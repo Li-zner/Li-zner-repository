@@ -31,6 +31,8 @@ _BOOK_PREFIX = {
 
 def _arabic_to_chinese(num: int) -> str:
     """阿拉伯数字转中文数字（支持1-9999），正确处理零位"""
+    if num == 0:
+        return "零"  # P2 #16：显式处理 0，避免返回空字符串
     if num < 10:
         return _DIGIT_MAP.get(str(num), str(num))
     

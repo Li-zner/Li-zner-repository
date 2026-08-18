@@ -1,26 +1,38 @@
+"""
+角色分级限流（QPS / 并发 / 日请求 / 日 Token）
+
+设计要点（2026-08-18 加固）：
+- QPS 滑动窗口：Redis 服务端 TIME 决定窗口（P1 #14 摆脱客户端时钟漂移），Lua 原子计数。
+- 并发控制：Lua 原子"检查+增量"，超限不占位（P0 #27 杜绝双重释放）；无条件 EXPIRE 30s 自愈（P1 #4）。
+- 日用量：Lua 原子 INCRBY 双 Key + 无条件 TTL（P1 #3/#15 防计数丢失 / Key 永不过期）。
+- Redis 异常：Fail-open（放行并记 Error 日志），保障业务可用性优先（P1 #5）。
+"""
 import time
-import os
-from fastapi import HTTPException
 
 from ..core.redis import get_redis
-from ..core.config import SECOND_REQUEST_LIMIT, DAILY_REQUEST_LIMIT, DAILY_TOKEN_LIMIT
+from ..core.logging import setup_logging
+from ..core.config import (
+    ADMIN_QPS_LIMIT, ADMIN_DAILY_REQ, ADMIN_DAILY_TOKEN, ADMIN_CONCURRENT,
+    USER_QPS_LIMIT, USER_DAILY_REQ, USER_DAILY_TOKEN, USER_CONCURRENT,
+)
+
+logger = setup_logging()
 
 # ============================================================
-# 角色分级限流配置
+# 角色分级限流配置（统一从 core.config 读取，P2 #18 消除 os.getenv 散落）
 # ============================================================
-# admin 用户获得更高额度
 _ROLE_LIMITS = {
     "admin": {
-        "qps": int(os.getenv("ADMIN_QPS_LIMIT", "5000")),
-        "daily_req": int(os.getenv("ADMIN_DAILY_REQ", "1000000")),
-        "daily_token": int(os.getenv("ADMIN_DAILY_TOKEN", "50000000")),
-        "concurrent": int(os.getenv("ADMIN_CONCURRENT", "500")),
+        "qps": ADMIN_QPS_LIMIT,
+        "daily_req": ADMIN_DAILY_REQ,
+        "daily_token": ADMIN_DAILY_TOKEN,
+        "concurrent": ADMIN_CONCURRENT,
     },
     "user": {
-        "qps": int(os.getenv("USER_QPS_LIMIT", "2000")),
-        "daily_req": int(os.getenv("USER_DAILY_REQ", "500000")),
-        "daily_token": int(os.getenv("USER_DAILY_TOKEN", "50000000")),
-        "concurrent": int(os.getenv("USER_CONCURRENT", "200")),
+        "qps": USER_QPS_LIMIT,
+        "daily_req": USER_DAILY_REQ,
+        "daily_token": USER_DAILY_TOKEN,
+        "concurrent": USER_CONCURRENT,
     },
 }
 
@@ -28,61 +40,146 @@ _DEFAULT_LIMITS = _ROLE_LIMITS["user"]
 
 
 def _get_limits(role: str = "user") -> dict:
+    """直接返回常量引用，避免每次调用重建字典（P2 #6）"""
     return _ROLE_LIMITS.get(role, _DEFAULT_LIMITS)
 
 
+# ============================================================
+# QPS 滑动窗口 Lua
+# ============================================================
+# 原理：维护"当前秒"与"前一秒"两个计数器，估算 = 前窗口×(1-已过比例) + 当前窗口。
+# 时间：用 Redis 服务端 TIME（高精度），彻底抛弃客户端时间戳（P1 #14/#32）。
+# 优化：首次创建 key 才 EXPIRE，后续 INCR 不续期（窗口仅 1-2 秒，P2 #23）。
+_QPS_COUNTER_LUA = """
+local limit = tonumber(ARGV[1])
+local prefix = ARGV[2]
+local now = redis.call('TIME')
+local now_sec = tonumber(now[1]) + tonumber(now[2])/1000000
+local curr_sec = math.floor(now_sec)
+local fraction = now_sec - curr_sec
+local curr_key = prefix .. curr_sec
+local prev_key = prefix .. (curr_sec - 1)
+local curr = tonumber(redis.call('GET', curr_key) or 0)
+local prev = tonumber(redis.call('GET', prev_key) or 0)
+local estimate = prev * (1 - fraction) + curr
+if estimate < limit then
+    redis.call('INCR', curr_key)
+    if curr == 0 then
+        redis.call('EXPIRE', curr_key, 2)
+    end
+    return 1
+else
+    return 0
+end
+"""
+
+
 async def check_qps(username: str, role: str = "user") -> bool:
-    limits = _get_limits(role)
-    r = await get_redis()
-    key = f"qps:{username}:{int(time.time())}"
-    count = await r.incr(key)
-    if count == 1:
-        await r.expire(key, 2)
-    return count <= limits["qps"]
+    """QPS 限流（滑动窗口，服务端时间）；Redis 异常 Fail-open 放行"""
+    try:
+        limits = _get_limits(role)
+        r = await get_redis()
+        ok = await r.eval(
+            _QPS_COUNTER_LUA, 0,
+            limits["qps"], f"qps:counter:{username}:",
+        )
+        return ok == 1
+    except Exception as e:
+        logger.error(f"QPS 限流 Redis 异常，放行请求（Fail-open）: {e}")
+        return True
+
+
+# ============================================================
+# 并发控制 Lua
+# ============================================================
+# 原子"检查+增量"：超限时不修改计数器（P0 #27 拒绝不占位，杜绝调用方二次释放）；
+# 通过时无条件 EXPIRE 30s 自愈（P1 #4，杜绝槽位泄漏）。
+_CONCURRENT_LUA = """
+local limit = tonumber(ARGV[1])
+local current = tonumber(redis.call('GET', KEYS[1]) or 0)
+if current >= limit then
+    return 0
+end
+redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], 30)
+return 1
+"""
 
 
 async def check_concurrent(username: str, role: str = "user") -> bool:
-    """检查用户并发请求数，超过限制则拒绝"""
-    limits = _get_limits(role)
-    r = await get_redis()
-    key = f"concurrent:{username}"
-    current = await r.incr(key)
-    if current == 1:
-        await r.expire(key, 30)  # 30秒超时自动释放
-    if current > limits["concurrent"]:
-        await r.decr(key)
-        return False
-    return True
+    """检查并占用一个并发槽位（原子）；超限返回 False 且不占位"""
+    try:
+        limits = _get_limits(role)
+        r = await get_redis()
+        ok = await r.eval(_CONCURRENT_LUA, 1, f"concurrent:{username}", limits["concurrent"])
+        return ok == 1
+    except Exception as e:
+        logger.error(f"并发限流 Redis 异常，放行请求（Fail-open）: {e}")
+        return True
 
 
 async def release_concurrent(username: str):
-    """释放一个并发槽位"""
-    r = await get_redis()
-    key = f"concurrent:{username}"
-    current = await r.get(key)
-    if current and int(current) > 0:
-        await r.decr(key)
+    """释放一个并发槽位（尽力而为，绝不向外抛异常，P2 #35）"""
+    try:
+        r = await get_redis()
+        key = f"concurrent:{username}"
+        current = await r.get(key)
+        cur = int(current) if current else 0
+        if cur > 0:
+            await r.decr(key)
+        elif cur <= 0:
+            # 零/负数强制重置，防计数永久残留（P2 #33）
+            logger.warning(f"并发计数异常（{cur}），重置为 0: {username}")
+            await r.set(key, 0, ex=30)
+    except Exception:
+        pass  # 释放失败仅影响并发统计，不覆盖业务异常
+
+
+# ============================================================
+# 日用量（请求数 + Token 数）
+# ============================================================
+# 原子累加 Lua：同时 INCRBY 两个 Key 并统一设置 TTL（P1 #3/#15 防账目不一致 / Key 永不过期）
+_DAILY_UPDATE_LUA = """
+local inc_req = tonumber(ARGV[1])
+local inc_token = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+redis.call('INCRBY', KEYS[1], inc_req)
+redis.call('INCRBY', KEYS[2], inc_token)
+redis.call('EXPIRE', KEYS[1], ttl)
+redis.call('EXPIRE', KEYS[2], ttl)
+return 1
+"""
 
 
 async def get_daily_usage(username: str, date_str: str):
-    r = await get_redis()
-    req_key = f"daily_req:{username}:{date_str}"
-    token_key = f"daily_token:{username}:{date_str}"
-    req_count = int(await r.get(req_key) or 0)
-    token_sum = int(await r.get(token_key) or 0)
-    return {"request_count": req_count, "token_sum": token_sum}
+    """读取日用量（date_str 统一用 UTC 日期，见 P3 #39 时区约定）"""
+    try:
+        r = await get_redis()
+        req_key = f"daily_req:{username}:{date_str}"
+        token_key = f"daily_token:{username}:{date_str}"
+        req_raw = await r.get(req_key) or "0"
+        token_raw = await r.get(token_key) or "0"
+        # 防御：Redis 半开状态返回空/非数字时按 0 处理（P3 #26）
+        req_count = int(req_raw) if req_raw.isdigit() else 0
+        token_sum = int(token_raw) if token_raw.isdigit() else 0
+        return {"request_count": req_count, "token_sum": token_sum}
+    except Exception:
+        return {"request_count": 0, "token_sum": 0}
 
 
 async def update_daily_usage(username: str, date_str: str, inc_request=1, inc_token=0):
-    r = await get_redis()
-    req_key = f"daily_req:{username}:{date_str}"
-    token_key = f"daily_token:{username}:{date_str}"
-    new_req = await r.incr(req_key, inc_request)
-    new_token = await r.incr(token_key, inc_token)
-    if new_req == inc_request:
+    """日用量原子累加（Lua 同时 INCRBY 双 Key + 无条件 TTL，P1 #3/#15）"""
+    try:
+        r = await get_redis()
+        req_key = f"daily_req:{username}:{date_str}"
+        token_key = f"daily_token:{username}:{date_str}"
+        # TTL 对齐到次日 UTC 零点
         now = time.time()
         tomorrow = int(now) - (int(now) % 86400) + 86400
-        ttl = tomorrow - int(now)
-        if ttl > 0:
-            await r.expire(req_key, ttl)
-            await r.expire(token_key, ttl)
+        ttl = max(1, tomorrow - int(now))
+        await r.eval(
+            _DAILY_UPDATE_LUA, 2, req_key, token_key,
+            inc_request, inc_token, ttl,
+        )
+    except Exception as e:
+        logger.warning(f"日用量累加失败（不影响主流程）: {e}")

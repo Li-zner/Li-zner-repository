@@ -30,9 +30,15 @@ core/
 │   ├── metrics.py          # Prometheus 指标
 │   ├── config.py           # 配置读取（全部走环境变量）
 │   ├── redis.py / db.py    # Redis / PostgreSQL 连接池
+│   ├── password.py         # 密码哈希（SHA-256 预处理 + bcrypt，超长密码全链路）
+│   ├── quota.py            # 用量配额
+│   ├── stream_utils.py     # LLM 流式输出与工具分发
+│   ├── concurrency.py      # 并发控制（信号量）
+│   ├── logging.py          # 结构化日志（trace_id 关联）
+│   ├── jfast.py            # 高性能 JSON 序列化
 │   └── constants.py        # 常量
 └── middleware/    # 网关中间件
-    ├── auth.py             # JWT 认证（access 2h + refresh 30d 轮换 + 黑名单）
+    ├── auth.py             # JWT 认证（access 2h + refresh 30d 轮换 + 黑名单）+ 密码校验
     ├── rate_limit.py       # Redis 分布式限流
     └── circuit_breaker.py  # 熔断降级
 ```
@@ -47,6 +53,6 @@ core/
 
 ## 说明
 
-- 为保护生产安全，本目录为**精选快照**，不随主仓 `app/` 实时同步
-- 支付、数据库迁移、运维脚本等内部工程内容**不在此公开**
+- 为保护生产安全，本目录为 `app/{core,agents,middleware}` 的**精选子集**：含核心引擎与基础设施
+- 支付、数据库迁移、运维脚本、路由层等内部工程内容**不在此公开**
 - 完整架构与工程能力见 [项目展示](../README.md)

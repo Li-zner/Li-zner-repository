@@ -13,10 +13,12 @@ from datetime import datetime
 import httpx
 
 from ..core.logging import setup_logging
+from ..core.jfast import loads as jloads
+from ..core.stream_utils import dispatch_tool, stream_llm
+from ..core.quota import inc_used_questions
 from ..core.config import (
-    DEEPSEEK_API_BASE, DEEPSEEK_API_TIMEOUT,
-    SUMMARY_THRESHOLD, TOOL_TIMEOUT, DEEPSEEK_MODEL, DEEPSEEK_FLASH_MODEL,
-    HTTP_TIMEOUT_LONG
+    DEEPSEEK_API_BASE, SUMMARY_THRESHOLD, TOOL_TIMEOUT, DEEPSEEK_MODEL,
+    DEEPSEEK_FLASH_MODEL, HTTP_TIMEOUT_LONG
 )
 from ..core.redis import get_redis
 from ..core.memory_manager import MemoryManager
@@ -26,8 +28,6 @@ from ..core.task_manager import (
     get_cancel_event
 )
 from ..core.semantic_cache import SemanticCache
-from .tools import fetch_weather_async
-from .sub_agents import call_sub_agent
 from .router import classify_intent, handle_simple_task
 from .memory import compress_message_history
 from .orchestrator import build_shared_context
@@ -67,6 +67,9 @@ _INTERNAL_PATTERNS = [
 
 import re
 
+# 预编译：单一正则替代逐模式 re.search（P2 #22 性能）
+_INTERNAL_PATTERNS_RE = re.compile("|".join(_INTERNAL_PATTERNS), re.IGNORECASE)
+
 
 def _clean_reasoning(text: str) -> str:
     if not text:
@@ -77,12 +80,7 @@ def _clean_reasoning(text: str) -> str:
         stripped = line.strip()
         if not stripped:
             continue
-        skip = False
-        for pat in _INTERNAL_PATTERNS:
-            if re.search(pat, stripped, re.IGNORECASE):
-                skip = True
-                break
-        if skip:
+        if _INTERNAL_PATTERNS_RE.search(stripped):
             continue
         if re.match(r'^\s*[{}\[\],]\s*$', stripped):
             continue
@@ -92,6 +90,117 @@ def _clean_reasoning(text: str) -> str:
             continue
         cleaned.append(line)
     return '\n'.join(cleaned)
+
+
+async def _safe_inc_used_questions(username: str):
+    """安全累加提问次数：失败记录日志不静默（P1 #35）"""
+    try:
+        await inc_used_questions(username)
+    except Exception as e:
+        logger.warning(f"提问次数累计失败: user={username}, err={e}")
+
+
+async def _safe_cache_set(query: str, value: str):
+    """安全写语义缓存：失败记录日志，不产生未处理 Task 异常（P0 #2）"""
+    try:
+        await SemanticCache.set(query, value)
+    except Exception as e:
+        logger.warning(f"语义缓存写入失败: {e}")
+
+
+async def _try_cache_hit(task_id: str, username: str, user_query: str, mm) -> bool:
+    """语义缓存拦截：命中则分块写入 Redis 并返回 True（调用方直接返回）"""
+    try:
+        cached = await SemanticCache.get(user_query)
+        if not cached:
+            return False
+        from ..core.safety_filter import get_filter
+        sf = get_filter()
+        if sf.contains_sensitive(cached):
+            cached = sf.safe_message
+        # 分块写入 Redis
+        for i in range(0, len(cached), 80):
+            chunk = cached[i:i + 80]
+            await append_result(task_id, chunk)
+            if is_cancelled(task_id):
+                await _finish_cancelled(task_id, await read_accumulated_result(task_id))
+                return True
+        await update_status(task_id, "completed", cached)
+        await mm.save_user_message({"role": "user", "content": user_query})
+        await mm.save_messages(
+            {"role": "user", "content": user_query},
+            {"role": "assistant", "content": cached}
+        )
+        return True
+    except Exception:
+        return False  # 缓存查询失败不影响正常推理
+
+
+async def _build_task_messages(mm, user_query: str, user_location: str,
+                               persona_id: str, file_ids, intent) -> tuple:
+    """准备任务消息：人格 → 历史/画像 → 文件注入 → 定位注入 → 工具加载。
+
+    返回 (messages, final_query, tools)。
+    """
+    from ..core.persona_manager import get_persona_manager
+    pm = get_persona_manager()
+    persona = pm.current
+    if persona_id and persona_id != pm.current_id:
+        pm.switch(persona_id)
+        persona = pm.current
+
+    today_str = datetime.now().strftime("%Y年%m月%d日 %A")
+    system_content = persona.system_prompt.format(today=today_str, name=persona.name) if persona else f"你是AI助手。今天是{today_str}。"
+
+    history_dicts = await mm.get_context(limit=SUMMARY_THRESHOLD)
+    user_profile = await mm.get_profile()
+    system_content += f"\n{build_shared_context(user_query, user_location, user_profile or '')}"
+    history_dicts = compress_message_history(history_dicts, max_messages=6)
+
+    messages = [{"role": "system", "content": system_content}]
+
+    # 上传文件注入
+    if file_ids:
+        r = await get_redis()
+        file_contents = []
+        for fid in file_ids:
+            content = await r.get(f"file:{fid}:content")
+            meta_raw = await r.get(f"file:{fid}:meta")
+            if content and meta_raw:
+                meta = json.loads(meta_raw)
+                content_text = content.decode() if isinstance(content, bytes) else content
+                # 文件内容截断（P0 #31）：防超大文件撑爆上下文窗口
+                if len(content_text) > 20000:
+                    content_text = content_text[:20000] + "\n...(内容过长，已截断)"
+                file_contents.append(f"【用户上传文件: {meta['filename']}】\n{content_text}\n【文件结束】")
+        if file_contents:
+            messages.append({"role": "system", "content": "用户上传了以下文件，请根据文件内容回答用户的问题：\n\n" + "\n\n".join(file_contents)})
+
+    for msg in history_dicts:
+        messages.append(msg)
+
+    # 注入定位
+    final_query = user_query
+    if user_location:
+        loc_name = user_location.replace("市", "")
+        if loc_name not in user_query:
+            intent_kw = ["天气", "酒店", "路线", "美食", "餐厅", "怎么去", "到", "旅游", "玩"]
+            if any(kw in user_query for kw in intent_kw):
+                final_query = f"{user_query}（我在{user_location}）"
+    messages.append({"role": "user", "content": final_query})
+
+    # 根据意图路由结果，只加载匹配的工具
+    from ..agents.router import get_tools_for_intent
+    try:
+        if intent and intent.get("agents"):
+            tools = get_tools_for_intent(intent["agents"])
+            logger.info(f"🔧 使用匹配工具: {len(tools)}个, agents={intent['agents']}")
+        else:
+            tools = []
+    except Exception:
+        from ..agents.tool_definitions import ALL_TOOLS as tools
+
+    return messages, final_query, tools
 
 
 async def run_agent_task(
@@ -108,38 +217,31 @@ async def run_agent_task(
     前端通过轮询 /v2/chat/tasks/{task_id}/result 获取进度。
     """
     cancel_ev = get_cancel_event(task_id)
-    full_content_text = ""
     conv_id = session_id or f"conv_{username}_{int(time.time())}"
     mm = MemoryManager(username, conv_id)
+    # 任务也算一次提问（GitHub 试用额度全局共享，所有助手）；异步失败不静默（P1 #35）
+    _ = asyncio.create_task(_safe_inc_used_questions(username))
 
+    rebuild_lock_token = None
     try:
         # ===== 状态 → generating =====
         await update_status(task_id, "generating")
 
         # ===== 1. 语义缓存拦截 =====
-        try:
-            cached = await SemanticCache.get(user_query)
-            if cached:
-                from ..core.safety_filter import get_filter
-                sf = get_filter()
-                if sf.contains_sensitive(cached):
-                    cached = sf.safe_message
-                # 分块写入 Redis
-                for i in range(0, len(cached), 80):
-                    chunk = cached[i:i+80]
-                    await append_result(task_id, chunk)
-                    if is_cancelled(task_id):
-                        await _finish_cancelled(task_id, await read_accumulated_result(task_id))
-                        return
-                await update_status(task_id, "completed", cached)
-                await mm.save_user_message({"role": "user", "content": user_query})
-                await mm.save_messages(
-                    {"role": "user", "content": user_query},
-                    {"role": "assistant", "content": cached}
-                )
-                return
-        except Exception:
-            pass
+        if await _try_cache_hit(task_id, username, user_query, mm):
+            return
+
+        # 防击穿（P0 #1/#32）：未命中时获取重建锁，仅一个请求重建，其余等待重读缓存
+        rebuild_lock_token = await SemanticCache.acquire_rebuild_lock(user_query, ttl=45)
+        if rebuild_lock_token is None:
+            # 已有请求在重建：等待后重读缓存（最多 15 秒）
+            for _ in range(30):
+                await asyncio.sleep(0.5)
+                if is_cancelled(task_id):
+                    await _finish_cancelled(task_id, await read_accumulated_result(task_id))
+                    return
+                if await _try_cache_hit(task_id, username, user_query, mm):
+                    return
 
         # ===== 1.5 意图路由：简单任务 vs 复杂任务 =====
         intent = None
@@ -177,59 +279,8 @@ async def run_agent_task(
             await update_status(task_id, "error", "DEEPSEEK_API_KEY 未设置")
             return
 
-        from ..core.persona_manager import get_persona_manager
-        pm = get_persona_manager()
-        persona = pm.current
-        if persona_id and persona_id != pm.current_id:
-            pm.switch(persona_id)
-            persona = pm.current
-
-        today_str = datetime.now().strftime("%Y年%m月%d日 %A")
-        system_content = persona.system_prompt.format(today=today_str, name=persona.name) if persona else f"你是AI助手。今天是{today_str}。"
-
-        history_dicts = await mm.get_context(limit=SUMMARY_THRESHOLD)
-        user_profile = await mm.get_profile()
-        system_content += f"\n{build_shared_context(user_query, user_location, user_profile or '')}"
-        history_dicts = compress_message_history(history_dicts, max_messages=6)
-
-        messages = [{"role": "system", "content": system_content}]
-
-        # 上传文件注入
-        if file_ids:
-            r = await get_redis()
-            file_contents = []
-            for fid in file_ids:
-                content = await r.get(f"file:{fid}:content")
-                meta_raw = await r.get(f"file:{fid}:meta")
-                if content and meta_raw:
-                    meta = json.loads(meta_raw)
-                    file_contents.append(f"【用户上传文件: {meta['filename']}】\n{content}\n【文件结束】")
-            if file_contents:
-                messages.append({"role": "system", "content": "用户上传了以下文件，请根据文件内容回答用户的问题：\n\n" + "\n\n".join(file_contents)})
-
-        for msg in history_dicts:
-            messages.append(msg)
-
-        # 注入定位
-        final_query = user_query
-        if user_location:
-            loc_name = user_location.replace("市", "")
-            if loc_name not in user_query:
-                intent_kw = ["天气", "酒店", "路线", "美食", "餐厅", "怎么去", "到", "旅游", "玩"]
-                if any(kw in user_query for kw in intent_kw):
-                    final_query = f"{user_query}（我在{user_location}）"
-        messages.append({"role": "user", "content": final_query})
-
-        # ===== 根据意图路由结果，只加载匹配的工具 =====
-        from ..agents.router import get_tools_for_intent, get_agent_names_for_orchestrator
-        try:
-            if intent and intent.get("agents"):
-                tools = get_tools_for_intent(intent["agents"])
-                logger.info(f"🔧 使用匹配工具: {len(tools)}个, agents={intent['agents']}")
-            else:
-                tools = []
-        except Exception:
-            from ..agents.tool_definitions import ALL_TOOLS as tools
+        messages, final_query, tools = await _build_task_messages(
+            mm, user_query, user_location, persona_id, file_ids, intent)
 
         # 立即保存用户消息
         await mm.save_user_message({"role": "user", "content": user_query})
@@ -243,6 +294,9 @@ async def run_agent_task(
                 await _finish_cancelled(task_id, await read_accumulated_result(task_id))
                 return
 
+            # 上下文截断：防 messages 无限累积撑爆上下文窗口（P0 #60）
+            messages = compress_message_history(messages, max_messages=10)
+
             full_reasoning = ""
             full_content = ""
             has_tool_calls = False
@@ -250,57 +304,40 @@ async def run_agent_task(
             _stream_usage = {"prompt_tokens": 0, "completion_tokens": 0}
 
             try:
-                async with httpx.AsyncClient(timeout=DEEPSEEK_API_TIMEOUT) as client:
-                    async with client.stream(
-                        "POST", f"{DEEPSEEK_API_BASE}/chat/completions",
-                        headers={"Authorization": f"Bearer {deepseek_api_key}", "Content-Type": "application/json"},
-                        json={"model": DEEPSEEK_MODEL, "messages": messages, "tools": tools, "tool_choice": "auto", "stream": True},
-                    ) as resp:
-                        resp.raise_for_status()
-                        async for line in resp.aiter_lines():
-                            if is_cancelled(task_id):
-                                await _finish_cancelled(task_id, await read_accumulated_result(task_id) + full_content)
-                                return
+                # 统一走 stream_llm（ReAct 路径保持模型默认 temperature）
+                async for _ev in stream_llm(
+                    deepseek_api_key, DEEPSEEK_MODEL, messages,
+                    tools=tools, tool_choice="auto",
+                    temperature=None, max_tokens=None,
+                ):
+                    if is_cancelled(task_id):
+                        await _finish_cancelled(task_id, await read_accumulated_result(task_id) + full_content)
+                        return
 
-                            if not line.startswith("data:"):
-                                continue
-                            data_str = line[5:].strip()
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                data = json.loads(data_str)
-                                delta = data.get("choices", [{}])[0].get("delta", {})
-                                if "usage" in data:
-                                    u = data["usage"]
-                                    _stream_usage["prompt_tokens"] = u.get("prompt_tokens", 0) or 0
-                                    _stream_usage["completion_tokens"] = u.get("completion_tokens", 0) or 0
-
-                                if delta.get("reasoning_content"):
-                                    full_reasoning += delta["reasoning_content"]
-
-                                if delta.get("content"):
-                                    chunk = delta["content"]
-                                    full_content += chunk
-                                    full_content_text += chunk
-                                    # 每块写入 Redis，前端可轮询获取进度
-                                    await append_result(task_id, chunk)
-
-                                if delta.get("tool_calls"):
-                                    has_tool_calls = True
-                                    for tc in delta["tool_calls"]:
-                                        idx = tc.get("index")
-                                        if idx is not None:
-                                            if idx not in tool_calls_index:
-                                                tool_calls_index[idx] = {"id": tc.get("id", ""), "type": tc.get("type", "function"), "function": {"name": "", "arguments": ""}}
-                                            if tc.get("id"):
-                                                tool_calls_index[idx]["id"] = tc["id"]
-                                            if tc.get("function"):
-                                                if tc["function"].get("name"):
-                                                    tool_calls_index[idx]["function"]["name"] = tc["function"]["name"]
-                                                if tc["function"].get("arguments"):
-                                                    tool_calls_index[idx]["function"]["arguments"] += tc["function"]["arguments"]
-                            except json.JSONDecodeError:
-                                pass
+                    if _ev["type"] == "usage":
+                        _stream_usage["prompt_tokens"] = _ev["prompt_tokens"]
+                        _stream_usage["completion_tokens"] = _ev["completion_tokens"]
+                    elif _ev["type"] == "reasoning":
+                        full_reasoning += _ev["text"]
+                    elif _ev["type"] == "content":
+                        chunk = _ev["text"]
+                        full_content += chunk
+                        # 每块写入 Redis，前端可轮询获取进度
+                        await append_result(task_id, chunk)
+                    elif _ev["type"] == "tool_calls":
+                        has_tool_calls = True
+                        for tc in _ev["delta"]:
+                            idx = tc.get("index")
+                            if idx is not None:
+                                if idx not in tool_calls_index:
+                                    tool_calls_index[idx] = {"id": tc.get("id", ""), "type": tc.get("type", "function"), "function": {"name": "", "arguments": ""}}
+                                if tc.get("id"):
+                                    tool_calls_index[idx]["id"] = tc["id"]
+                                if tc.get("function"):
+                                    if tc["function"].get("name"):
+                                        tool_calls_index[idx]["function"]["name"] = tc["function"]["name"]
+                                    if tc["function"].get("arguments"):
+                                        tool_calls_index[idx]["function"]["arguments"] += tc["function"]["arguments"]
 
             except Exception as e:
                 logger.warning(f"DeepSeek API 失败 (step {step}): {e}")
@@ -334,17 +371,12 @@ async def run_agent_task(
                      "function": {"name": v["function"]["name"], "arguments": v["function"]["arguments"]}}
                     for v in tool_calls_index.values()
                 ]
-                # 执行工具
+                # 执行工具（统一走 dispatch_tool）
                 tasks = []
                 for tc in tool_calls_list:
                     func_name = tc["function"]["name"]
                     args = json.loads(tc["function"]["arguments"])
-                    if func_name == "query_weather":
-                        tasks.append(fetch_weather_async(args.get("city")))
-                    elif func_name in ["query_hotel", "query_route", "query_food"]:
-                        tasks.append(call_sub_agent(func_name, args, user_query))
-                    else:
-                        tasks.append(asyncio.sleep(0, result={"error": f"未知工具: {func_name}"}))
+                    tasks.append(dispatch_tool(func_name, args, user_query))
 
                 try:
                     tool_results = await asyncio.wait_for(
@@ -362,6 +394,7 @@ async def run_agent_task(
                 # 多 Agent 讨论（只用匹配到的 Agent）
                 try:
                     from .orchestrator import AgentOrchestrator
+                    from ..agents.router import get_agent_names_for_orchestrator
                     orch = AgentOrchestrator(user_query, user_location)
                     # 只用匹配到的 Agent，不浪费未涉及的 Agent
                     matched_agents = intent.get("agents", []) if intent else []
@@ -432,7 +465,7 @@ async def run_agent_task(
                     {"role": "user", "content": user_query},
                     {"role": "assistant", "content": final_answer}
                 )
-                asyncio.create_task(SemanticCache.set(user_query, final_answer))
+                asyncio.create_task(_safe_cache_set(user_query, final_answer))
 
                 await update_status(task_id, "completed", final_answer)
                 logger.info(f"✅ 任务完成: task_id={task_id}")
@@ -450,6 +483,13 @@ async def run_agent_task(
         logger.error(f"Agent 任务异常: {e}", exc_info=True)
         await update_status(task_id, "error", str(e))
         cleanup_event(task_id)
+    finally:
+        # 释放重建锁（仅持有者释放；失败由 TTL 自愈，P0 #1）
+        if rebuild_lock_token:
+            try:
+                await SemanticCache.release_rebuild_lock(user_query, rebuild_lock_token)
+            except Exception:
+                pass
 
 
 async def _finish_cancelled(task_id: str, partial: str):
@@ -460,12 +500,16 @@ async def _finish_cancelled(task_id: str, partial: str):
 
 
 async def _fallback_chain(user_query: str, username: str):
-    """降级链：仅 Flash（Dify 已移除）"""
+    """降级链：仅 Flash（Dify 已移除）；Flash 也失败则给友好兜底（P1 #37）"""
+    yielded = False
     try:
         async for chunk in _fallback_flash(user_query, username):
+            yielded = True
             yield chunk
     except Exception:
-        return
+        pass
+    if not yielded:
+        yield "服务繁忙，请稍后再试。"
 
 
 async def _fallback_flash(user_query: str, username: str):

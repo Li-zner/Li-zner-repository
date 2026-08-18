@@ -75,6 +75,9 @@ def classify_by_keywords(query: str) -> Dict:
     # 条件：用户表达了全面的旅行规划需求
     is_recommend = False
     has_recommend_kw = any(p in query for p in RECOMMEND_PATTERNS)
+    # 法律咨询场景的"推荐"不触发旅游全推荐（P2 #20：如"推荐一本民法典书籍"）
+    if has_recommend_kw and any(kw in query for kw in ("民法典", "法律", "法条", "法规")):
+        has_recommend_kw = False
     if has_recommend_kw:
         # 触发全推荐模式的条件（满足任意一条即可）：
         # 1. 匹配了至少2个领域关键词
@@ -458,7 +461,11 @@ def _build_simple_prompt(query: str, agent_name: str, tool_result: dict,
     persona = pm.current
 
     today_str = __import__('datetime').datetime.now().strftime("%Y年%m月%d日 %A")
-    system = persona.system_prompt.format(today=today_str, name=persona.name) if persona else f"你是AI助手。今天是{today_str}。"
+    try:
+        system = persona.system_prompt.format(today=today_str, name=persona.name) if persona else f"你是AI助手。今天是{today_str}。"
+    except (KeyError, ValueError):
+        # 人格提示词缺占位符时不崩溃（与 v2 的 _safe_format_prompt 一致）
+        system = persona.system_prompt if persona else f"你是AI助手。今天是{today_str}。"
 
     # 注入定位
     if user_location:

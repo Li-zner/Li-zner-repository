@@ -1,9 +1,11 @@
 import json
 import re
 import os
+import asyncio
 import httpx
 from ..core.logging import setup_logging
 from ..core.config import DEEPSEEK_API_BASE, DEEPSEEK_MODEL, HTTP_TIMEOUT_MEDIUM
+from ..core.jfast import loads as jloads
 
 logger = setup_logging()
 
@@ -22,7 +24,7 @@ def _extract_json(text: str) -> dict:
 
     # 尝试直接解析
     try:
-        return json.loads(text)
+        return jloads(text)
     except json.JSONDecodeError:
         pass
 
@@ -30,7 +32,7 @@ def _extract_json(text: str) -> dict:
     block_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
     if block_match:
         try:
-            return json.loads(block_match.group(1).strip())
+            return jloads(block_match.group(1).strip())
         except json.JSONDecodeError:
             pass
 
@@ -38,49 +40,53 @@ def _extract_json(text: str) -> dict:
     brace_match = re.search(r'\{.*\}', text, re.DOTALL)
     if brace_match:
         try:
-            return json.loads(brace_match.group(0))
+            return jloads(brace_match.group(0))
         except json.JSONDecodeError:
             pass
 
     # 最后尝试：修复常见问题（未引用的 key）
     fixed = re.sub(r'(?<!")(\b\w+\b)(?=\s*:)', r'"\1"', text)
     try:
-        return json.loads(fixed)
-    except json.JSONDecodeError:
+        return jloads(fixed)
+    except (json.JSONDecodeError, TypeError, ValueError):  # P2 #23：覆盖 jloads 可能的异常类型
         raise
 
 
 
 SUB_AGENT_PROMPTS = {
-    "query_hotel": '''你是酒店推荐专家。根据用户需求调用酒店API，只返回JSON。
+    "query_hotel": '''你是酒店推荐专家。只返回JSON。
+
+【输出规则】
+- 数量按热度：热门城市 3-5 家，冷门 2-3 家；至少 2 家
+- 覆盖不同价位（经济/舒适/高档）
 
 【输出格式】
-{"hotels": [{"name": "名称", "price": 价格, "rating": 评分, "address": "地址", "comment": "对酒店位置/服务的简短评价"}]}
-【约束】只输出JSON，不输出任何解释性文字。''',
+{"hotels": [{"name": "名称", "price": 价格, "rating": 评分, "address": "地址", "comment": "简短评价"}]}
+【约束】只输出JSON。''',
 
     "query_route": '''你是路线规划专家。根据出发地和目的地规划路线，只返回JSON。
 
 【核心规则】
-- 根据两地距离**智能选择**交通方式：
-  - 如果在同一城市内（<30km）：公交/地铁/打车
-  - 如果跨城市但距离较近（30-200km）：高铁/动车/大巴，优先推荐高铁
-  - 如果跨城市且距离较远（>200km）：高铁/飞机，优先推荐高铁
-  - 仅当用户明确说「驾车/开车/自驾」时才用驾车
-- **禁止**使用市内公交（如"坐公交"）跨城市长途出行
-- 如果用户没指定出发地，默认从用户当前位置出发
+- 同一城市（<30km）：公交/地铁/打车
+- 跨城较近（30-200km）：高铁/动车/大巴，优先高铁
+- 跨城较远（>200km）：高铁/飞机，优先高铁
+- 仅用户明确说自驾才用驾车
+- 用户没给出发地时默认当前位置
 
 【输出格式】
 {"route": {"distance_km": 数字, "duration_min": 数字, "mode": "高铁"}}
-- mode 字段：高铁/动车/公交/驾车/飞机/大巴，根据距离智能选择
-- distance_km：路线距离（公里），客观估算
-- duration_min：预计耗时（分钟），客观估算
-【约束】只输出JSON，不输出任何解释性文字。''',
+- mode：高铁/动车/公交/驾车/飞机/大巴
+【约束】只输出JSON。''',
 
-    "query_food": '''你是美食推荐专家。根据目的地调用餐厅API，只返回JSON。
+    "query_food": '''你是美食推荐专家。只返回JSON。
+
+【输出规则】
+- 数量按热度：热门城市 3-5 家，冷门 2-3 家；至少 2 家
+- 优先本地特色/必吃
 
 【输出格式】
 {"restaurants": [{"name": "名称", "cuisine": "菜系", "avg_price": 价格, "rating": 评分, "feature": "特色推荐"}]}
-【约束】只输出JSON，不输出任何解释性文字。''',
+【约束】只输出JSON。''',
 }
 
 async def call_sub_agent(agent_name: str, args: dict, user_query: str, retry: bool = True):
@@ -129,13 +135,16 @@ async def call_sub_agent(agent_name: str, args: dict, user_query: str, retry: bo
     
     try:
         return await _call()
-    except (json.JSONDecodeError, Exception) as e:
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
         if retry:
+            # 重试前加退避（P1 #34：防 API 限流时立即重试加剧压力）
+            await asyncio.sleep(0.5)
             logger.warning(f"子Agent {agent_name} 首次返回非法JSON，自动重试")
             messages[0]["content"] = system_prompt + "\n【重要】只输出纯JSON，不要添加任何解释。"
             try:
                 return await _call()
-            except Exception as e2:
-                logger.error(f"子Agent {agent_name} 重试仍失败: {e2}")
-                return {"error": f"重试失败: {str(e2)}"}
-        return {"error": f"JSON解析失败: {str(e)}"}
+            except (json.JSONDecodeError, TypeError, ValueError, httpx.HTTPError) as e2:
+                # 日志截断：避免记录可能含 API Key 的完整异常（P1 #5）
+                logger.error(f"子Agent {agent_name} 重试仍失败: {str(e2)[:120]}")
+                return {"error": f"重试失败: {str(e2)[:120]}"}
+        return {"error": f"JSON解析失败: {str(e)[:120]}"}

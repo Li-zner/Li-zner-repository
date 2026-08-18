@@ -1,6 +1,7 @@
 import os
 import asyncpg
-from ..core.config import DATABASE_URL
+from contextlib import asynccontextmanager
+from ..core.config import DATABASE_URL, DB_ACQUIRE_TIMEOUT
 from ..core.logging import setup_logging
 
 logger = setup_logging()
@@ -13,18 +14,29 @@ _POOL_CONFIG = {
     "max_size": int(os.getenv("DB_POOL_MAX_SIZE", "50")),
 }
 
+# 校验：min_size > max_size 时 asyncpg 报错信息不明确，这里直接给出清晰错误（P0）
+if _POOL_CONFIG["min_size"] > _POOL_CONFIG["max_size"]:
+    raise ValueError(
+        f"DB_POOL_MIN_SIZE({_POOL_CONFIG['min_size']}) 不能大于 "
+        f"DB_POOL_MAX_SIZE({_POOL_CONFIG['max_size']})，请检查环境变量"
+    )
+
 
 async def init_pool():
     """初始化连接池（在 lifespan 中调用，全局唯一创建点）"""
     global _pool
     if _pool is not None:
         return _pool
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL 环境变量未配置！请在 .env 或 compose env_file 中设置数据库连接串。")
     # 安全：连接错误时不暴露完整 DATABASE_URL（可能含密码）
     try:
         _pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=_POOL_CONFIG["min_size"],
             max_size=_POOL_CONFIG["max_size"],
+            timeout=DB_ACQUIRE_TIMEOUT,                   # 获取连接超时，防高并发无限阻塞（P0）
+            max_inactive_connection_lifetime=300,          # 空闲连接 300s 回收，防连接无限占用（P0）
         )
     except Exception as e:
         logger.error(f"数据库连接池初始化失败: {e}")
@@ -49,8 +61,12 @@ async def close_pool():
         _pool = None
 
 
+@asynccontextmanager
 async def get_db_conn():
-    """FastAPI 依赖项：从连接池获取一个连接"""
+    """FastAPI 依赖项：从连接池获取一个连接（try/finally 确保业务异常时也归还连接，P1）"""
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    conn = await pool.acquire()
+    try:
         yield conn
+    finally:
+        await pool.release(conn)

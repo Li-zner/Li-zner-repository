@@ -61,7 +61,20 @@ class SafetyFilter:
             "SAFETY_FILTER_MESSAGE",
             "该问题涉及敏感信息，小助手不便回答哦~"
         )
-        self._build_trie(_BUILTIN_SENSITIVE_WORDS)
+        words = list(_BUILTIN_SENSITIVE_WORDS)
+        # 外部敏感词库（可选，每行一个词，# 开头为注释；P1 #56 不改代码即可增改词库）
+        external_file = os.getenv("SAFETY_FILTER_WORDS_FILE", "")
+        if external_file and os.path.exists(external_file):
+            try:
+                with open(external_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        w = line.strip()
+                        if w and not w.startswith("#"):
+                            words.append(w)
+                logger.info(f"已加载外部敏感词库: {external_file}")
+            except Exception as e:
+                logger.warning(f"外部敏感词库加载失败，使用内置词库: {e}")
+        self._build_trie(words)
         if extra_words:
             self._build_trie(extra_words)
         logger.info(f"DFA 过滤器已初始化，已加载 {self._count_words()} 个敏感词")
@@ -94,7 +107,11 @@ class SafetyFilter:
     ]
 
     def _in_safe_context(self, text: str) -> bool:
-        """检查文本是否在安全上下文中（如法律咨询、旅游推荐）"""
+        """检查文本是否在安全上下文中（如法律咨询、旅游推荐）
+
+        注（C4）：保持子串匹配——中文无空格词边界，正则 \b 不可靠；
+        白名单上下文误判的代价是跳过敏感检查，当前风险可控。
+        """
         if not text:
             return False
         text_lower = text.lower()
@@ -113,6 +130,8 @@ class SafetyFilter:
         # 先检查安全上下文白名单
         if self._in_safe_context(text):
             return False
+        # 大文本只扫描前 5000 字符，避免 O(n²) 卡死事件循环（P1 #58）
+        text = text[:5000]
         import time
         start = time.perf_counter()
         n = len(text)
@@ -155,6 +174,7 @@ class SafetyFilter:
         """
         if not text:
             return None
+        text = text[:5000]  # 只扫描前 5000 字符，限制大文本开销（P1 #58）
         for i in range(len(text)):
             node = self._root
             for j in range(i, len(text)):

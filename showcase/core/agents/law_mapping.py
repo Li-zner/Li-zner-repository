@@ -4,8 +4,12 @@
 在民法典知识库检索前，先判断用户问题是否属于其他法律领域。
 """
 import os, csv, re, json
+import threading
 from pathlib import Path
 from typing import Optional
+from ..core.logging import setup_logging
+
+logger = setup_logging()
 
 # 映射表路径
 _MAPPING_FILE = Path(__file__).parent.parent.parent / "tests" / "民法典补充协议.txt"
@@ -13,40 +17,48 @@ _MAPPING_FILE = Path(__file__).parent.parent.parent / "tests" / "民法典补充
 # 在内存中缓存解析后的映射表
 _LAW_MAPPING_CACHE: Optional[list[dict]] = None
 
+# 映射表加载锁（P1 #8/#44：并发首次加载防重复读盘；防御未来 async 化）
+_LOAD_LOCK = threading.Lock()
+
 
 def _load_mapping() -> list[dict]:
-    """加载并解析映射表"""
+    """加载并解析映射表（懒加载 + 锁保护 + 文件缺失优雅降级，P0 #59）"""
     global _LAW_MAPPING_CACHE
     if _LAW_MAPPING_CACHE is not None:
         return _LAW_MAPPING_CACHE
+    with _LOAD_LOCK:
+        # 双重检查：避免拿锁后重复加载
+        if _LAW_MAPPING_CACHE is not None:
+            return _LAW_MAPPING_CACHE
+        if not _MAPPING_FILE.exists():
+            # 文件缺失：返回空映射表，不阻塞应用启动（P0 #59）
+            logger.warning(f"法律映射表文件缺失，映射表为空: {_MAPPING_FILE}")
+            _LAW_MAPPING_CACHE = []
+            return _LAW_MAPPING_CACHE
 
-    if not _MAPPING_FILE.exists():
-        _LAW_MAPPING_CACHE = []
-        return _LAW_MAPPING_CACHE
+        entries = []
+        with open(_MAPPING_FILE, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                # 提取关键词（从场景描述中拆分）
+                scenario = row.get("用户常见问法/场景", "").strip()
+                law = row.get("实际法律依据", "").strip()
+                citation = row.get("正确引用索引", "").strip()
+                if not scenario:
+                    continue
+                # 生成关键词列表：拆分场景描述中的关键词
+                keywords = _extract_keywords(scenario)
+                entries.append({
+                    "id": len(entries) + 1,
+                    "scenario": scenario,
+                    "law": law,
+                    "citation": citation,
+                    "keywords": keywords,
+                    "wrong_area": row.get("常误认为《民法典》条文", "").strip(),
+                })
 
-    entries = []
-    with open(_MAPPING_FILE, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f, delimiter="\t")
-        for row in reader:
-            # 提取关键词（从场景描述中拆分）
-            scenario = row.get("用户常见问法/场景", "").strip()
-            law = row.get("实际法律依据", "").strip()
-            citation = row.get("正确引用索引", "").strip()
-            if not scenario:
-                continue
-            # 生成关键词列表：拆分场景描述中的关键词
-            keywords = _extract_keywords(scenario)
-            entries.append({
-                "id": len(entries) + 1,
-                "scenario": scenario,
-                "law": law,
-                "citation": citation,
-                "keywords": keywords,
-                "wrong_area": row.get("常误认为《民法典》条文", "").strip(),
-            })
-
-    _LAW_MAPPING_CACHE = entries
-    return entries
+        _LAW_MAPPING_CACHE = entries
+    return _LAW_MAPPING_CACHE
 
 
 def _extract_keywords(text: str) -> list[str]:
@@ -168,7 +180,8 @@ def get_all_entries() -> list[dict]:
 
 
 def reload_mapping():
-    """重新加载映射表（用于热更新）"""
+    """重新加载映射表（用于热更新；锁保护防并发读到半清空状态，P1 #12）"""
     global _LAW_MAPPING_CACHE
-    _LAW_MAPPING_CACHE = None
-    return _load_mapping()
+    with _LOAD_LOCK:
+        _LAW_MAPPING_CACHE = None
+        return _load_mapping()

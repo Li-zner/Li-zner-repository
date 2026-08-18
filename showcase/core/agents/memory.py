@@ -15,8 +15,15 @@ def compress_message_history(messages: list, max_messages: int = 6) -> list:
     if len(messages) <= max_messages:
         return messages
 
-    prior_messages = messages[:-max_messages]
-    recent_messages = messages[-max_messages:]
+    # 已有的【历史摘要】system 消息（来自滚动压缩）不参与截断，始终保留
+    summaries = [m for m in messages
+                 if m.get("role") == "system" and (m.get("content") or "").startswith("【历史摘要】")]
+    rest = [m for m in messages if m not in summaries]
+    if len(rest) <= max_messages:
+        return messages
+
+    prior_messages = rest[:-max_messages]
+    recent_messages = rest[-max_messages:]
     prior_text_parts = []
     for msg in prior_messages:
         content = (msg.get("content") or "").strip()
@@ -25,7 +32,7 @@ def compress_message_history(messages: list, max_messages: int = 6) -> list:
         prior_text_parts.append(content[:120])
 
     summary_text = " ".join(prior_text_parts[-4:]) if prior_text_parts else "历史上下文较多"
-    compacted = [{
+    compacted = summaries + [{
         "role": "system",
         "content": f"【历史摘要】请忽略更早的冗长对话，只按以下要点继续回答：{summary_text[:600]}"
     }]

@@ -1,97 +1,226 @@
+"""
+配置管理（Pydantic BaseSettings，2026-08-18 迁移，遗留 A2）
+
+- 统一从环境变量 + .env 读取，类型自动校验（int/float/str），非法值启动即报错。
+- 安全凭据缺失 fail loudly（SESSION_SECRET_KEY / JWT_SECRET / ADMIN_PASSWORD）。
+- CORS 通配符与 allow_credentials=True 冲突时拒绝启动。
+"""
 import os
 
-# ============================================
-# 配置区
-# ============================================
-# 安全：数据库连接串必须来自环境变量（docker-compose 注入），不再内置默认密码。
-# 若未配置则置空，连接时 db.py 会给出明确报错（fail loudly），绝不回退到硬编码密钥。
-POSTGRES_DSN = os.getenv("DATABASE_URL") or ""
-DATABASE_URL = POSTGRES_DSN  # MemoryManager 使用的别名
-TIMEOUT_SECONDS = float(os.getenv("TIMEOUT_SECONDS", "30.0"))
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# GitHub OAuth 配置
-GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
-GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
-SESSION_SECRET_KEY = os.getenv("SESSION_SECRET_KEY")
-if not SESSION_SECRET_KEY:
+
+class _Settings(BaseSettings):
+    """全量配置（字段名小写，自动匹配 UPPER_SNAKE 环境变量，大小写不敏感）"""
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    # ---------- 数据库 ----------
+    database_url: str = ""
+    timeout_seconds: float = 30.0
+
+    # ---------- GitHub OAuth ----------
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    session_secret_key: str = ""
+
+    # ---------- JWT ----------
+    jwt_secret: str = ""
+    jwt_secret_old: str = ""
+    access_token_expire_minutes: int = 120
+    refresh_token_expire_days: int = 30
+    refresh_max_days: int = 30
+
+    # ---------- DeepSeek ----------
+    deepseek_api_base: str = "https://api.deepseek.com"
+    deepseek_api_timeout: float = 30.0
+    deepseek_model: str = "deepseek-v4-flash"
+    deepseek_flash_model: str = "deepseek-v4-flash"
+    deepseek_fallback_message: str = "服务器繁忙，请稍后再提问吧！"
+    rerank_sim_threshold: float = 0.6
+    llm_temperature: float = 0.3
+
+    # ---------- 对话管理 ----------
+    summary_threshold: int = 20
+    history_limit: int = 20
+    history_ttl: int = 86400
+    history_summary_ttl: int = 604800
+
+    # ---------- 超时 ----------
+    tool_timeout: float = 30.0
+    http_timeout_short: float = 5.0
+    http_timeout_medium: float = 15.0
+    http_timeout_long: float = 30.0
+    map_api_timeout: float = 8.0
+    db_acquire_timeout: float = 10.0
+    task_timeout: float = 120.0
+    llm_connect_timeout: float = 10.0
+    task_ttl_seconds: int = 3600
+
+    # ---------- Embedding / 语义缓存 ----------
+    embedding_api_url: str = "http://localhost:11434/api/embeddings"
+    embedding_api_key: str = ""
+    embedding_model: str = "shaw/dmeta-embedding-zh"
+    cache_similarity_threshold: float = 0.85
+    cache_l0_ttl: int = 600
+
+    # ---------- 限流（角色分级）----------
+    daily_request_limit: int = 50000
+    daily_token_limit: int = 10000000
+    second_request_limit: int = 500
+    admin_qps_limit: int = 5000
+    admin_daily_req: int = 1000000
+    admin_daily_token: int = 50000000
+    admin_concurrent: int = 500
+    user_qps_limit: int = 2000
+    user_daily_req: int = 500000
+    user_daily_token: int = 50000000
+    user_concurrent: int = 200
+
+    # ---------- GitHub 试用额度 ----------
+    github_question_limit: int = 20
+
+    # ---------- 短信 ----------
+    alibaba_cloud_access_key_id: str = ""
+    alibaba_cloud_access_key_secret: str = ""
+    sms_sign: str = "旅行助手"
+    sms_template_code: str = "SMS_000000"
+    sms_code_expire_seconds: int = 300
+    sms_send_min_interval: int = 60
+    sms_send_hour_limit: int = 5
+    sms_attempt_limit: int = 5
+    sms_attempt_lock_seconds: int = 900
+
+    # ---------- 安全凭据 ----------
+    admin_phone: str = ""
+    admin_username: str = "admin"
+    admin_password: str = ""
+    fengfeng_password: str = ""
+
+    # ---------- CORS / 回调 ----------
+    cors_origins: str = "http://localhost:10088,http://localhost:10086,http://localhost:10089,http://localhost:10090"
+    github_redirect_uri: str = "http://localhost:10088/auth/github/callback"
+    gateway_public_url: str = "http://localhost:10088"
+
+    # ---------- 密码 ----------
+    bcrypt_max_bytes: int = 72
+    # C7：SHA-256 预处理后无 72 字节硬上限，此为策略上限（防超长密码 DoS）
+    password_max_bytes: int = 128
+
+    # ---------- 支付 ----------
+    payment_success_rate: float = 0.95
+    payment_simulated_delay_min: float = 1.0
+    payment_simulated_delay_max: float = 3.0
+    recharge_min_amount: float = 0.01
+    recharge_max_amount: float = 999999.00
+    default_wallet_balance: float = 0.00
+    order_expire_seconds: int = 600
+    token_cost_rate: float = 10.0
+
+
+_settings = _Settings()
+
+# ===== 安全校验（fail loudly，A2：BaseSettings 迁移后保留）=====
+if not _settings.session_secret_key:
     raise RuntimeError("SESSION_SECRET_KEY 环境变量未设置！请在 .env 中配置一个强随机字符串。")
-
-# JWT 配置（2026-08-11 加固：短时效 + 前端 401 自动刷新）
-SECRET_KEY = os.getenv("JWT_SECRET")
-if not SECRET_KEY:
+if not _settings.jwt_secret:
     raise RuntimeError("JWT_SECRET 环境变量未设置！请在 .env 中配置一个强随机字符串。")
-# 旧密钥（轮换并行期使用；可选，未设置则跳过）。
-# 轮换流程: 新 JWT_SECRET 生效后，旧值保留在 JWT_SECRET_OLD，
-#           直到所有旧 token 过期再移除（见 scripts/rotate_jwt_secret.sh）。
-SECRET_KEY_OLD = os.getenv("JWT_SECRET_OLD") or None
+if not _settings.admin_password and os.getenv("APP_ENV") != "test":
+    raise RuntimeError("ADMIN_PASSWORD 环境变量未设置！admin 账户空密码是安全漏洞，请配置强随机字符串。")
+
+# CORS：逗号分隔转列表 + 逐项 trim；通配符与 allow_credentials=True 冲突时拒绝启动
+CORS_ORIGINS = [o.strip() for o in _settings.cors_origins.split(",") if o.strip()]
+if "*" in CORS_ORIGINS:
+    raise RuntimeError("CORS_ORIGINS 不能包含 '*'（与 allow_credentials=True 冲突），请配置具体来源")
+
+# ===== 模块级导出（保持所有 import 名兼容）=====
+POSTGRES_DSN = _settings.database_url
+DATABASE_URL = POSTGRES_DSN  # MemoryManager 使用的别名
+TIMEOUT_SECONDS = _settings.timeout_seconds
+
+GITHUB_CLIENT_ID = _settings.github_client_id
+GITHUB_CLIENT_SECRET = _settings.github_client_secret
+SESSION_SECRET_KEY = _settings.session_secret_key
+
+SECRET_KEY = _settings.jwt_secret
+SECRET_KEY_OLD = _settings.jwt_secret_old or None
 ALGORITHM = "HS256"
-# access token 短时效（默认 2 小时；前端 apiFetch 已支持 401 自动刷新）
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "120"))
-# 独立 refresh token 有效期（默认 30 天；登出/轮换后旧 refresh 进 Redis 黑名单）
-REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
-# 滑动续期最大会话时长：超过该天数未活跃则需重新登录
-REFRESH_MAX_DAYS = 30
+ACCESS_TOKEN_EXPIRE_MINUTES = _settings.access_token_expire_minutes
+REFRESH_TOKEN_EXPIRE_DAYS = _settings.refresh_token_expire_days
+REFRESH_MAX_DAYS = _settings.refresh_max_days
 
-# DeepSeek 配置
-DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com")
-DEEPSEEK_API_TIMEOUT = float(os.getenv("DEEPSEEK_API_TIMEOUT", "30.0"))
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")          # 主力模型（flash）
-DEEPSEEK_FLASH_MODEL = os.getenv("DEEPSEEK_FLASH_MODEL", "deepseek-v4-flash")  # Flash 降级模型
-DEEPSEEK_FALLBACK_MESSAGE = os.getenv("DEEPSEEK_FALLBACK_MESSAGE", "服务器繁忙，请稍后再提问吧！")
+DEEPSEEK_API_BASE = _settings.deepseek_api_base
+DEEPSEEK_API_TIMEOUT = _settings.deepseek_api_timeout
+DEEPSEEK_MODEL = _settings.deepseek_model
+DEEPSEEK_FLASH_MODEL = _settings.deepseek_flash_model
+DEEPSEEK_FALLBACK_MESSAGE = _settings.deepseek_fallback_message
+RERANK_SIM_THRESHOLD = _settings.rerank_sim_threshold
+LLM_TEMPERATURE = _settings.llm_temperature
 
-# 对话管理
-SUMMARY_THRESHOLD = int(os.getenv("SUMMARY_THRESHOLD", "20"))
+SUMMARY_THRESHOLD = _settings.summary_threshold
+HISTORY_LIMIT = _settings.history_limit
+HISTORY_TTL = _settings.history_ttl
+HISTORY_SUMMARY_TTL = _settings.history_summary_ttl
 
-# 工具调用超时
-TOOL_TIMEOUT = float(os.getenv("TOOL_TIMEOUT", "30.0"))
+TOOL_TIMEOUT = _settings.tool_timeout
+HTTP_TIMEOUT_SHORT = _settings.http_timeout_short
+HTTP_TIMEOUT_MEDIUM = _settings.http_timeout_medium
+HTTP_TIMEOUT_LONG = _settings.http_timeout_long
+MAP_API_TIMEOUT = _settings.map_api_timeout
+DB_ACQUIRE_TIMEOUT = _settings.db_acquire_timeout
+TASK_TIMEOUT = _settings.task_timeout
+LLM_CONNECT_TIMEOUT = _settings.llm_connect_timeout
+TASK_TTL_SECONDS = _settings.task_ttl_seconds
 
-# ===== 超时收口（2026-08-11 集中管理，命名 = 用途_语义）=====
-# 所有超时统一在此定义，业务代码禁止再写裸数字 timeout=xx
-HTTP_TIMEOUT_SHORT   = float(os.getenv("HTTP_TIMEOUT_SHORT", "5.0"))     # 短查询（工具/意图分类）
-HTTP_TIMEOUT_MEDIUM  = float(os.getenv("HTTP_TIMEOUT_MEDIUM", "15.0"))   # 中等（编排/子Agent/文件）
-HTTP_TIMEOUT_LONG    = float(os.getenv("HTTP_TIMEOUT_LONG", "30.0"))     # 长任务（摘要/兜底）
-MAP_API_TIMEOUT      = float(os.getenv("MAP_API_TIMEOUT", "8.0"))        # 地图 API
-DB_ACQUIRE_TIMEOUT   = float(os.getenv("DB_ACQUIRE_TIMEOUT", "10.0"))    # 数据库连接获取
-TASK_TIMEOUT         = float(os.getenv("TASK_TIMEOUT", "120.0"))         # 任务式聊天整体超时
-LLM_CONNECT_TIMEOUT  = float(os.getenv("LLM_CONNECT_TIMEOUT", "10.0"))   # LLM 连接阶段超时
-# DEEPSEEK_API_TIMEOUT 在上方 DeepSeek 配置段定义（读超时）
+EMBEDDING_API_URL = _settings.embedding_api_url
+EMBEDDING_API_KEY = _settings.embedding_api_key
+EMBEDDING_MODEL = _settings.embedding_model
+CACHE_SIMILARITY_THRESHOLD = _settings.cache_similarity_threshold
+CACHE_L0_TTL = _settings.cache_l0_ttl
 
+DAILY_REQUEST_LIMIT = _settings.daily_request_limit
+DAILY_TOKEN_LIMIT = _settings.daily_token_limit
+SECOND_REQUEST_LIMIT = _settings.second_request_limit
+ADMIN_QPS_LIMIT = _settings.admin_qps_limit
+ADMIN_DAILY_REQ = _settings.admin_daily_req
+ADMIN_DAILY_TOKEN = _settings.admin_daily_token
+ADMIN_CONCURRENT = _settings.admin_concurrent
+USER_QPS_LIMIT = _settings.user_qps_limit
+USER_DAILY_REQ = _settings.user_daily_req
+USER_DAILY_TOKEN = _settings.user_daily_token
+USER_CONCURRENT = _settings.user_concurrent
 
-# 语义缓存 & Embedding
-EMBEDDING_API_URL = os.getenv("EMBEDDING_API_URL", "http://localhost:11434/api/embeddings")
-EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "shaw/dmeta-embedding-zh")
-CACHE_SIMILARITY_THRESHOLD = float(os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.85"))
+GITHUB_QUESTION_LIMIT = _settings.github_question_limit
 
-# 限流配置（求职演示用-大幅放宽）
-DAILY_REQUEST_LIMIT = 50000       # 每日请求上限 5万
-DAILY_TOKEN_LIMIT = 10000000      # 每日 Token 上限 1000万
-SECOND_REQUEST_LIMIT = 500       # 每秒请求上限 500（压测放宽）
+ALIBABA_CLOUD_ACCESS_KEY_ID = _settings.alibaba_cloud_access_key_id.strip()
+ALIBABA_CLOUD_ACCESS_KEY_SECRET = _settings.alibaba_cloud_access_key_secret.strip()
+SMS_SIGN = _settings.sms_sign
+SMS_TEMPLATE_CODE = _settings.sms_template_code
+SMS_CODE_EXPIRE_SECONDS = _settings.sms_code_expire_seconds
+SMS_SEND_MIN_INTERVAL = _settings.sms_send_min_interval
+SMS_SEND_HOUR_LIMIT = _settings.sms_send_hour_limit
+SMS_ATTEMPT_LIMIT = _settings.sms_attempt_limit
+SMS_ATTEMPT_LOCK_SECONDS = _settings.sms_attempt_lock_seconds
 
-# 短信配置（阿里云 SMS）
-ALIBABA_CLOUD_ACCESS_KEY_ID = os.getenv("ALIBABA_CLOUD_ACCESS_KEY_ID", "").strip(' \"\'')
-ALIBABA_CLOUD_ACCESS_KEY_SECRET = os.getenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET", "").strip(' \"\'')
-SMS_SIGN = os.getenv("SMS_SIGN", "旅行助手")
-SMS_TEMPLATE_CODE = os.getenv("SMS_TEMPLATE_CODE", "SMS_000000")  # 需在阿里云 SMS 控制台申请
-# ===== 安全凭据（必须通过环境变量设置，不可使用默认值）=====
-ADMIN_PHONE = os.getenv("ADMIN_PHONE", "")
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # 管理员密码，必须设置
-USER_FENGFENG_PASSWORD = os.getenv("FENGFENG_PASSWORD", "")  # Fengfeng用户密码
+ADMIN_PHONE = _settings.admin_phone
+ADMIN_USERNAME = _settings.admin_username
+ADMIN_PASSWORD = _settings.admin_password
+USER_FENGFENG_PASSWORD = _settings.fengfeng_password
 
-# CORS 与 OAuth 回调（生产环境必须覆盖）
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:10088,http://localhost:10086,http://localhost:10089,http://localhost:10090").split(",")
-GITHUB_REDIRECT_URI = os.getenv("GITHUB_REDIRECT_URI", "http://localhost:10088/auth/github/callback")
+GITHUB_REDIRECT_URI = _settings.github_redirect_uri
+GATEWAY_PUBLIC_URL = _settings.gateway_public_url
 
-# 网关对外地址（用于回调跳转）
-GATEWAY_PUBLIC_URL = os.getenv("GATEWAY_PUBLIC_URL", "http://localhost:10088")
+BCRYPT_MAX_BYTES = _settings.bcrypt_max_bytes  # bcrypt 技术上限（存量截断兼容用，C11 去魔数）
+PASSWORD_MAX_BYTES = _settings.password_max_bytes  # C7：新方案密码策略上限（SHA-256 预处理）
 
-# ===== 模拟支付配置 =====
-PAYMENT_SUCCESS_RATE = float(os.getenv("PAYMENT_SUCCESS_RATE", "0.95"))          # 模拟支付成功率
-PAYMENT_SIMULATED_DELAY_MIN = float(os.getenv("PAYMENT_SIMULATED_DELAY_MIN", "1.0"))  # 最小模拟延迟（秒）
-PAYMENT_SIMULATED_DELAY_MAX = float(os.getenv("PAYMENT_SIMULATED_DELAY_MAX", "3.0"))  # 最大模拟延迟（秒）
-RECHARGE_MIN_AMOUNT = float(os.getenv("RECHARGE_MIN_AMOUNT", "0.01"))           # 最小充值金额
-RECHARGE_MAX_AMOUNT = float(os.getenv("RECHARGE_MAX_AMOUNT", "999999.00"))      # 最大充值金额
-DEFAULT_WALLET_BALANCE = float(os.getenv("DEFAULT_WALLET_BALANCE", "0.00"))     # 新用户默认余额（元）
-ORDER_EXPIRE_SECONDS = int(os.getenv("ORDER_EXPIRE_SECONDS", "600"))             # 订单过期时间（秒）
-TOKEN_COST_RATE = float(os.getenv("TOKEN_COST_RATE", "10.0"))                   # 每万token价格（元）
+PAYMENT_SUCCESS_RATE = _settings.payment_success_rate
+PAYMENT_SIMULATED_DELAY_MIN = _settings.payment_simulated_delay_min
+PAYMENT_SIMULATED_DELAY_MAX = _settings.payment_simulated_delay_max
+RECHARGE_MIN_AMOUNT = _settings.recharge_min_amount
+RECHARGE_MAX_AMOUNT = _settings.recharge_max_amount
+DEFAULT_WALLET_BALANCE = _settings.default_wallet_balance
+ORDER_EXPIRE_SECONDS = _settings.order_expire_seconds
+TOKEN_COST_RATE = _settings.token_cost_rate

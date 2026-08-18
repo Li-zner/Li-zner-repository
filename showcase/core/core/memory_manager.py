@@ -1,16 +1,21 @@
 import json
+import os
 import asyncio
 from typing import List, Dict
 from ..core.redis import get_redis
 from ..core.db import get_pool
 from ..core.logging import setup_logging
+from ..core.config import HISTORY_LIMIT, HISTORY_TTL, HISTORY_SUMMARY_TTL
+from ..agents.memory import generate_summary
 
 logger = setup_logging()
 
 # ============================================================
 # 限流队列：控制 PG 写入并发，防止连接池耗尽
+# 连接池 max=50，并发写放大到 12（原 5 太低，拖慢落库）
 # ============================================================
-_PG_WRITE_SEMAPHORE = asyncio.Semaphore(5)  # 最多 5 个并发 PG 写入
+# 最多 12 个并发 PG 写入；与连接池上限联动（P1 #42：防连接池耗尽）
+_PG_WRITE_SEMAPHORE = asyncio.Semaphore(max(1, min(12, int(os.getenv("DB_POOL_MAX_SIZE", "50")) // 4)))
 
 
 class MemoryManager:
@@ -19,23 +24,25 @@ class MemoryManager:
     def __init__(self, user_id: str, conv_id: str):
         self.user_id = user_id
         self.conv_id = conv_id
+        self._history_key = f"conv:{self.conv_id}"
+        self._summary_key = f"conv_summary:{self.conv_id}"
 
     # ---------- 读路径：L1(Redis) -> L2(PG) 回填 ----------
-    async def get_context(self, limit: int = 20, offset: int = 0) -> List[Dict]:
+    async def get_context(self, limit: int = HISTORY_LIMIT, offset: int = 0) -> List[Dict]:
         """
         获取历史消息（支持分页）
         limit: 返回条数
         offset: 偏移量（用于分页加载早期消息）
+        首页（offset=0）会注入滚动压缩摘要【历史摘要】，帮助 LLM 理解更早的上下文。
         """
         redis = await get_redis()
-        history_key = f"conv:{self.conv_id}"
-        cache_key = f"conv_cache:{self.conv_id}"
 
         # 首次加载：走 Redis L1 缓存
         if offset == 0:
-            raw = await redis.lrange(history_key, -limit, -1)
+            raw = await redis.lrange(self._history_key, -limit, -1)
             if raw:
-                return [json.loads(m) for m in raw]
+                msgs = [json.loads(m) for m in raw]
+                return await self._inject_summary(redis, msgs)
 
         # L1 缺失：从 PG 分页加载，回填 Redis
         pg_messages = await self._fetch_from_pg(limit, offset)
@@ -43,10 +50,23 @@ class MemoryManager:
             # 仅首页回填 Redis 热缓存
             pipe = redis.pipeline()
             for msg in pg_messages:
-                pipe.rpush(history_key, json.dumps(msg))
-            pipe.expire(history_key, 3600)
+                pipe.rpush(self._history_key, json.dumps(msg))
+            pipe.expire(self._history_key, HISTORY_TTL)
             await pipe.execute()
+            pg_messages = await self._inject_summary(redis, pg_messages)
         return pg_messages
+
+    async def _inject_summary(self, redis, msgs: List[Dict]) -> List[Dict]:
+        """把滚动压缩摘要注入为第一条（system），供 LLM 理解更早上下文"""
+        try:
+            summary = await redis.get(self._summary_key)
+            if summary:
+                summary = summary.decode() if isinstance(summary, bytes) else summary
+                if summary and summary.strip():
+                    return [{"role": "system", "content": f"【历史摘要】{summary}"}] + msgs
+        except Exception as e:
+            logger.warning(f"读取对话摘要失败: {e}")
+        return msgs
 
     async def _fetch_from_pg(self, limit: int, offset: int = 0) -> List[Dict]:
         pool = await get_pool()
@@ -63,21 +83,49 @@ class MemoryManager:
     async def save_user_message(self, user_msg: Dict):
         """仅保存用户消息（用于流式开始时立即保存，防止刷新丢失）"""
         redis = await get_redis()
-        history_key = f"conv:{self.conv_id}"
-        await redis.rpush(history_key, json.dumps(user_msg))
-        await redis.expire(history_key, 3600)
+        await redis.rpush(self._history_key, json.dumps(user_msg))
+        await redis.expire(self._history_key, HISTORY_TTL)
+        await self._trim_and_compress(redis)
 
     async def save_messages(self, user_msg: Dict, assistant_msg: Dict):
-        """双写：Redis（热） + PG（冷）"""
+        """双写：Redis（热，按条数保留） + PG（冷，全量落库）"""
         redis = await get_redis()
-        history_key = f"conv:{self.conv_id}"
         # 先写用户消息，再写助手消息，保持顺序
-        await redis.rpush(history_key, json.dumps(user_msg))
-        await redis.rpush(history_key, json.dumps(assistant_msg))
-        await redis.expire(history_key, 3600)
+        await redis.rpush(self._history_key, json.dumps(user_msg))
+        await redis.rpush(self._history_key, json.dumps(assistant_msg))
+        await redis.expire(self._history_key, HISTORY_TTL)
+        await self._trim_and_compress(redis)
 
-        import asyncio
         asyncio.create_task(self._save_to_pg(user_msg, assistant_msg))
+
+    # ---------- 条数限制 + 滚动压缩摘要 ----------
+    async def _trim_and_compress(self, redis):
+        """保留最近 HISTORY_LIMIT 条；溢出的旧消息异步压缩为滚动摘要"""
+        try:
+            llen = await redis.llen(self._history_key)
+            if llen <= HISTORY_LIMIT:
+                return
+            overflow = await redis.lrange(self._history_key, 0, llen - HISTORY_LIMIT - 1)
+            await redis.ltrim(self._history_key, -HISTORY_LIMIT, -1)
+            asyncio.create_task(self._compress_overflow(overflow))
+        except Exception as e:
+            logger.warning(f"对话历史条数裁剪失败: {e}")
+
+    async def _compress_overflow(self, overflow_msgs):
+        """滚动摘要：旧摘要 + 本次溢出 → LLM 重新生成摘要（失败不阻塞主流程）"""
+        try:
+            redis = await get_redis()
+            old = await redis.get(self._summary_key)
+            old_text = old.decode() if isinstance(old, bytes) else (old or "")
+            combined = []
+            if old_text and old_text.strip():
+                combined.append({"role": "system", "content": f"此前摘要：{old_text}"})
+            combined.extend(json.loads(m) for m in overflow_msgs)
+            new_summary = await generate_summary(combined)
+            if new_summary and new_summary.strip():
+                await redis.set(self._summary_key, new_summary, ex=HISTORY_SUMMARY_TTL)
+        except Exception as e:
+            logger.warning(f"生成滚动摘要失败（不影响主流程）: {e}")
 
     async def _save_to_pg(self, user_msg: Dict, assistant_msg: Dict):
         """异步写入 PostgreSQL（带限流与错误处理）"""
@@ -96,6 +144,7 @@ class MemoryManager:
                             "(user_id, conversation_id, role, content) VALUES ($1, $2, $3, $4)",
                             self.user_id, self.conv_id, "assistant", assistant_msg["content"]
                         )
+                    # 画像更新必须在事务之外执行（P0 #41）：画像失败不会回滚已提交的对话记忆
                     await self._update_profile_async(conn, user_msg["content"], assistant_msg["content"])
             except Exception as e:
                 logger.warning(f"PG 写入失败（不影响主流程）: {e}")
@@ -131,7 +180,7 @@ class MemoryManager:
         import re
         new_profile = {}
         # 只匹配以 市/州/省/区 结尾的地名（至少2字），避免把"今天""你好"等词误认为城市
-        cities = re.findall(r'([\u4e00-\u9fa5]{2,4}(?:市|州|省|区))', user_content)
+        cities = re.findall(r'([\u4e00-\u9fa5]{2,4}(?:市|州|省|区|自治区))', user_content)
         if cities:
             new_profile["recent_cities"] = cities
         budget_match = re.search(r'(\d+)[-~](\d+)?元', user_content)
@@ -158,8 +207,10 @@ class MemoryManager:
                 from datetime import datetime, timedelta
                 updated = row["updated_at"]
                 if updated and (datetime.now() - updated) > timedelta(days=90):
+                    # 原子条件删除（P1 #44）：带过期条件，避免"读-删"两步竞态与重复清理
                     await conn.execute(
-                        "DELETE FROM user_profiles WHERE user_id = $1",
+                        "DELETE FROM user_profiles WHERE user_id = $1 "
+                        "AND updated_at < NOW() - INTERVAL '90 days'",
                         self.user_id
                     )
                     return ""

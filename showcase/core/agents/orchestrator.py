@@ -181,6 +181,8 @@ class DiscussionBoard:
             p = AGENT_PROFILES.get(agent_id, {})
             aname = p.get("name", agent_id)
             analysis = opinion.get("analysis", "无")
+            # 二次过滤：防 LLM 输出中的注入语句污染后续 Agent 判断（P0 #30）
+            analysis = _sanitize_context(str(analysis))
             parts.append(f"### {aname} 的分析\n{analysis}")
             cross = opinion.get("cross_comments", "")
             if cross and cross != "无":
@@ -312,11 +314,13 @@ async def _call_deepseek_think(
 
             return json.loads(content)
     except json.JSONDecodeError as e:
-        logger.warning(f"Agent {agent_id} {phase} JSON解析失败: {e}")
-        return {"analysis": f"（分析失败: JSON解析错误）", "cross_comments": "无", "suggestions": []}
+        logger.warning(f"Agent {agent_id} {phase} JSON解析失败: {str(e)[:120]}")
+        # 带 error 标记：调用方可区分"正常返回"与"降级"（P1 #9）
+        return {"analysis": "（分析失败: JSON解析错误）", "cross_comments": "无", "suggestions": [], "error": True}
     except Exception as e:
-        logger.warning(f"Agent {agent_id} {phase} 调用失败: {e}")
-        return {"analysis": f"（分析失败: {str(e)[:50]}）", "cross_comments": "无", "suggestions": []}
+        # 日志截断：避免记录可能含 API Key 的完整异常（P1 #5）
+        logger.warning(f"Agent {agent_id} {phase} 调用失败: {str(e)[:120]}")
+        return {"analysis": f"（分析失败: {str(e)[:50]}）", "cross_comments": "无", "suggestions": [], "error": True}
 
 
 # ============================================================
@@ -373,7 +377,7 @@ class AgentOrchestrator:
         for idx, agent_id in enumerate(agent_ids):
             result = results[idx]
             if isinstance(result, Exception):
-                result = {"analysis": f"（分析异常: {str(result)[:50]}）", "cross_comments": "无", "suggestions": []}
+                result = {"analysis": f"（分析异常: {str(result)[:50]}）", "cross_comments": "无", "suggestions": [], "error": True}
             opinions[agent_id] = result
             self.board.add_phase1_opinion(agent_id, result)
 

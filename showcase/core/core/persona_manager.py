@@ -23,7 +23,8 @@ class Persona:
     def __init__(self, persona_id: str, name: str, icon: str,
                  system_prompt: str, model: str = "",
                  tools_enabled: list = None,
-                 knowledge_base: str = ""):
+                 knowledge_base: str = "",
+                 show_reasoning: bool = True):
         self.id = persona_id
         self.name = name
         self.icon = icon
@@ -31,6 +32,7 @@ class Persona:
         self.model = model
         self.tools_enabled = tools_enabled or []
         self.knowledge_base = knowledge_base  # 关联的知识库文件路径
+        self.show_reasoning = show_reasoning  # 是否展示思考过程（P2 #24 配置化）
 
     def to_dict(self):
         return {
@@ -67,6 +69,7 @@ class PersonaManager:
                     model=data.get("model", ""),
                     tools_enabled=data.get("tools", []),
                     knowledge_base=data.get("knowledge_base", ""),
+                    show_reasoning=data.get("show_reasoning", True),  # P2 #24：默认展示思考
                 )
                 self._personas[persona.id] = persona
                 logger.info(f"🧑 加载人格: {persona.icon} {persona.name} (id={persona.id})")
@@ -76,6 +79,16 @@ class PersonaManager:
         # 默认选中 unified（综合助手），不存在则选第一个
         if self._personas and not self._current:
             self._current = "unified" if "unified" in self._personas else list(self._personas.keys())[0]
+        # 降级兜底：prompts 目录缺失或解析全失败时，注册内置默认人格，避免 LLM 无 system prompt（P1 #67）
+        if not self._personas:
+            self._personas["unified"] = Persona(
+                persona_id="unified",
+                name="统一助手",
+                icon="🤖",
+                system_prompt="你是AI助手，请直接、准确地回答用户的问题。今天是{today}。",
+            )
+            self._current = "unified"
+            logger.warning("prompts 目录为空或解析失败，已注册内置默认人格（unified）")
 
     @property
     def current(self) -> Optional[Persona]:
@@ -129,8 +142,25 @@ class PersonaManager:
 _manager = None
 
 
+def _build_degraded_manager() -> PersonaManager:
+    """降级单例：仅含内置默认人格（P1 #68：初始化失败时防全局状态异常）"""
+    pm = PersonaManager.__new__(PersonaManager)  # 绕过 __init__（不加载 prompts）
+    pm._personas = {}
+    pm._current = "unified"
+    pm._personas["unified"] = Persona(
+        persona_id="unified", name="统一助手", icon="AI",
+        system_prompt="你是AI助手，请直接、准确地回答用户的问题。今天是{today}。",
+    )
+    return pm
+
+
 def get_persona_manager() -> PersonaManager:
     global _manager
     if _manager is None:
-        _manager = PersonaManager()
+        try:
+            _manager = PersonaManager()
+        except Exception as e:
+            # 初始化失败：记录错误并使用降级单例（P1 #68）
+            logger.error(f"人格管理器初始化失败，使用降级单例: {e}")
+            _manager = _build_degraded_manager()
     return _manager

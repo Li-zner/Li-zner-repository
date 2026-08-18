@@ -7,11 +7,15 @@ import io
 import json
 import zipfile
 import asyncio
+import threading
 from pathlib import Path
 from typing import Optional
 from ..core.logging import setup_logging
 
 logger = setup_logging()
+
+# OCR 引擎串行化锁：RapidOCR 内部 ONNX Runtime 不支持并发调用（P1 #43）
+_OCR_LOCK = threading.Lock()
 
 # ============================================================
 # 图片 OCR 引擎（RapidOCR 优先，Tesseract 降级）
@@ -50,31 +54,32 @@ def _ocr_image(img: Image.Image, label: str = "") -> str:
     if not _HAS_RAPID and not _HAS_TESSERACT:
         return ""
     try:
-        if _HAS_RAPID:
-            # RapidOCR：直接处理 PIL Image
-            result, elapse = _RAPID_ENGINE(img)
-            if result:
-                texts = []
-                for box, text, conf in result:
-                    t = text.strip()
-                    if t:
-                        texts.append(t)
-                if texts:
-                    combined = " ".join(texts)
-                    return f"\n[图片 OCR{ ' ('+label+')' if label else '' }]: {combined}"
-            return ""
-        else:
-            # Tesseract 降级
-            if img.mode != 'L':
-                img = img.convert('L')
-            from PIL import ImageEnhance, ImageFilter
-            enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(1.5)
-            text = pytesseract.image_to_string(img, lang='chi_sim+eng', config='--psm 6')
-            result = text.strip()
-            if result:
-                return f"\n[图片 OCR{ ' ('+label+')' if label else '' }]: {result}"
-            return ""
+        with _OCR_LOCK:  # RapidOCR/ONNX 不支持并发，串行化（P1 #43）
+            if _HAS_RAPID:
+                # RapidOCR：直接处理 PIL Image
+                result, elapse = _RAPID_ENGINE(img)
+                if result:
+                    texts = []
+                    for box, text, conf in result:
+                        t = text.strip()
+                        if t:
+                            texts.append(t)
+                    if texts:
+                        combined = " ".join(texts)
+                        return f"\n[图片 OCR{ ' ('+label+')' if label else '' }]: {combined}"
+                return ""
+            else:
+                # Tesseract 降级
+                if img.mode != 'L':
+                    img = img.convert('L')
+                from PIL import ImageEnhance, ImageFilter
+                enhancer = ImageEnhance.Contrast(img)
+                img = enhancer.enhance(1.5)
+                text = pytesseract.image_to_string(img, lang='chi_sim+eng', config='--psm 6')
+                result = text.strip()
+                if result:
+                    return f"\n[图片 OCR{ ' ('+label+')' if label else '' }]: {result}"
+                return ""
     except Exception as e:
         logger.warning(f"OCR 失败 {label}: {e}")
         return ""
@@ -160,12 +165,14 @@ async def parse_image(filepath: str, dpi: int = 200) -> str:
                 return "[图片中未识别到文字]"
             else:
                 from PIL import Image, ImageEnhance, ImageFilter
-                img = Image.open(filepath)
-                if img.mode != 'L':
-                    img = img.convert('L')
-                enhancer = ImageEnhance.Contrast(img)
-                img = enhancer.enhance(1.5)
-                text = pytesseract.image_to_string(img, lang='chi_sim+eng', config='--psm 6')
+                with Image.open(filepath) as raw_img:  # P1 #6：显式关闭文件句柄
+                    if raw_img.mode != 'L':
+                        img = raw_img.convert('L')
+                    else:
+                        img = raw_img
+                    enhancer = ImageEnhance.Contrast(img)
+                    img = enhancer.enhance(1.5)
+                    text = pytesseract.image_to_string(img, lang='chi_sim+eng', config='--psm 6')
                 return text.strip() or "[图片中未识别到文字]"
         except Exception as e:
             return f"[OCR 识别失败: {e}]"
@@ -217,7 +224,13 @@ async def parse_docx(filepath: str) -> str:
         ocr_results = []
         try:
             with zipfile.ZipFile(filepath, 'r') as z:
-                media_files = [f for f in z.namelist() if f.startswith('word/media/')]
+                # Zip Slip 防护（P0 #4）：仅读取 word/media/ 下无路径穿越的成员
+                media_files = [
+                    f for f in z.namelist()
+                    if f.startswith('word/media/')
+                    and not f.startswith('/')
+                    and '..' not in os.path.normpath(f).split(os.sep)
+                ]
                 for idx, media_path in enumerate(sorted(media_files)):
                     img_bytes = z.read(media_path)
                     ext = os.path.splitext(media_path)[1].lstrip('.')

@@ -27,11 +27,13 @@ import time
 from datetime import datetime, timezone
 from typing import Optional, Dict
 from ..core.redis import get_redis as _get_redis
+from ..core.config import TASK_TTL_SECONDS, TASK_TIMEOUT
 
 # ---- 全局取消信号表 ----
 _cancel_events: Dict[str, asyncio.Event] = {}
 
-TASK_TTL = 600  # 10 分钟过期
+# 任务在 Redis 中的保留期（秒）：调大默认值，防长任务处理中被中途清除（P0 #35）
+TASK_TTL = TASK_TTL_SECONDS
 
 # ============================================================
 # Redis 读写
@@ -60,24 +62,33 @@ async def create_task(session_id: str, user_message: str, user_location: str = "
 
 
 async def get_task(task_id: str) -> Optional[dict]:
-    """获取任务状态"""
+    """获取任务状态（惰性超时检查：超过 TASK_TIMEOUT 未完成的 task 标记 timeout，P2 C1）"""
     r = await _redis()
     data = await r.hgetall(f"task:{task_id}")
     if not data:
         return None
-    # bytes → str
-    return {k.decode() if isinstance(k, bytes) else k:
-            v.decode() if isinstance(v, bytes) else v
-            for k, v in data.items()}
+    result = {k.decode() if isinstance(k, bytes) else k:
+              v.decode() if isinstance(v, bytes) else v
+              for k, v in data.items()}
+    # 惰性超时：pending/generating 超时 → 读侧标记 timeout（不写回，由外部定时任务清理）
+    if result.get("status") in ("pending", "generating"):
+        try:
+            _dt = datetime.fromisoformat(result.get("created_at") or "")
+            if _dt.tzinfo is None:
+                _dt = _dt.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - _dt).total_seconds() > TASK_TIMEOUT:
+                result["status"] = "timeout"
+        except Exception:
+            pass
+    return result
 
 
 async def update_status(task_id: str, status: str, result: str = ""):
     """更新任务状态和结果"""
     r = await _redis()
     now = datetime.now(timezone.utc).isoformat()
-    mapping = {"status": status, "updated_at": now}
-    if result:
-        mapping["result"] = result
+    # 显式设置 result（None/空串都覆盖旧值，避免残留，P1 #37）
+    mapping = {"status": status, "updated_at": now, "result": result if result is not None else ""}
     await r.hset(f"task:{task_id}", mapping=mapping)
     await r.expire(f"task:{task_id}", TASK_TTL)
 
@@ -85,7 +96,8 @@ async def update_status(task_id: str, status: str, result: str = ""):
 async def append_result(task_id: str, chunk: str):
     """追加结果文本"""
     r = await _redis()
-    await r.hincrbyfloat(f"task:{task_id}", "_result_len", len(chunk))
+    # 长度是整数，用 HINCRBY 而非 HINCRBYFLOAT（P1 #36）
+    await r.hincrby(f"task:{task_id}", "_result_len", len(chunk))
     # 用 append 到独立 key 避免 hset 覆盖
     await r.append(f"task:{task_id}:result_buf", chunk)
     await r.expire(f"task:{task_id}:result_buf", TASK_TTL)
@@ -128,19 +140,34 @@ def cleanup_event(task_id: str):
 
 # ============================================================
 # 幂等保护: 同一 session + 相同 message 10秒内复用
+# 多实例共享：幂等映射存 Redis（10s TTL），避免单实例字典无法跨实例共享（P0 #34）
 # ============================================================
 
-_idempotent_map: Dict[str, str] = {}  # key=f"{session_id}:{msg_hash}" → task_id
+# 幂等键前缀（Redis key），TTL 由 setex 控制，天然过期无需手动清理
+_IDEMPOTENT_PREFIX = "idempotent:"
 
 
 def _idempotent_key(session_id: str, msg: str) -> str:
     return f"{session_id}:{hashlib.sha256(msg.encode()).hexdigest()[:16]}"
 
 
+async def _persist_idempotent(key: str, task_id: str):
+    """写幂等映射到 Redis（10 秒 TTL）；失败仅影响幂等复用，不影响主流程"""
+    try:
+        r = await _redis()
+        await r.setex(f"{_IDEMPOTENT_PREFIX}{key}", 10, task_id)
+    except Exception:
+        pass
+
+
 async def try_idempotent(session_id: str, msg: str) -> Optional[str]:
-    """幂等检查：返回已有 task_id 或 None"""
+    """幂等检查：返回已有 task_id 或 None（Redis 读，异常时返回 None 容错）"""
     key = _idempotent_key(session_id, msg)
-    task_id = _idempotent_map.get(key)
+    try:
+        r = await _redis()
+        task_id = await r.get(f"{_IDEMPOTENT_PREFIX}{key}")
+    except Exception:
+        return None
     if task_id:
         task = await get_task(task_id)
         if task and task["status"] in ("pending", "generating"):
@@ -149,11 +176,9 @@ async def try_idempotent(session_id: str, msg: str) -> Optional[str]:
 
 
 def save_idempotent(session_id: str, msg: str, task_id: str):
-    """记录幂等映射（10秒后自动清除）"""
+    """记录幂等映射（10 秒 TTL，Redis 存储；保持同步签名，调用方无需改）"""
     key = _idempotent_key(session_id, msg)
-    _idempotent_map[key] = task_id
-    # 10秒后清理
-    def _clean():
-        if _idempotent_map.get(key) == task_id:
-            _idempotent_map.pop(key, None)
-    asyncio.get_running_loop().call_later(10, _clean)
+    try:
+        asyncio.get_running_loop().create_task(_persist_idempotent(key, task_id))
+    except RuntimeError:
+        pass  # 无运行循环（非 async 上下文）时静默跳过，幂等写入尽力而为

@@ -58,7 +58,7 @@ _WHITELIST = {
     ],
     "其他民事": [
         "诉讼时效", "三年", "抗辩权", "同时履行", "先履行", "不安抗辩权",
-        "亲子关系", "确认", "否认", "民事",
+        "亲子关系", "确认", "否认",
     ],
     "法条引用": [
         "民法典第", "第一千零", "第一千一百", "第一千二百", "第一千三百",
@@ -80,7 +80,7 @@ _WHITELIST_FLAT = list(dict.fromkeys(_WHITELIST_FLAT))
 # ============================================================
 _FORCED_CIVIL_KEYWORDS = [
     # ── 人格权编必答词（优先级高于治安管理处罚法）──
-    "偷拍", "隐私", "肖像", "查微信", "酒店摄像头", "摄像头",
+    "偷拍", "隐私", "肖像", "查微信", "酒店摄像头",
     "名誉权", "隐私权", "肖像权", "姓名权", "声音权", "人格尊严",
     "个人信息", "诽谤", "造谣", "起绰号", "侮辱",
     # ── 总则编行为能力必答词（优先级高于未成年人保护法）──
@@ -317,6 +317,12 @@ _WHITELIST_PATTERN = re.compile(
     '|'.join(re.escape(kw) for kw in sorted(_WHITELIST_FLAT, key=len, reverse=True))
 )
 
+# 通用安全敏感关键词（P0 #14：默认放行前拦截危险问题）
+_SAFETY_KEYWORDS = [
+    "炸弹", "爆炸物", "制毒", "毒品", "冰毒", "枪支", "弹药", "恐怖袭击",
+    "自杀方法", "自杀方式", "制作炸弹", "儿童色情", "爆破",
+]
+
 
 # ============================================================
 # 路由裁决函数
@@ -351,12 +357,11 @@ def route_query(query: str) -> RoutingResult:
     if not query:
         return RoutingResult(action="pass")
     
-    # Step 0: 口语→术语映射（优先进行，使 mapped_query 在所有路径中可用）
+    # Step 0: 口语→术语映射（优先进行，使 mapped_query 在所有路径中可用；全部替换，P2 #39）
     _mapped_query = query
     for _colloquial, _legal in sorted(_COLLOQUIAL_MAP.items(), key=lambda x: -len(x[0])):
         if _colloquial in _mapped_query:
             _mapped_query = _mapped_query.replace(_colloquial, _legal)
-            break
     _has_mapping = (_mapped_query != query)
     
     # Step 1: 检测是否引用了民法典法条编号
@@ -368,6 +373,9 @@ def route_query(query: str) -> RoutingResult:
         return result
     
     # Step 2: ⚡ 强制白名单（人格权编/总则编必答词，优先级高于黑名单）
+    # 注：P0 #3 的"词边界匹配"方案经测试对中文不可靠（前后助词/动词导致漏判真实民事问题，
+    #     如"被人偷拍了"），故保留子串匹配，改为移除过于宽泛的关键词（见 _FORCED_CIVIL_KEYWORDS）。
+    #     完全防"附加词绕过"需语义级判断，已登记遗留。
     for keyword in _FORCED_CIVIL_KEYWORDS:
         if keyword in query:
             result = RoutingResult(action="pass", match_type="forced_whitelist",
@@ -422,7 +430,15 @@ def route_query(query: str) -> RoutingResult:
                     match_type="blacklist"
                 )
     
-    # Step 6: 默认放行（给LLM判断）
+    # Step 6: 通用安全关键词拦截（P0 #14：防危险问题默认放行给 LLM）
+    for _kw in _SAFETY_KEYWORDS:
+        if _kw in query:
+            return RoutingResult(
+                action="reject", match_type="safety",
+                message="抱歉，这个问题涉及安全敏感内容，我无法回答。",
+            )
+
+    # 默认放行（给LLM判断）
     result = RoutingResult(action="pass", match_type="unknown")
     if _has_mapping:
         result.mapped_query = _mapped_query

@@ -1,8 +1,13 @@
 import os
 import json
+import time
+import asyncio
 import httpx
 from ..core.logging import setup_logging
-from ..core.config import HTTP_TIMEOUT_SHORT, HTTP_TIMEOUT_MEDIUM, HTTP_TIMEOUT_LONG
+from ..core.config import (
+    HTTP_TIMEOUT_SHORT, HTTP_TIMEOUT_MEDIUM, HTTP_TIMEOUT_LONG,
+    DEEPSEEK_API_BASE, DEEPSEEK_MODEL, RERANK_SIM_THRESHOLD,
+)
 
 logger = setup_logging()
 
@@ -95,23 +100,16 @@ def _map_colloquial_to_legal(query: str) -> str:
     return query
 
 
-async def search_knowledge(query: str, top_k: int = 5):
-    """语义搜索知识库（pg_trgm 召回 + DeepSeek Rerank）
-    
-    在检索前，先通过法律依据纠正映射表检查用户问题是否属于其他法律领域。
-    如果命中映射表，直接返回纠正引导信息，不执行知识库搜索。
-    """
-    # ===== 法律依据纠正映射表检查 =====
+def _law_mapping_check(query):
+    """法律依据纠正映射表检查：命中返回引导信息（不执行检索）"""
     try:
         from .law_mapping import check_query as _check_law
         _match = _check_law(query)
         if _match:
-            from ..core.logging import setup_logging as _setup_log
-            _log = _setup_log()
-            _log.info(f"⚖️ 法律映射表命中 #{_match['id']}: {_match['scenario']} → {_match['law']}")
+            logger.info(f"⚖️ 法律映射表命中 #{_match['id']}: {_match['scenario']} → {_match['law']}")
             return {
                 "results": [{
-                    "heading": f"⚠️ 该问题不属于民法典调整范围",
+                    "heading": "⚠️ 该问题不属于民法典调整范围",
                     "content": _match["message"],
                     "similarity": 1.0,
                     "is_law_mapping": True,
@@ -122,98 +120,111 @@ async def search_knowledge(query: str, top_k: int = 5):
                 "mapping_hit": True,
                 "message": _match["message"],
             }
-    except Exception as _e:
-        # 映射表检查失败不应影响正常检索
-        pass
+    except Exception:
+        pass  # 映射表检查失败不应影响正常检索
+    return None
 
-    import math, json, os
+
+def _dedup(candidates: list, heading: str, content: str, sim: float) -> bool:
+    """候选去重：heading 与内容前 50 字相同则跳过"""
+    if any(e["heading"] == heading and e["content"][:50] == content[:50] for e in candidates):
+        return False
+    candidates.append({"heading": heading, "content": content[:500], "similarity": sim})
+    return True
+
+
+async def _recall_pg_trgm(conn, search_query: str, recall_limit: int,
+                          permissions: list | None = None) -> list:
+    """pg_trgm 相似度召回（带相似度分数）。
+
+    permissions=None = 不过滤（内部/admin）；[] = 仅公开；['vip'] = 公开+vip。
+    """
+    perm_clause = ""
+    args = [search_query, recall_limit]
+    if permissions:
+        # 有权限组：公开 + 命中权限组（P0 #29/#41）
+        perm_clause = " AND (COALESCE(permission, '{}') = '{}' OR permission && $3) "
+        args.append(permissions)
+    elif permissions is not None:
+        # permissions=[]：仅公开，避免空数组 && 导致公开文档被排除（P0 #29）
+        perm_clause = " AND COALESCE(permission, '{}') = '{}' "
+    rows = await conn.fetch(
+        "SELECT chunk_key, source, heading, content, source_doc, "
+        "similarity(content, $1) as sim "
+        "FROM knowledge_chunks WHERE source = 'civil_code' "
+        + perm_clause +
+        "ORDER BY sim DESC LIMIT $2",
+        *args,
+    )
+    return [{
+        "heading": r["heading"],
+        "content": r["content"][:500],
+        "similarity": round(r["sim"], 4) if r["sim"] else 0,
+        "source_doc": r["source_doc"] or r["source"],
+    } for r in rows]
+
+
+async def _keyword_fill(conn, query: str, recall_limit: int, candidates: list,
+                        permissions: list | None = None):
+    """关键词 ILIKE 补充（去重；补满 recall_limit 即停；支持权限过滤）"""
+    perm_clause = ""
+    for kw in query.replace("?", "").replace("，", " ").replace("？", " ").split():
+        if len(kw) < 2:
+            continue
+        args = [f"%{kw}%", recall_limit - len(candidates)]
+        if permissions:
+            perm_clause = " AND (COALESCE(permission, '{}') = '{}' OR permission && $3) "
+            args.append(permissions)
+        elif permissions is not None:
+            # permissions=[]：仅公开（P0 #29）
+            perm_clause = " AND COALESCE(permission, '{}') = '{}' "
+        more = await conn.fetch(
+            "SELECT chunk_key, source, heading, content, 0.5 as sim "
+            "FROM knowledge_chunks WHERE source = 'civil_code' "
+            + perm_clause +
+            "AND content ILIKE $1 LIMIT $2",
+            *args,
+        )
+        for r in more:
+            _dedup(candidates, r["heading"], r["content"], 0.5)
+        if len(candidates) >= recall_limit:
+            break
+
+
+async def search_knowledge(query: str, top_k: int = 5, permissions: list | None = None):
+    """语义搜索知识库（pg_trgm 召回 + 关键词补充 + DeepSeek Rerank）
+
+    在检索前，先通过法律依据纠正映射表检查用户问题是否属于其他法律领域。
+    如果命中映射表，直接返回纠正引导信息，不执行知识库搜索。
+
+    permissions: None=不过滤（内部/admin）；[]=仅公开；['vip']=公开+vip 可检索。
+    """
+    # ===== 法律依据纠正映射表检查 =====
+    mapping_result = _law_mapping_check(query)
+    if mapping_result:
+        return mapping_result
+
     from ..core.db import get_pool
 
     # ===== 口语→术语映射：优先使用映射后的查询进行检索 =====
-    _mapped_query_first = _map_colloquial_to_legal(query)
-    _search_query = _mapped_query_first  # 使用映射后的查询（如无映射则与原查询相同）
+    _search_query = _map_colloquial_to_legal(query)
     if _search_query != query:
         logger.info(f"🔄 搜索前置口语映射: {query[:30]}... → {_search_query[:60]}...")
-    
+
+    recall_limit = max(top_k * 4, 20)
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # === 第一阶段：pg_trgm 宽召回（取 top_k*4 个候选）===
-        recall_limit = max(top_k * 4, 20)
-        rows = await conn.fetch(
-            "SELECT chunk_key, source, heading, content, "
-            "similarity(content, $1) as sim "
-            "FROM knowledge_chunks WHERE source = 'civil_code' "
-            "AND content % $1 "
-            "ORDER BY sim DESC LIMIT $2",
-            _search_query, recall_limit
-        )
-        candidates = [{
-            "heading": r["heading"],
-            "content": r["content"][:500],
-            "similarity": round(r["sim"], 4) if r["sim"] else 0
-        } for r in rows]
+        # === 第一阶段：pg_trgm 宽召回 + 关键词补充 ===
+        candidates = await _recall_pg_trgm(conn, _search_query, recall_limit, permissions)
+        await _keyword_fill(conn, _search_query, recall_limit, candidates, permissions)
 
-        # 补充关键词匹配（使用映射后的查询关键词）
-        if len(candidates) < recall_limit:
-            keywords = _search_query.replace("?", "").replace("，", " ").replace("？", " ").split()
-            for kw in keywords:
-                if len(kw) < 2:
-                    continue
-                more = await conn.fetch(
-                    "SELECT chunk_key, source, heading, content, 0.5 as sim "
-                    "FROM knowledge_chunks WHERE source = 'civil_code' "
-                    "AND content ILIKE $1 LIMIT $2",
-                    f"%{kw}%", recall_limit - len(candidates)
-                )
-                for r in more:
-                    h = r["heading"]
-                    c = r["content"][:500]
-                    if not any(e["heading"] == h and e["content"][:50] == c[:50] for e in candidates):
-                        candidates.append({"heading": h, "content": c, "similarity": 0.5})
-                if len(candidates) >= recall_limit:
-                    break
-
+        # === 无结果 → 用口语映射后的专业术语重试 ===
         if not candidates:
-            # ===== 第一轮检索无结果 → 尝试口语化表述映射 =====
             try:
                 _mapped_query = _map_colloquial_to_legal(query)
                 if _mapped_query != query:
-                    # 用映射后的专业术语重新检索
-                    map_rows = await conn.fetch(
-                        "SELECT chunk_key, source, heading, content, "
-                        "similarity(content, $1) as sim "
-                        "FROM knowledge_chunks WHERE source = 'civil_code' "
-                        "AND content % $1 "
-                        "ORDER BY sim DESC LIMIT $2",
-                        _mapped_query, recall_limit
-                    )
-                    for r in map_rows:
-                        h = r["heading"]
-                        c = r["content"][:500]
-                        if not any(e["heading"] == h and e["content"][:50] == c[:50] for e in candidates):
-                            candidates.append({
-                                "heading": h,
-                                "content": c,
-                                "similarity": round(r["sim"], 4) if r["sim"] else 0
-                            })
-                    # 补充关键词
-                    if len(candidates) < recall_limit:
-                        for kw in _mapped_query.replace("?", "").replace("，", " ").replace("？", " ").split():
-                            if len(kw) < 2:
-                                continue
-                            more = await conn.fetch(
-                                "SELECT chunk_key, source, heading, content, 0.5 as sim "
-                                "FROM knowledge_chunks WHERE source = 'civil_code' "
-                                "AND content ILIKE $1 LIMIT $2",
-                                f"%{kw}%", recall_limit - len(candidates)
-                            )
-                            for r in more:
-                                h = r["heading"]
-                                c = r["content"][:500]
-                                if not any(e["heading"] == h and e["content"][:50] == c[:50] for e in candidates):
-                                    candidates.append({"heading": h, "content": c, "similarity": 0.5})
-                            if len(candidates) >= recall_limit:
-                                break
+                    candidates = await _recall_pg_trgm(conn, _mapped_query, recall_limit, permissions)
+                    await _keyword_fill(conn, _mapped_query, recall_limit, candidates, permissions)
                     if candidates:
                         logger.info(f"✅ 口语映射后找到 {len(candidates)} 条结果")
             except Exception as _map_err:
@@ -222,15 +233,22 @@ async def search_knowledge(query: str, top_k: int = 5):
         if not candidates:
             return {"results": [], "method": "pg_trgm"}
 
-        # === 第二阶段：DeepSeek Rerank ===
-        try:
-            candidates = await _rerank_with_deepseek(query, candidates, top_k)
-            method = "pg_trgm+rerank"
-        except Exception as e:
-            logger.warning(f"Rerank失败，使用pg_trgm原始排序: {e}")
-            # 降级：直接截取 top_k
+        # === 第二阶段：阈值粗筛 → 只在模糊时调用昂贵的 LLM Rerank ===
+        # 粗筛：候选集中存在相似度 >= RERANK_SIM_THRESHOLD 的高置信结果时，
+        # 说明 pg_trgm 已给出明确答案，直接按相似度排序截取，跳过 LLM Rerank（省 token）
+        _top_sim = max(c["similarity"] for c in candidates)
+        if _top_sim >= RERANK_SIM_THRESHOLD:
             candidates = sorted(candidates, key=lambda x: x["similarity"], reverse=True)[:top_k]
             method = "pg_trgm"
+        else:
+            # 检索结果模糊（低相似度）→ 升级 LLM Rerank 精排
+            try:
+                candidates = await _rerank_with_deepseek(query, candidates, top_k)
+                method = "pg_trgm+rerank"
+            except Exception as e:
+                logger.warning(f"Rerank失败，使用pg_trgm原始排序: {e}")
+                candidates = sorted(candidates, key=lambda x: x["similarity"], reverse=True)[:top_k]
+                method = "pg_trgm"
 
         return {"results": candidates, "method": method}
 
@@ -277,7 +295,8 @@ async def _rerank_with_deepseek(query: str, candidates: list, top_k: int) -> lis
         result = json.loads(content)
 
     scores = result.get("scores", [])
-    if len(scores) != len(candidates):
+    if not scores or len(scores) != len(candidates):
+        # 空/不匹配评分直接失败，由调用方回退 pg_trgm 排序（P1 #42）
         raise ValueError(f"评分数量({len(scores)})与候选数({len(candidates)})不匹配")
 
     # 合并评分并排序
@@ -288,13 +307,35 @@ async def _rerank_with_deepseek(query: str, candidates: list, top_k: int) -> lis
     return candidates[:top_k]
 
 
+# web_search 本地限流（P1 #13/#40：防高频调用导致外部搜索 API 封 IP）
+_search_rate_lock = asyncio.Lock()
+_search_rate_last = 0.0
+_search_rate_count = 0
+_SEARCH_WINDOW_SECONDS = 10.0
+_SEARCH_MAX_PER_WINDOW = 10
+
+
+async def _check_search_rate():
+    """web_search 本地限流：每 10 秒最多 10 次（全局兜底；每用户限流需调用方传标识）"""
+    global _search_rate_last, _search_rate_count
+    async with _search_rate_lock:
+        now = time.time()
+        if now - _search_rate_last > _SEARCH_WINDOW_SECONDS:
+            _search_rate_count = 0
+            _search_rate_last = now
+        if _search_rate_count >= _SEARCH_MAX_PER_WINDOW:
+            raise RuntimeError("搜索过于频繁，请稍后再试")
+        _search_rate_count += 1
+
+
 async def web_search(query: str, max_results: int = 5):
     """
     联网搜索工具 — 当用户询问实时信息、营业时间、评价、排队情况等
     现有工具无法覆盖的内容时调用。
-    
+
     使用 DuckDuckGo 搜索（免费，无需 API Key），返回结构化结果。
     """
+    await _check_search_rate()  # 本地限流（P1 #13/#40）
     try:
         from duckduckgo_search import DDGS
         results = []

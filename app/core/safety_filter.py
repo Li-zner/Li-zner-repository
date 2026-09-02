@@ -15,7 +15,7 @@ logger = setup_logging()
 # ============================================================
 _BUILTIN_SENSITIVE_WORDS = [
     # ── 政治高危（仅保留真正需要拦截的组合词）──
-    # ⚠️ 注意：旅行助手场景下，以下规则必须严格审核：
+    # 注意：旅行助手场景下，以下规则必须严格审核：
     #   - 数字类（64/89等）会误伤日期、价格、距离等正常内容
     #   - 单个人名会误伤"毛泽东纪念堂"等正常推荐
     #   - "敏感词"本身会触发自指误伤
@@ -214,7 +214,7 @@ class SafetyFilter:
         result = self.find_first(chunk)
         if result:
             word, start, end = result
-            logger.warning(f"🛡️ DFA 过滤器触发: 敏感词='{word}'")
+            logger.warning(f"DFA 过滤器触发: 敏感词='{word}'")
             return {
                 "safe": False,
                 "chunk": chunk[:start],

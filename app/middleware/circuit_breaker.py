@@ -1,7 +1,7 @@
 """
 熔断器（三态状态机：CLOSED → OPEN → HALF_OPEN）
 
-⚠️ 仅适用于单进程/单 Worker 模式（P2 #11/#21）：
+仅适用于单进程/单 Worker 模式（P2 #11/#21）：
     _breakers 为进程内存级注册表，多 Worker 下各进程状态不共享。
     若未来扩展多 Worker，需将熔断状态迁移到 Redis。
 
@@ -68,6 +68,13 @@ class SimpleBreaker:
     async def _record_failure(self):
         """记录一次失败；达到阈值则开启熔断（锁内更新，P0 #1 防并发计数错乱）"""
         async with self._lock:
+            if self.state == "HALF_OPEN":
+                # HALF_OPEN 试探期一次失败即应重回 OPEN（标准熔断语义，文档已声明）；
+                # 避免下游仍宕机时让 fail_threshold 个试探请求白跑。
+                self._set_state("OPEN")
+                self.fail_count = 0
+                self.last_fail_time = time.time()
+                return
             self.fail_count += 1
             self.last_fail_time = time.time()
             if self.fail_count >= self.fail_threshold:

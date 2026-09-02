@@ -189,16 +189,16 @@ async def lifespan(app: FastAPI):
     # --- 初始化连接池 ---
     try:
         pool = await init_pool()
-        logger.info(f"✅ 数据库连接池已初始化 (min=10, max=30)")
+        logger.info(f"数据库连接池已初始化 (min=10, max=30)")
     except Exception as e:
-        logger.warning(f"⚠️ 连接池初始化失败: {e}")
+        logger.warning(f"连接池初始化失败: {e}")
 
     # --- 初始化数据库表 ---
     try:
         await init_db()
-        logger.info("✅ PostgreSQL 数据库已初始化")
+        logger.info("PostgreSQL 数据库已初始化")
     except Exception as e:
-        logger.warning(f"⚠️ PostgreSQL 初始化失败（服务仍可启动，数据库功能受限）: {e}")
+        logger.warning(f"PostgreSQL 初始化失败（服务仍可启动，数据库功能受限）: {e}")
 
     # CDC 事件表与触发器由 Alembic 迁移管理（A19/A23，迁移 e5f6a7b8c9d0），
     # 启动不再执行 DDL；缺失时 init_db 已 fail loudly。
@@ -208,7 +208,7 @@ async def lifespan(app: FastAPI):
     try:
         from .core.db_maintenance import ensure_indexes
         await ensure_indexes()
-        logger.info("✅ 数据库索引已确保")
+        logger.info("数据库索引已确保")
     except Exception as e:
         logger.warning(f"索引创建跳过（首次运行可能无表）: {e}")
 
@@ -216,7 +216,7 @@ async def lifespan(app: FastAPI):
     try:
         from .core.redis import init_redis
         await init_redis()
-        logger.info("✅ Redis 连接池已初始化")
+        logger.info("Redis 连接池已初始化")
     except Exception as e:
         logger.warning(f"Redis 初始化失败: {e}")
 
@@ -321,7 +321,7 @@ app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET_KEY)
 os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 os.makedirs("uploads", exist_ok=True)
-# ⚠️ 安全：uploads 目录不移除通过 StaticFiles 公开挂载，文件只能通过 API 授权访问
+# 安全：uploads 目录不移除通过 StaticFiles 公开挂载，文件只能通过 API 授权访问
 
 # ---------- 路由 ----------
 app.include_router(v2_router)

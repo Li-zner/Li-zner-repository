@@ -114,7 +114,7 @@ class SimulatedAlipayChannel(ChannelInterface):
         success = _simulate_success(PAYMENT_SUCCESS_RATE)
         now = datetime.now(timezone.utc).isoformat()
         if success:
-            logger.info(f"💳 模拟支付宝支付成功: order_no={order.get('order_no')}")
+            logger.info(f"模拟支付宝支付成功: order_no={order.get('order_no')}")
             return {
                 "success": True,
                 "channel_order_no": _generate_channel_order_no("SAP"),
@@ -122,7 +122,7 @@ class SimulatedAlipayChannel(ChannelInterface):
                 "message": "模拟支付宝支付成功",
             }
         else:
-            logger.info(f"💳 模拟支付宝支付失败: order_no={order.get('order_no')}")
+            logger.info(f"模拟支付宝支付失败: order_no={order.get('order_no')}")
             return {
                 "success": False,
                 "channel_order_no": "",
@@ -152,7 +152,7 @@ class SimulatedWechatChannel(ChannelInterface):
         success = _simulate_success(PAYMENT_SUCCESS_RATE)
         now = datetime.now(timezone.utc).isoformat()
         if success:
-            logger.info(f"📱 模拟微信支付成功: order_no={order.get('order_no')}")
+            logger.info(f"模拟微信支付成功: order_no={order.get('order_no')}")
             return {
                 "success": True,
                 "channel_order_no": _generate_channel_order_no("SWX"),
@@ -160,7 +160,7 @@ class SimulatedWechatChannel(ChannelInterface):
                 "message": "模拟微信支付成功",
             }
         else:
-            logger.info(f"📱 模拟微信支付失败: order_no={order.get('order_no')}")
+            logger.info(f"模拟微信支付失败: order_no={order.get('order_no')}")
             return {
                 "success": False,
                 "channel_order_no": "",

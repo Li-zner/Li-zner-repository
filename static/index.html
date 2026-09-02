@@ -1,0 +1,4455 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>旅游规划助手</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    /* ============================================================
+     * 主题系统 - 通过 data-theme 属性切换
+     * data-theme="classic"  |  默认绿色自然风
+     * data-theme="glass"    |  玻璃质感高级风
+     * data-theme="dark"     |  暗色现代专业风
+     * ============================================================ */
+
+    /* ---------- 全局重置 ---------- */
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+        height: 100vh; display: flex; justify-content: center; align-items: center;
+        transition: background 0.4s ease, color 0.3s ease;
+    }
+
+    /* ========== 主题 A: Classic (默认绿色自然风) ========== */
+    body[data-theme="classic"], body:not([data-theme]) {
+        --primary: #2d8a4e;
+        --primary-light: #e8f5e9;
+        --primary-dark: #1b6b3a;
+        --primary-gradient: linear-gradient(135deg, #2d8a4e, #1b6b3a);
+        --bg-body: #dde8dd;
+        --bg-chat: #f2f8f2;
+        --bg-sidebar: #eaf3ea;
+        --bg-card: #ffffff;
+        --border-color: #c8dcc8;
+        --text-primary: #1a2e1a;
+        --text-secondary: #3d5a3d;
+        --text-muted: #7a9a7a;
+        --shadow-sm: 0 1px 3px rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.03);
+        --shadow-md: 0 4px 20px rgba(0,0,0,0.05);
+        --shadow-lg: 0 10px 40px rgba(0,0,0,0.08);
+        --radius-lg: 16px;
+        --radius-md: 12px;
+        --radius-sm: 8px;
+        --transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+        --login-bg: linear-gradient(135deg, #dde8dd 0%, #c5dcc5 100%);
+        --msg-user-bg: var(--primary);
+        --msg-user-color: #fff;
+        --msg-assistant-bg: #ffffff;
+        --msg-assistant-border: var(--border-color);
+        --input-bg: var(--bg-body);
+        --input-border: var(--border-color);
+        --input-focus-bg: #ffffff;
+        --header-bg: rgba(234, 243, 234, 0.85);
+        --btn-send-bg: var(--primary);
+        --btn-send-hover: var(--primary-dark);
+        --btn-send-disabled: #a0c4b8;
+        --badge-bg: #2563eb;
+        --scrollbar-thumb: #d1d5db;
+        --scrollbar-hover: #b0b4b8;
+        --overlay-bg: rgba(0,0,0,0.4);
+        --think-bg: #edf5ed;
+        --think-border: var(--primary);
+    }
+
+    /* ========== 主题 B: Glass (玻璃质感高级风) ========== */
+    body[data-theme="glass"] {
+        --primary: #4f46e5;
+        --primary-light: #eef2ff;
+        --primary-dark: #3730a3;
+        --primary-gradient: linear-gradient(135deg, #4f46e5, #7c3aed);
+        --bg-body: #f0eff7;
+        --bg-chat: rgba(255,255,255,0.6);
+        --bg-sidebar: rgba(255,255,255,0.7);
+        --bg-card: rgba(255,255,255,0.75);
+        --border-color: rgba(255,255,255,0.4);
+        --text-primary: #1e1b4b;
+        --text-secondary: #4338ca;
+        --text-muted: #8b8fa3;
+        --shadow-sm: 0 4px 12px rgba(79,70,229,0.06);
+        --shadow-md: 0 8px 32px rgba(79,70,229,0.08);
+        --shadow-lg: 0 20px 60px rgba(79,70,229,0.10);
+        --radius-lg: 16px;
+        --radius-md: 12px;
+        --radius-sm: 8px;
+        --transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+        --login-bg: linear-gradient(135deg, #e0e7ff 0%, #ddd6fe 50%, #c4b5fd 100%);
+        --msg-user-bg: linear-gradient(135deg, #4f46e5, #7c3aed);
+        --msg-user-color: #fff;
+        --msg-assistant-bg: rgba(255,255,255,0.85);
+        --msg-assistant-border: rgba(255,255,255,0.5);
+        --input-bg: rgba(255,255,255,0.7);
+        --input-border: rgba(255,255,255,0.5);
+        --input-focus-bg: rgba(255,255,255,0.95);
+        --header-bg: rgba(255,255,255,0.7);
+        --btn-send-bg: linear-gradient(135deg, #4f46e5, #7c3aed);
+        --btn-send-hover: linear-gradient(135deg, #4338ca, #6d28d9);
+        --btn-send-disabled: #a5b4fc;
+        --badge-bg: #4f46e5;
+        --scrollbar-thumb: #c7d2fe;
+        --scrollbar-hover: #a5b4fc;
+        --overlay-bg: rgba(79,70,229,0.2);
+        --think-bg: rgba(238,242,255,0.85);
+        --think-border: #4f46e5;
+    }
+    body[data-theme="glass"] .sidebar,
+    body[data-theme="glass"] .chat-header,
+    body[data-theme="glass"] .chat-input-area,
+    body[data-theme="glass"] .message.assistant,
+    body[data-theme="glass"] #login-container .login-box,
+    body[data-theme="glass"] .payment-modal {
+        backdrop-filter: blur(16px) saturate(160%);
+        -webkit-backdrop-filter: blur(16px) saturate(160%);
+    }
+    body[data-theme="glass"] .sidebar,
+    body[data-theme="glass"] .chat-input-area {
+        border-right: 1px solid rgba(255,255,255,0.3);
+        background: rgba(255,255,255,0.55) !important;
+    }
+    body[data-theme="glass"] .chat-header {
+        background: rgba(255,255,255,0.5) !important;
+        border-bottom: 1px solid rgba(255,255,255,0.3);
+    }
+    body[data-theme="glass"] .chat-area {
+        background: rgba(255,255,255,0.35) !important;
+    }
+    body[data-theme="glass"] .input-wrapper input {
+        background: rgba(255,255,255,0.75) !important;
+        border-color: rgba(255,255,255,0.5) !important;
+    }
+    body[data-theme="glass"] .input-wrapper input:focus {
+        background: rgba(255,255,255,0.95) !important;
+        box-shadow: 0 0 0 4px rgba(79,70,229,0.1) !important;
+    }
+    body[data-theme="glass"] .wallet-btn,
+    body[data-theme="glass"] .logout-btn,
+    body[data-theme="glass"] .map-btn,
+    body[data-theme="glass"] .me-btn {
+        backdrop-filter: blur(8px);
+        -webkit-backdrop-filter: blur(8px);
+    }
+
+    /* ========== 主题 C: Dark (暗色现代专业风) ========== */
+    body[data-theme="dark"] {
+        --primary: #06b6d4;
+        --primary-light: #1a2e3e;
+        --primary-dark: #0891b2;
+        --primary-gradient: linear-gradient(135deg, #06b6d4, #3b82f6);
+        --bg-body: #0f172a;
+        --bg-chat: #1e293b;
+        --bg-sidebar: #1a2332;
+        --bg-card: #1e293b;
+        --border-color: #334155;
+        --text-primary: #f1f5f9;
+        --text-secondary: #94a3b8;
+        --text-muted: #64748b;
+        --shadow-sm: 0 1px 3px rgba(0,0,0,0.3);
+        --shadow-md: 0 4px 20px rgba(0,0,0,0.3);
+        --shadow-lg: 0 10px 40px rgba(0,0,0,0.4);
+        --radius-lg: 12px;
+        --radius-md: 8px;
+        --radius-sm: 6px;
+        --transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+        --login-bg: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+        --msg-user-bg: linear-gradient(135deg, #06b6d4, #3b82f6);
+        --msg-user-color: #fff;
+        --msg-assistant-bg: #1e293b;
+        --msg-assistant-border: #334155;
+        --input-bg: #1e293b;
+        --input-border: #334155;
+        --input-focus-bg: #1e293b;
+        --header-bg: rgba(15,23,42,0.9);
+        --btn-send-bg: linear-gradient(135deg, #06b6d4, #3b82f6);
+        --btn-send-hover: linear-gradient(135deg, #0891b2, #2563eb);
+        --btn-send-disabled: #1e3a5f;
+        --badge-bg: #06b6d4;
+        --scrollbar-thumb: #334155;
+        --scrollbar-hover: #475569;
+        --overlay-bg: rgba(0,0,0,0.7);
+        --think-bg: #1a2e3e;
+        --think-border: #06b6d4;
+    }
+    body[data-theme="dark"] .sidebar {
+        border-right: 1px solid #334155;
+    }
+    body[data-theme="dark"] .chat-header {
+        border-bottom: 1px solid #334155;
+        background: rgba(15,23,42,0.85) !important;
+    }
+    body[data-theme="dark"] .chat-input-area {
+        border-top: 1px solid #334155;
+        background: #1a2332 !important;
+    }
+    body[data-theme="dark"] .message.assistant {
+        box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    }
+    body[data-theme="dark"] .input-wrapper input {
+        background: #1e293b !important;
+        border-color: #334155 !important;
+        color: #f1f5f9 !important;
+    }
+    body[data-theme="dark"] .input-wrapper input::placeholder {
+        color: #64748b;
+    }
+    body[data-theme="dark"] .input-wrapper input:focus {
+        border-color: #06b6d4 !important;
+        box-shadow: 0 0 0 4px rgba(6,182,212,0.1) !important;
+    }
+    body[data-theme="dark"] #login-container .login-box {
+        background: rgba(30,41,59,0.9);
+        border: 1px solid #334155;
+    }
+    body[data-theme="dark"] #login-container .login-box input {
+        background: #1e293b;
+        border-color: #334155;
+        color: #f1f5f9;
+    }
+    body[data-theme="dark"] .wallet-btn,
+    body[data-theme="dark"] .logout-btn,
+    body[data-theme="dark"] .map-btn {
+        background: #1e293b !important;
+        border-color: #334155 !important;
+        color: #94a3b8 !important;
+    }
+    body[data-theme="dark"] .wallet-btn:hover,
+    body[data-theme="dark"] .logout-btn:hover,
+    body[data-theme="dark"] .map-btn:hover {
+        border-color: #06b6d4 !important;
+        color: #06b6d4 !important;
+    }
+    body[data-theme="dark"] .history-item:hover {
+        background: rgba(6,182,212,0.08);
+    }
+    body[data-theme="dark"] .history-item.active {
+        background: rgba(6,182,212,0.15);
+        color: #06b6d4;
+    }
+    body[data-theme="dark"] .chat-messages::-webkit-scrollbar-thumb {
+        background: #334155;
+    }
+    body[data-theme="dark"] .chat-messages::-webkit-scrollbar-thumb:hover {
+        background: #475569;
+    }
+    body[data-theme="dark"] .think-block-top {
+        background: #1a2e3e;
+        border-left-color: #06b6d4;
+    }
+    body[data-theme="dark"] .recharge-rules {
+        background: #1a2e3e;
+        border-color: #334155;
+    }
+    body[data-theme="dark"] .payment-modal {
+        background: #1e293b;
+        border: 1px solid #334155;
+    }
+    body[data-theme="dark"] .payment-modal .modal-header {
+        border-bottom-color: #334155;
+    }
+    body[data-theme="dark"] .payment-modal .modal-footer {
+        border-top-color: #334155;
+    }
+    body[data-theme="dark"] .success-details {
+        background: #1a2e3e;
+    }
+    body[data-theme="dark"] .detail-row {
+        border-bottom-color: #334155;
+    }
+    body[data-theme="dark"] .channel-option {
+        border-color: #334155;
+    }
+    body[data-theme="dark"] .channel-option:hover {
+        border-color: #06b6d4;
+    }
+    body[data-theme="dark"] .channel-option.selected {
+        border-color: #06b6d4;
+        background: rgba(6,182,212,0.1);
+    }
+    body[data-theme="dark"] .amount-grid button {
+        background: #1e293b;
+        border-color: #334155;
+        color: #f1f5f9;
+    }
+    body[data-theme="dark"] .amount-grid button:hover {
+        border-color: #06b6d4;
+        background: rgba(6,182,212,0.1);
+    }
+    body[data-theme="dark"] .tx-item {
+        border-bottom-color: #334155;
+    }
+    body[data-theme="dark"] .tx-filter-btn {
+        border-color: #334155 !important;
+    }
+
+    /* ---------- 主题切换器（侧边栏/移动端面板）---------- */
+    .theme-btn-pc.active, .theme-btn-mb.active {
+        background: var(--primary) !important;
+        color: #fff !important;
+        border-color: var(--primary) !important;
+    }
+    body[data-theme="dark"] .theme-btn-pc.active,
+    body[data-theme="dark"] .theme-btn-mb.active {
+        background: var(--primary) !important;
+        color: #fff !important;
+        border-color: var(--primary) !important;
+    }
+    .theme-btn-pc:hover, .theme-btn-mb:hover {
+        border-color: var(--primary) !important;
+        color: var(--primary) !important;
+    }
+
+    /* ---------- CSS 变量 & 全局重置 ---------- */
+    :root {
+        --primary: #2d8a4e;
+        --primary-light: #e8f5e9;
+        --primary-dark: #1b6b3a;
+        --bg-body: #dde8dd;
+        --bg-chat: #f2f8f2;
+        --bg-sidebar: #eaf3ea;
+        --border-color: #c8dcc8;
+        --text-primary: #1a2e1a;
+        --text-secondary: #3d5a3d;
+        --text-muted: #7a9a7a;
+        --shadow-sm: 0 1px 3px rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.03);
+        --shadow-md: 0 4px 20px rgba(0,0,0,0.05);
+        --radius-lg: 0px;
+        --radius-md: 8px;
+        --radius-sm: 6px;
+        --transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+    }
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+        background: var(--bg-body);
+        height: 100vh;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        color: var(--text-primary);
+    }
+
+    /* ---------- 登录界面 ---------- */
+    #login-container {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        width: 100%;
+        height: 100vh;
+        background: var(--login-bg);
+        padding: 20px;
+        transition: background 0.4s ease;
+    }
+    #login-container .login-box {
+        background: rgba(255,255,255,0.8);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        border-radius: var(--radius-lg);
+        padding: 48px 36px;
+        box-shadow: 0 20px 60px rgba(0,0,0,0.08);
+        width: 100%;
+        max-width: 400px;
+        border: 1px solid rgba(255,255,255,0.5);
+    }
+    /* ... 其余登录样式保持简洁，但更新颜色 ... */
+    #login-container .login-box h2 {
+        font-size: 26px; font-weight: 700; color: var(--text-primary); margin-bottom: 8px;
+    }
+    #login-container .login-box p {
+        color: var(--text-muted); font-size: 14px; margin-bottom: 28px;
+    }
+    #login-container .login-box input {
+        width: 100%; padding: 14px 16px; border: 1.5px solid var(--border-color);
+        border-radius: var(--radius-sm); font-size: 15px; margin-bottom: 16px;
+        background: #fafafa; transition: var(--transition);
+    }
+    #login-container .login-box input:focus {
+        border-color: var(--primary); box-shadow: 0 0 0 4px rgba(16,163,127,0.1); background: #fff;
+    }
+    #login-container .login-box button {
+        width: 100%; padding: 14px; background: var(--primary); color: #fff;
+        border: none; border-radius: var(--radius-sm); font-size: 16px; font-weight: 600;
+        cursor: pointer; transition: var(--transition);
+    }
+    #login-container .login-box button:hover { background: var(--primary-dark); transform: translateY(-1px); }
+
+    /* ---------- 主应用容器（全屏） ---------- */
+    .app {
+        display: none;
+        width: 100%;
+        height: 100vh;
+        background: var(--bg-chat);
+        box-shadow: none;
+        position: relative;
+        overflow: hidden;
+    }
+    .app.show { display: flex; }
+
+    /* ---------- 侧边栏 ---------- */
+    .sidebar {
+        width: 280px;
+        background: var(--bg-sidebar);
+        border-right: 1px solid var(--border-color);
+        display: flex;
+        flex-direction: column;
+        padding: 24px 16px;
+        flex-shrink: 0;
+        transition: background 0.3s ease, border-color 0.3s ease;
+    }
+    .sidebar-title {
+        font-size: 20px; font-weight: 700; color: var(--text-primary);
+        margin-bottom: 24px; display: flex; align-items: center; gap: 10px;
+    }
+    .sidebar-title span {
+        background: var(--primary); color: #fff; font-size: 12px; padding: 2px 12px;
+        border-radius: 20px; font-weight: 500;
+    }
+    .new-chat-btn {
+        background: var(--primary); color: #fff; border: none;
+        padding: 12px 16px; border-radius: var(--radius-sm);
+        font-size: 14px; font-weight: 600; cursor: pointer;
+        margin-bottom: 28px; transition: var(--transition);
+        display: flex; align-items: center; justify-content: center; gap: 8px;
+    }
+    .new-chat-btn:hover { background: var(--primary-dark); transform: scale(0.98); }
+    .history-label { font-size: 13px; color: var(--text-muted); margin-bottom: 12px; font-weight: 600; letter-spacing: 0.5px; }
+    .history-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+    .history-item {
+        padding: 10px 14px; border-radius: var(--radius-sm); font-size: 14px;
+        color: var(--text-secondary); cursor: pointer; transition: var(--transition);
+        background: transparent; border: none; text-align: left; width: 100%;
+        display: flex; align-items: center; gap: 4px;
+    }
+    .history-item .item-name {
+        flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .history-item button {
+        color: var(--text-muted); background: none; border: none; cursor: pointer;
+        padding: 0 4px; font-size: 14px; flex-shrink: 0; min-width: 28px;
+        transition: var(--transition);
+    }
+    .history-item .rename-btn:hover { color: var(--primary); }
+    .history-item .delete-btn:hover { color: #ef4444; }
+
+    /* ---------- 聊天区域 ---------- */
+    .chat-area {
+        flex: 1; display: flex; flex-direction: column;
+        background: var(--bg-chat); min-width: 0;
+        transition: background 0.4s ease;
+    }
+    .chat-header {
+        padding: 16px 28px; border-bottom: 1px solid var(--border-color);
+        display: flex; align-items: center; justify-content: space-between;
+        flex-shrink: 0; background: var(--header-bg); backdrop-filter: blur(8px);
+        -webkit-backdrop-filter: blur(8px);
+        z-index: 10;
+        transition: background 0.3s ease, border-color 0.3s ease;
+    }
+    .chat-header .title {
+        font-size: 18px; font-weight: 700; color: var(--text-primary);
+        display: flex; align-items: center; gap: 10px;
+    }
+    .chat-header .title .badge {
+        font-size: 11px; font-weight: 500; color: var(--text-muted);
+        background: var(--bg-body); padding: 2px 12px; border-radius: 20px;
+        transition: background 0.3s ease;
+    }
+    .header-actions { display: flex; align-items: center; gap: 12px; }
+    .header-left { display: flex; align-items: center; gap: 12px; }
+
+    .logout-btn {
+        background: none; border: 1px solid var(--border-color); color: var(--text-secondary);
+        padding: 6px 16px; border-radius: 30px; font-size: 13px; cursor: pointer;
+        transition: var(--transition);
+    }
+    .logout-btn:hover { background: var(--bg-body); border-color: var(--text-muted); }
+
+    /* ---------- 地图入口按钮（头部） ---------- */
+    .map-btn {
+        background: var(--bg-body);
+        border: 1px solid var(--border-color);
+        color: var(--text-secondary);
+        padding: 6px 14px;
+        border-radius: 30px;
+        font-size: 13px;
+        cursor: pointer;
+        transition: var(--transition);
+        text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        white-space: nowrap;
+    }
+    .map-btn:hover { background: var(--primary-light); border-color: var(--primary); color: var(--primary); }
+
+    /* ---------- 求职助手按钮 ---------- */
+    .me-btn {
+        background: var(--primary);
+        border: 1px solid var(--primary);
+        color: #fff;
+        padding: 6px 14px;
+        border-radius: 30px;
+        font-size: 13px;
+        cursor: pointer;
+        transition: var(--transition);
+        text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        white-space: nowrap;
+        font-weight: 500;
+    }
+    .me-btn:hover { background: var(--primary-dark); border-color: var(--primary-dark); transform: translateY(-1px); }
+
+    /* ---------- 模式徽标（顶部居中） ---------- */
+    .mode-badge {
+        display: none;
+        position: absolute;
+        top: 0;
+        left: 50%;
+        transform: translateX(-50%);
+        background: var(--badge-bg);
+        color: #fff;
+        font-size: 13px;
+        font-weight: 600;
+        padding: 4px 20px;
+        border-radius: 0 0 12px 12px;
+        z-index: 20;
+        box-shadow: 0 2px 8px rgba(37, 99, 235, 0.25);
+        letter-spacing: 1px;
+        white-space: nowrap;
+        transition: background 0.3s ease;
+    }
+    .mode-badge.show { display: block; }
+
+    /* 求职模式下部分样式覆盖 */
+    .chat-area.me-mode .chat-header {
+        background: rgba(238, 242, 255, 0.85);
+    }
+    .chat-area.me-mode .chat-header .title {
+        color: #1e40af;
+    }
+    .chat-area.me-mode .input-wrapper input:focus {
+        border-color: #2563eb;
+        box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.08);
+    }
+    .chat-area.me-mode .chat-input-area button {
+        background: #2563eb;
+    }
+    .chat-area.me-mode .chat-input-area button:hover:not(:disabled) {
+        background: #1d4ed8;
+    }
+    .chat-area.me-mode .sidebar {
+        background: #eef2ff;
+        border-right-color: #c7d2fe;
+    }
+    /* 求职模式下隐藏地图按钮（地图属于旅行功能） */
+    .chat-area.me-mode .map-btn {
+        display: none;
+    }
+
+    /* ---------- 求职欢迎卡片 ---------- */
+    .welcome-card {
+        max-width: 560px;
+        margin: 40px auto;
+        background: #fff;
+        border: 1px solid var(--border-color);
+        border-radius: 12px;
+        padding: 32px 36px;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.05);
+        text-align: center;
+    }
+    .welcome-card h1 {
+        font-size: 24px;
+        font-weight: 700;
+        color: var(--text-primary);
+        margin-bottom: 4px;
+    }
+    .welcome-card .subtitle {
+        font-size: 14px;
+        color: var(--text-muted);
+        margin-bottom: 20px;
+    }
+    .welcome-card .info-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        text-align: left;
+        margin: 16px 0;
+        font-size: 14px;
+        background: var(--bg-chat);
+        border-radius: 8px;
+        padding: 16px;
+    }
+    .welcome-card .info-grid .label {
+        color: var(--text-muted);
+        font-weight: 500;
+    }
+    .welcome-card .info-grid .value {
+        color: var(--text-primary);
+    }
+    .welcome-card .tag-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        justify-content: center;
+        margin: 12px 0;
+    }
+    .welcome-card .tag {
+        background: #eef2ff;
+        color: #1d4ed8;
+        padding: 3px 12px;
+        border-radius: 20px;
+        font-size: 12px;
+        font-weight: 500;
+    }
+    .welcome-card .hint {
+        font-size: 13px;
+        color: var(--text-muted);
+        margin-top: 16px;
+        padding-top: 14px;
+        border-top: 1px dashed var(--border-color);
+    }
+    .welcome-card .presets {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        justify-content: center;
+        margin-top: 12px;
+    }
+    .welcome-card .presets button {
+        padding: 7px 16px;
+        background: #eef2ff;
+        border: 1px solid #c7d2fe;
+        border-radius: 20px;
+        color: #1d4ed8;
+        font-size: 13px;
+        cursor: pointer;
+        transition: all 0.2s;
+    }
+    .welcome-card .presets button:hover {
+        background: #2563eb;
+        border-color: #2563eb;
+        color: #fff;
+        transform: scale(0.97);
+    }
+
+    /* ---------- 消息容器 ---------- */
+    .chat-messages {
+        flex: 1; overflow-y: auto; padding: 24px 28px;
+        display: flex; flex-direction: column; gap: 20px;
+        background: var(--bg-chat);
+    }
+
+    /* ---------- 消息气泡 ---------- */
+    .message {
+        max-width: 75%; padding: 0; border-radius: var(--radius-lg);
+        animation: fadeIn 0.3s ease; position: relative; display: flex; flex-direction: column;
+    }
+    .message.user {
+        align-self: flex-end; background: var(--msg-user-bg); color: var(--msg-user-color);
+        border-radius: var(--radius-lg); padding: 12px 18px; width: fit-content;
+        max-width: 75%;
+    }
+    .message.assistant {
+        align-self: flex-start; background: var(--msg-assistant-bg); color: var(--text-primary);
+        border: 1px solid var(--msg-assistant-border); border-radius: var(--radius-lg);
+        padding: 16px 24px; max-width: 80%; margin: 0; box-shadow: var(--shadow-sm);
+        transition: background 0.3s ease, border-color 0.3s ease;
+    }
+    .message .msg-actions {
+        display: flex; gap: 8px; margin-top: 6px; justify-content: flex-end;
+    }
+    .message .msg-actions button {
+        background: transparent; border: none; color: var(--text-muted);
+        cursor: pointer; font-size: 12px; padding: 2px 6px;
+        border-radius: 4px; transition: var(--transition);
+    }
+    .message .msg-actions button:hover { background: rgba(0,0,0,0.05); color: var(--primary); }
+    .message .msg-time {
+        font-size: 11px; color: var(--text-muted); margin-top: 4px; text-align: left;
+    }
+
+    /* ---------- 思考区块 (顶部, 参考 DeepSeek 网页版) ---------- */
+    .think-block-top {
+        background: var(--think-bg);
+        border: 1px solid var(--think-border);
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin-bottom: 12px;
+        font-size: 13px;
+        color: var(--text-secondary);
+        line-height: 1.6;
+        max-height: 220px;
+        overflow-y: auto;
+    }
+    .think-block-top summary {
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-muted);
+        user-select: none;
+        margin-bottom: 6px;
+        list-style: none;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }
+    .think-block-top summary::before {
+        content: '▾';
+        display: inline-block;
+        transition: transform 0.2s;
+    }
+    .think-block-top[open] summary::before {
+        transform: rotate(180deg);
+    }
+    .think-block-top div {
+        padding: 3px 0;
+        border-bottom: 1px dashed rgba(0,0,0,0.06);
+        word-break: break-word;
+        white-space: pre-wrap;
+    }
+    .think-block-top div:last-child { border-bottom: none; }
+    /* 工具调用行（以「调用:」开头） */
+    .think-block-top div.think-tool {
+        color: var(--primary);
+        font-weight: 500;
+    }
+    /* 工具结果行 */
+    .think-block-top div.think-result {
+        color: var(--text-muted);
+        font-size: 12px;
+    }
+    .think-block-top div.think-result::before {
+        content: '✔ ';
+    }
+
+    /* ---------- 生成框（消息正文区域） ---------- */
+    .message.assistant .answer-box {
+        margin-top: 4px;
+        padding: 0;
+        line-height: 1.7;
+        font-size: 15px;
+        color: var(--text-primary);
+    }
+    .message.assistant .answer-box p { margin: 6px 0; }
+    .message.assistant .answer-box ul, 
+    .message.assistant .answer-box ol { padding-left: 20px; margin: 6px 0; }
+    .message.assistant .answer-box li { margin: 3px 0; }
+    .message.assistant .answer-box pre {
+        background: #f0f7f0;
+        border: 1px solid var(--border-color);
+        border-radius: 6px;
+        padding: 12px;
+        overflow-x: auto;
+        font-size: 13px;
+        margin: 8px 0;
+    }
+    .message.assistant .answer-box code {
+        background: #f0f7f0;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 13px;
+    }
+    .message.assistant .answer-box pre code {
+        background: none;
+        padding: 0;
+    }
+
+    /* ---------- 输入区域 ---------- */
+    .chat-input-area {
+        padding: 16px 28px 24px;
+        border-top: 1px solid var(--border-color);
+        background: var(--bg-sidebar);
+        display: flex;
+        gap: 12px;
+        flex-shrink: 0;
+        align-items: center;
+        transition: background 0.3s ease, border-color 0.3s ease;
+    }
+    .input-wrapper {
+        flex: 1; position: relative; min-width: 0;
+        border-radius: 30px; overflow: hidden; height: 52px;
+    }
+    .input-wrapper input {
+        width: 100%; height: 100%; padding: 14px 20px; border: 1.5px solid var(--input-border);
+        border-radius: 30px; font-size: 15px; outline: none;
+        transition: var(--transition); background: var(--input-bg); box-sizing: border-box;
+        color: var(--text-primary);
+    }
+    .input-wrapper input:focus {
+        border-color: var(--primary); box-shadow: 0 0 0 4px rgba(16,163,127,0.08);
+        background: var(--input-focus-bg);
+    }
+    .voice-input-area {
+        position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+        display: none; align-items: center; justify-content: center;
+        background: var(--bg-body); border: 1.5px solid var(--border-color);
+        border-radius: 30px; cursor: pointer; height: 100%;
+        transition: var(--transition); user-select: none; box-sizing: border-box;
+    }
+    .voice-input-area:hover { border-color: var(--primary); }
+    .voice-input-area.recording { background: #fee2e2; border-color: #ef4444; }
+    .voice-input-area .voice-prompt { font-size: 15px; color: var(--text-muted); letter-spacing: 1px; font-weight: 500; }
+    .voice-input-area.recording .voice-prompt { color: #ef4444; font-weight: 600; }
+    .chat-input-area button {
+        padding: 14px 28px; background: var(--btn-send-bg); color: #fff;
+        border: none; border-radius: 30px; font-size: 15px; font-weight: 600;
+        cursor: pointer; transition: all 0.25s ease; white-space: nowrap;
+        height: 52px; display: flex; align-items: center; justify-content: center;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+    .chat-input-area button:hover:not(:disabled) { background: var(--btn-send-hover); transform: translateY(-2px); box-shadow: 0 4px 16px rgba(0,0,0,0.15); }
+    .chat-input-area button:disabled { background: var(--btn-send-disabled); cursor: not-allowed; opacity: 0.7; box-shadow: none; }
+    /* 发送中 = 取消按钮（红色警示态） */
+    .chat-input-area button.btn-cancel,
+    .chat-input-area button.btn-cancel:hover:not(:disabled) {
+        background: #ef4444;
+        transform: none;
+        box-shadow: 0 2px 8px rgba(239,68,68,0.3);
+    }
+
+    /* ---------- 文件上传按钮 ---------- */
+    .upload-btn {
+        display: inline-flex; align-items: center; justify-content: center;
+        width: 52px; height: 52px; border-radius: 50%;
+        background: var(--bg-body); border: 1.5px dashed var(--border-color);
+        cursor: pointer; transition: var(--transition); flex-shrink: 0;
+        position: relative; overflow: hidden;
+    }
+    .upload-btn:hover { background: var(--primary-light); border-color: var(--primary); }
+    .upload-btn:active { background: var(--primary); color: #fff; border-color: var(--primary); }
+    .upload-btn input { display: none; }
+    .upload-btn.has-file { background: var(--primary); color: #fff; border-color: var(--primary); border-style: solid; }
+    /* 上传中蓝色光晕贴合图标 */
+    .upload-btn.has-file svg { filter: drop-shadow(0 0 2px rgba(255,255,255,0.5)); }
+
+    /* ---------- 模拟支付 UI ---------- */
+    .wallet-btn {
+        background: var(--bg-body);
+        border: 1px solid var(--border-color);
+        color: var(--text-secondary);
+        padding: 6px 12px;
+        border-radius: 30px;
+        font-size: 13px;
+        cursor: pointer;
+        transition: var(--transition);
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        white-space: nowrap;
+        font-weight: 500;
+    }
+    .wallet-btn:hover { background: var(--primary-light); border-color: var(--primary); color: var(--primary); }
+    .wallet-btn .balance-text { color: var(--primary); font-weight: 700; }
+
+    /* 支付弹窗遮罩 */
+    .payment-overlay {
+        display: none;
+        position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+        background: rgba(0,0,0,0.45); backdrop-filter: blur(6px);
+        z-index: 10000;
+        justify-content: center; align-items: center;
+        padding: 20px;
+    }
+    .payment-overlay.show { display: flex; animation: fadeIn 0.2s ease; }
+    .payment-modal {
+        background: #fff; border-radius: 16px;
+        max-width: 480px; width: 100%;
+        max-height: 85vh; overflow-y: auto;
+        box-shadow: 0 25px 60px rgba(0,0,0,0.15);
+        animation: slideUp 0.25s ease;
+    }
+    .payment-modal .modal-header {
+        padding: 20px 24px 16px;
+        border-bottom: 1px solid #eee;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+    .payment-modal .modal-header h3 { font-size: 18px; font-weight: 700; color: #1a2e1a; margin: 0; }
+    .payment-modal .modal-header .close-btn {
+        background: none; border: none; font-size: 22px; cursor: pointer;
+        color: #999; padding: 4px 8px; border-radius: 8px;
+        transition: 0.2s;
+    }
+    .payment-modal .modal-header .close-btn:hover { background: #f5f5f5; color: #333; }
+    .payment-modal .modal-body { padding: 20px 24px; }
+    .payment-modal .modal-footer {
+        padding: 16px 24px 20px;
+        border-top: 1px solid #eee;
+        display: flex; gap: 12px; justify-content: flex-end;
+    }
+    .payment-modal .modal-footer button {
+        padding: 10px 24px; border-radius: 10px; font-size: 14px;
+        font-weight: 600; cursor: pointer; transition: 0.2s; border: none;
+    }
+    .payment-modal .modal-footer .btn-secondary {
+        background: #f0f5f0; color: var(--text-secondary);
+    }
+    .payment-modal .modal-footer .btn-secondary:hover { background: #e0ebe0; }
+    .payment-modal .modal-footer .btn-primary {
+        background: var(--primary); color: #fff;
+    }
+    .payment-modal .modal-footer .btn-primary:hover { background: var(--primary-dark); }
+
+    /* 充值规则 */
+    .recharge-rules {
+        background: #f8fdf8; border: 1px solid #d4edd4;
+        border-radius: 10px; padding: 16px; margin-bottom: 20px;
+        font-size: 13px; line-height: 1.7;
+    }
+    .recharge-rules .rule-title { font-weight: 700; color: var(--primary); margin-bottom: 8px; font-size: 14px; }
+    .recharge-rules ul { margin: 0; padding-left: 18px; color: var(--text-secondary); }
+    .recharge-rules li { margin: 4px 0; }
+    .recharge-rules .highlight { color: #d97706; font-weight: 600; }
+    .recharge-rules .demo-note { background: #fef3c7; border: 1px solid #fde68a; border-radius: 8px; padding: 10px; margin-top: 12px; font-size: 12px; color: #92400e; }
+
+    /* 金额选择区 */
+    .amount-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 8px; margin: 16px 0;
+    }
+    .amount-grid button {
+        padding: 12px 8px;
+        border: 2px solid #e5e5e5;
+        border-radius: 10px;
+        background: #fff;
+        font-size: 15px;
+        font-weight: 700;
+        color: var(--text-primary);
+        cursor: pointer;
+        transition: 0.2s;
+    }
+    .amount-grid button:hover { border-color: var(--primary); background: var(--primary-light); }
+    .amount-grid button.selected { border-color: var(--primary); background: var(--primary-light); color: var(--primary); }
+
+    /* 渠道选择 */
+    .channel-option {
+        display: flex; align-items: center; gap: 12px;
+        padding: 12px 16px;
+        border: 2px solid #e5e5e5;
+        border-radius: 10px;
+        cursor: pointer;
+        transition: 0.2s;
+        margin-bottom: 8px;
+    }
+    .channel-option:hover { border-color: var(--primary); }
+    .channel-option.selected { border-color: var(--primary); background: var(--primary-light); }
+    .channel-option .channel-icon { font-size: 24px; }
+    .channel-option .channel-name { font-size: 15px; font-weight: 600; color: var(--text-primary); }
+    .channel-option .channel-radio {
+        margin-left: auto; width: 20px; height: 20px;
+        border: 2px solid #ccc; border-radius: 50%;
+        display: flex; align-items: center; justify-content: center;
+        transition: 0.2s;
+    }
+    .channel-option.selected .channel-radio { border-color: var(--primary); }
+    .channel-option.selected .channel-radio::after {
+        content: ''; width: 10px; height: 10px;
+        background: var(--primary); border-radius: 50%;
+    }
+
+    /* 二维码展示区 */
+    .qr-section {
+        text-align: center; padding: 20px 0;
+    }
+    .qr-section .qr-box {
+        width: 200px; height: 200px;
+        margin: 0 auto 16px;
+        background: #fff;
+        border: 2px dashed #ddd;
+        border-radius: 12px;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 14px; color: #999;
+        position: relative;
+        overflow: hidden;
+    }
+    .qr-section .qr-box canvas, .qr-section .qr-box img {
+        width: 180px; height: 180px;
+    }
+    .qr-section .qr-box .qr-placeholder {
+        display: flex; flex-direction: column; align-items: center; gap: 8px;
+    }
+    .qr-section .qr-box .qr-placeholder svg { width: 80px; height: 80px; opacity: 0.3; }
+    .qr-section .qr-box .qr-placeholder .qr-code-text { font-size: 12px; color: #bbb; }
+    .qr-section .qr-tip {
+        font-size: 14px; color: #d97706; font-weight: 600;
+        background: #fef3c7; border: 1px solid #fde68a;
+        border-radius: 8px; padding: 10px 16px;
+        display: inline-block;
+    }
+    .qr-section .qr-amount {
+        font-size: 28px; font-weight: 800; color: var(--text-primary);
+        margin: 12px 0 4px;
+    }
+    .qr-section .qr-order-no {
+        font-size: 12px; color: #999;
+    }
+
+    /* 充值成功 */
+    .success-section {
+        text-align: center; padding: 10px 0;
+    }
+    .success-section .success-icon {
+        font-size: 64px; margin-bottom: 12px;
+        display: block;
+    }
+    .success-section .success-title {
+        font-size: 22px; font-weight: 700; color: var(--primary);
+        margin-bottom: 20px;
+    }
+    .success-details {
+        background: #f8fdf8; border-radius: 10px;
+        padding: 16px; text-align: left; font-size: 13px;
+    }
+    .success-details .detail-row {
+        display: flex; justify-content: space-between;
+        padding: 6px 0; border-bottom: 1px dashed #e0f0e0;
+    }
+    .success-details .detail-row:last-child { border-bottom: none; }
+    .success-details .detail-label { color: #666; }
+    .success-details .detail-value { color: var(--text-primary); font-weight: 600; }
+
+    /* 交易流水弹窗 */
+    .tx-list { max-height: 400px; overflow-y: auto; }
+    .tx-item {
+        padding: 12px 0;
+        border-bottom: 1px solid #f0f0f0;
+        display: flex; align-items: center; justify-content: space-between;
+    }
+    .tx-item:last-child { border-bottom: none; }
+    .tx-item .tx-icon { font-size: 20px; margin-right: 12px; }
+    .tx-item .tx-info { flex: 1; }
+    .tx-item .tx-info .tx-type { font-size: 14px; font-weight: 600; color: var(--text-primary); }
+    .tx-item .tx-info .tx-time { font-size: 11px; color: #999; margin-top: 2px; }
+    .tx-item .tx-amount { font-size: 16px; font-weight: 700; }
+    .tx-item .tx-amount.recharge { color: var(--primary); }
+    .tx-item .tx-amount.consume { color: #ef4444; }
+
+    /* 移动端支付按钮适配 */
+    @media (max-width: 768px) {
+        .wallet-btn .balance-label { display: none; }
+        .payment-modal { max-width: 100%; margin: 10px; border-radius: 12px; }
+        .amount-grid { grid-template-columns: repeat(3, 1fr); }
+        .payment-modal .modal-body { padding: 16px; }
+        .payment-modal .modal-header { padding: 16px; }
+        .payment-modal .modal-footer { padding: 12px 16px 16px; }
+        .qr-section .qr-box { width: 160px; height: 160px; }
+        .qr-section .qr-box canvas, .qr-section .qr-box img { width: 144px; height: 144px; }
+    }
+
+    /* ---------- Toast 通知 ---------- */
+    .toast-notice {
+        position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
+        background: rgba(26,46,26,0.92); color: #fff; padding: 10px 20px;
+        border-radius: 12px; font-size: 13px; z-index: 9999;
+        backdrop-filter: blur(8px); box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+        display: flex; align-items: center; gap: 8px;
+        animation: toastIn 0.3s ease; pointer-events: none;
+        max-width: 90vw; white-space: nowrap;
+    }
+    .toast-notice.hide { animation: toastOut 0.3s ease forwards; }
+    @keyframes toastIn { from { opacity: 0; transform: translateX(-50%) translateY(12px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
+    @keyframes toastOut { from { opacity: 1; } to { opacity: 0; transform: translateX(-50%) translateY(12px); } }
+    @media (max-width: 768px) { .toast-notice { bottom: 70px; font-size: 12px; padding: 8px 14px; } }
+
+        /* ---------- 文件上传指示器（圆圈进度 2.0）---------- */
+    .file-indicator {
+        display: none; align-items: center; gap: 6px;
+        padding: 4px 12px 4px 8px; margin: 4px 28px 0;
+        background: var(--primary-light); border-radius: 20px;
+        font-size: 12px; color: var(--primary-dark);
+        flex-shrink: 0; max-width: fit-content; height: 32px;
+    }
+    .file-indicator .file-progress {
+        width: 24px; height: 24px; position: relative; flex-shrink: 0;
+    }
+    .file-indicator .file-progress svg {
+        width: 24px; height: 24px;
+    }
+    .file-indicator .file-progress .track {
+        fill: none; stroke: rgba(0,0,0,0.1); stroke-width: 3;
+    }
+    /* 上传中圆圈：从12点顺时针填充 */
+    .file-indicator.uploading .fill-arc {
+        fill: none; stroke: var(--primary); stroke-width: 3;
+        stroke-linecap: round; transition: stroke-dashoffset 0.15s linear;
+    }
+    .file-indicator.uploading .fill-arc {
+        transform: rotate(-90deg);
+        transform-origin: 12px 12px;
+    }
+    /* OCR识别中：从底部从空到满填充 */
+    .file-indicator.processing .fill-arc {
+        fill: none; stroke: var(--primary); stroke-width: 3;
+        stroke-linecap: round;
+        transform: rotate(90deg);  /* 从6点开始 */
+        transform-origin: 12px 12px;
+        stroke-dashoffset: 62.83;
+        animation: fillFromBottom 1.8s ease-in-out forwards;
+    }
+    @keyframes fillFromBottom {
+        0%   { stroke-dashoffset: 62.83; }
+        100% { stroke-dashoffset: 0; }
+    }
+    /* 完成：满圈 + 中间打勾 */
+    .file-indicator.done .fill-arc {
+        fill: none; stroke: var(--primary); stroke-width: 3;
+        stroke-dasharray: 62.83; stroke-dashoffset: 0;
+        transform: rotate(-90deg);
+        transform-origin: 12px 12px;
+        transition: none;
+    }
+    .file-indicator .file-progress .icon-overlay {
+        position: absolute; top: 50%; left: 50%;
+        transform: translate(-50%, -50%);
+        font-size: 12px; line-height: 1;
+    }
+    .file-indicator .file-label {
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px;
+    }
+    .file-indicator .file-close {
+        background: none; border: none; color: var(--primary-dark); cursor: pointer;
+        font-size: 14px; padding: 0 2px; opacity: 0.6; line-height: 1;
+    }
+    .file-indicator .file-close:hover { opacity: 1; }
+    @media (max-width: 768px) {
+        .file-indicator { margin: 2px 12px 0; font-size: 11px; height: 28px; padding: 2px 10px 2px 6px; }
+        .file-indicator .file-label { max-width: 100px; }
+    }
+
+    /* ---------- 推荐按钮/* ---------- 推荐按钮（消息内嵌） ---------- */
+    .message-suggestions {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-top: 12px;
+        padding-top: 10px;
+        border-top: 1px dashed var(--border-color);
+    }
+    .message-suggestions button {
+        padding: 6px 16px; background: var(--bg-body); border: 1px solid var(--border-color);
+        border-radius: 20px; color: var(--text-secondary); font-size: 12px;
+        cursor: pointer; transition: var(--transition); white-space: nowrap;
+    }
+    .message-suggestions button:hover {
+        background: var(--primary-light); border-color: var(--primary); color: var(--primary);
+        transform: scale(0.97);
+    }
+
+    /* ---------- 滚动条 ---------- */
+    .chat-messages::-webkit-scrollbar { width: 6px; }
+    .chat-messages::-webkit-scrollbar-track { background: transparent; }
+    .chat-messages::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 10px; }
+    .chat-messages::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-hover); }
+
+    /* ---------- 移动端适配 (E2 核心) ---------- */
+    .mobile-menu-btn {
+        display: none;
+        background: none; border: none; font-size: 24px; cursor: pointer;
+        color: var(--text-secondary); padding: 8px; border-radius: var(--radius-sm);
+        transition: var(--transition);
+    }
+    .mobile-menu-btn:hover { background: var(--bg-body); }
+
+    .mobile-overlay {
+        display: none;
+        position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+        background: rgba(0,0,0,0.4); backdrop-filter: blur(4px);
+        z-index: 999; justify-content: flex-start; align-items: flex-start;
+        padding: 20px;
+    }
+    .mobile-overlay.show { display: flex; animation: fadeIn 0.2s ease; }
+    .mobile-menu-panel {
+        background: #fff; width: 100%; max-width: 360px; max-height: 80vh;
+        border-radius: var(--radius-lg); box-shadow: 0 20px 60px rgba(0,0,0,0.15);
+        padding: 24px 20px; display: flex; flex-direction: column; overflow: hidden;
+        animation: slideUp 0.25s ease; margin-top: 20px;
+    }
+    @keyframes slideUp {
+        from { transform: translateY(20px); opacity: 0; }
+        to { transform: translateY(0); opacity: 1; }
+    }
+    @keyframes fadeIn {
+        from { opacity: 0; } to { opacity: 1; }
+    }
+    .mobile-menu-panel .panel-header {
+        display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;
+    }
+    .mobile-menu-panel .panel-header h3 { font-size: 18px; color: var(--text-primary); font-weight: 700; }
+    .mobile-menu-panel .panel-close {
+        background: none; border: none; font-size: 28px; cursor: pointer; color: var(--text-muted); padding: 0 4px;
+    }
+    .mobile-menu-panel .panel-new-btn {
+        background: var(--primary); color: #fff; border: none;
+        padding: 14px 16px; border-radius: var(--radius-sm); font-size: 15px;
+        font-weight: 600; cursor: pointer; margin-bottom: 20px; width: 100%;
+        transition: var(--transition);
+    }
+    .mobile-menu-panel .panel-new-btn:hover { background: var(--primary-dark); }
+    .mobile-menu-panel .panel-history-list { flex: 1; overflow-y: auto; }
+    .mobile-menu-panel .panel-history-item {
+        padding: 12px 14px; border-radius: var(--radius-sm); font-size: 14px;
+        color: var(--text-secondary); cursor: pointer; transition: var(--transition);
+        display: flex; justify-content: space-between; align-items: center;
+        border: none; background: transparent; width: 100%; text-align: left;
+    }
+    .mobile-menu-panel .panel-history-item:hover { background: var(--bg-body); }
+    .mobile-menu-panel .panel-history-item.active {
+        background: var(--primary-light); color: var(--primary); font-weight: 600;
+    }
+    .mobile-menu-panel .panel-history-item .del-btn {
+        color: var(--text-muted); background: none; border: none; cursor: pointer; font-size: 16px; padding: 0 4px;
+    }
+    .mobile-menu-panel .panel-history-item .del-btn:hover { color: #ef4444; }
+
+    /* ---------- 移动端响应式断点 ---------- */
+    @media (max-width: 768px) {
+        .sidebar { display: none; }
+        .app { max-width: 100%; border-radius: 0; height: 100vh; margin: 0; }
+        .message { max-width: 92%; }
+        .message.assistant { max-width: 92%; padding: 14px 18px; margin: 0; }
+        .chat-header { padding: 12px 16px; }
+        .chat-header .title .badge { display: none; }
+        .chat-messages { padding: 16px; gap: 16px; }
+        .chat-input-area { padding: 10px 12px 16px; gap: 6px; }
+        .upload-btn { width: 40px; height: 40px; min-width: 40px; }
+        .upload-btn svg { width: 18px; height: 18px; }
+        .input-wrapper { height: 40px; }
+        .input-wrapper input { font-size: 14px; padding: 10px 14px; }
+        .voice-input-area { font-size: 14px; }
+        .chat-input-area button { min-width: 52px; padding: 10px 14px; font-size: 13px; height: 40px; min-height: 40px; }
+
+        .mobile-menu-btn { display: block; }
+        .logout-btn { font-size: 12px; padding: 4px 12px; }
+        .map-btn { display: none; }
+        .mode-badge { font-size: 11px; padding: 2px 14px; }
+
+        .mobile-overlay { padding: 10px; align-items: flex-start; }
+        .mobile-menu-panel { max-height: 90vh; margin-top: 10px; padding: 20px 16px; }
+    }
+
+    @media (max-width: 480px) {
+        .chat-messages { padding: 12px; }
+        .message.assistant { padding: 12px 16px; font-size: 14px; }
+        .chat-input-area { padding: 8px 8px 12px; gap: 4px; }
+        .upload-btn, .chat-input-area button { min-width: 44px; padding: 8px 12px; font-size: 12px; height: 36px; }
+        .header-actions { gap: 4px; }
+        .file-indicator { margin: 2px 8px 0; font-size: 10px; }
+        .file-indicator span { max-width: 80px; }
+        .theme-btn-pc { font-size: 11px !important; padding: 5px 0 !important; }
+    }
+  </style>
+
+<!-- ========== 主题切换器 ========== -->
+
+</head>
+<body>
+
+<!-- ========== 登录界面 ========== -->
+<div id="login-container">
+  <div class="login-box">
+    <h2 data-i18n="app_title">旅行规划助手</h2>
+    <p data-i18n="login_subtitle">请登录以继续</p>
+
+    <!-- 登录方式切换 -->
+    <div style="display:flex;gap:0;margin-bottom:20px;border:1px solid var(--border-color);border-radius:var(--radius-sm);overflow:hidden;">
+      <button class="login-tab active" data-tab="password" style="flex:1;padding:10px;background:var(--primary);color:#fff;border:none;font-size:14px;font-weight:600;cursor:pointer;transition:0.2s;" data-i18n="tab_password">密码登录</button>
+      <button class="login-tab" data-tab="phone" style="flex:1;padding:10px;background:#f0f5f0;color:var(--text-secondary);border:none;font-size:14px;font-weight:600;cursor:pointer;transition:0.2s;" data-i18n="tab_phone">手机号登录</button>
+    </div>
+
+    <!-- 密码登录 -->
+    <div id="loginTabPassword">
+      <input type="text" id="loginUsername" placeholder="用户名" data-i18n-ph="username_ph" />
+      <input type="password" id="loginPassword" placeholder="密码" data-i18n-ph="password_ph" />
+      <button id="loginBtn" data-i18n="login_btn">登录</button>
+      <div class="error-msg" id="loginError" style="display:none" data-i18n="login_error">用户名或密码错误</div>
+    </div>
+
+    <!-- 手机号登录 -->
+    <div id="loginTabPhone" style="display:none;">
+      <input type="text" id="phoneInput" placeholder="请输入手机号" style="width:100%;padding:12px 14px;border:1.5px solid var(--border-color);border-radius:var(--radius-sm);font-size:15px;margin-bottom:10px;background:#fafafa;transition:var(--transition);outline:none;box-sizing:border-box;" data-i18n-ph="phone_input_ph" />
+      <div style="display:flex;gap:6px;margin-bottom:10px;">
+        <input type="text" id="phoneCodeInput" placeholder="验证码" style="flex:1;padding:12px 14px;border:1.5px solid var(--border-color);border-radius:var(--radius-sm);font-size:15px;background:#fafafa;transition:var(--transition);outline:none;box-sizing:border-box;" data-i18n-ph="code_ph" />
+        <button id="phoneSendCodeBtn" style="width:110px;flex-shrink:0;padding:12px 0;background:var(--primary);color:#fff;border:none;border-radius:var(--radius-sm);font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;transition:0.2s;box-sizing:border-box;" data-i18n="get_code">获取验证码</button>
+      </div>
+      <input type="password" id="phonePasswordInput" placeholder="设置密码（可选，设置后可密码登录）" style="width:100%;padding:12px 14px;border:1.5px solid var(--border-color);border-radius:var(--radius-sm);font-size:15px;margin-bottom:10px;background:#fafafa;transition:var(--transition);outline:none;box-sizing:border-box;" data-i18n-ph="phone_password_ph" />
+      <!-- 用户协议 -->
+      <label style="display:flex;align-items:center;gap:6px;margin-bottom:14px;font-size:12px;color:var(--text-secondary);cursor:pointer;">
+        <input type="checkbox" id="agreeCheckbox" style="width:16px;height:16px;cursor:pointer;accent-color:var(--primary);" checked />
+        <span data-i18n="agree_prefix">我已阅读并同意</span>
+        <a href="/static/user-agreement.html" target="_blank" style="color:var(--primary);text-decoration:underline;">《用户协议》</a>
+      </label>
+      <button id="phoneLoginBtn" style="width:100%;padding:12px;background:var(--primary);color:#fff;border:none;border-radius:var(--radius-sm);font-size:15px;font-weight:600;cursor:pointer;transition:var(--transition);" data-i18n="phone_login_btn">登录 / 注册</button>
+      <div class="error-msg" id="phoneError" style="display:none;" data-i18n="phone_error_default">操作失败</div>
+    </div>
+
+    <!-- GitHub 登录 -->
+    <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #e5e5e5; text-align: center;">
+      <p style="color: #8e8e8e; font-size: 13px; margin-bottom: 12px;" data-i18n="or_third_party">或使用第三方账号登录</p>
+      <a href="/auth/github" style="text-decoration: none; display: block;">
+        <button type="button" style="
+          width: 100%;
+          padding: 12px;
+          background: #24292e;
+          color: #fff;
+          border: none;
+          border-radius: 8px;
+          font-size: 16px;
+          font-weight: 500;
+          cursor: pointer;
+          transition: background 0.2s;
+        " onmouseover="this.style.background='#1b1f23'" onmouseout="this.style.background='#24292e'" data-i18n="github_login">
+          使用 GitHub 登录
+        </button>
+      </a>
+    </div>
+  </div>
+</div>
+
+<!-- ========== 聊天应用（初始隐藏） ========== -->
+<div class="app" id="appContainer">
+  <!-- 侧边栏（桌面端） -->
+  <aside class="sidebar">
+    <div class="sidebar-title"><span data-i18n="sidebar_title_1">旅行规划</span><span data-i18n="sidebar_title_2">助手</span></div>
+    <button class="new-chat-btn" id="newChatBtn"><span data-i18n="new_chat">＋ 开启新对话</span></button>
+    <div class="history-label" data-i18n="history_label">历史对话</div>
+    <div class="history-list" id="historyList"></div>
+    <!-- 主题选择器（PC端） -->
+    <div style="padding:0 0 8px 0;margin-bottom:4px;border-bottom:1px solid var(--border-color);">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;">
+        <button class="theme-btn-pc active" data-theme="classic" style="padding:6px 0;border-radius:6px;border:1.5px solid var(--border-color);background:transparent;color:var(--text-secondary);font-size:12px;cursor:pointer;transition:all 0.2s;font-weight:500;">经典绿</button>
+        <button class="theme-btn-pc" data-theme="glass" style="padding:6px 0;border-radius:6px;border:1.5px solid var(--border-color);background:transparent;color:var(--text-secondary);font-size:12px;cursor:pointer;transition:all 0.2s;font-weight:500;">玻璃紫</button>
+        <button class="theme-btn-pc" data-theme="dark" style="padding:6px 0;border-radius:6px;border:1.5px solid var(--border-color);background:transparent;color:var(--text-secondary);font-size:12px;cursor:pointer;transition:all 0.2s;font-weight:500;">暗夜蓝</button>
+      </div>
+    </div>
+    <div class="sidebar-footer" style="font-size:11px;color:var(--text-muted);text-align:center;padding:8px 0 0 0;border-top:1px solid var(--border-color);margin-top:0;">
+      <div data-i18n="sessions_saved_local">会话保存在本地</div>
+      <button id="settingsBtn" style="display:flex;align-items:center;justify-content:center;gap:6px;width:100%;margin-top:6px;padding:6px 0;font-size:12px;color:var(--text-secondary);background:var(--bg-body);border:1px solid var(--border-color);border-radius:6px;cursor:pointer;transition:var(--transition);font-weight:500;">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span data-i18n="settings">设置</span>
+      </button>
+    </div>
+    <button id="clearAllHistoryBtn" style="font-size:11px;color:var(--text-muted);background:none;border:1px dashed var(--border-color);border-radius:4px;padding:4px 8px;cursor:pointer;width:100%;margin-top:6px;transition:var(--transition);"><span data-i18n="clear_history">清空历史</span></button>
+  </aside>
+
+  <!-- 聊天区域 -->
+  <div class="chat-area">
+    <div class="chat-header">
+      <div class="header-left">
+        <button class="mobile-menu-btn" id="mobileMenuBtn" aria-label="历史会话">＋</button>
+        <button class="wallet-btn" id="walletBtn">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><rect x="1" y="5" width="22" height="14" rx="2"/><circle cx="12" cy="12" r="3"/><path d="M16 12h4"/></svg>
+          <span class="balance-label" data-i18n="balance">余额</span> <span class="balance-text" id="walletBalance">—</span>
+        </button>
+        <!-- GitHub 试用剩余提问次数徽标（仅受限用户显示；点击可绑定手机号解锁） -->
+        <span id="quotaBadge" title="绑定手机号解锁更多提问次数" style="display:none;margin-left:8px;padding:6px 10px;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.4);border-radius:20px;color:#d97706;font-size:12px;font-weight:600;white-space:nowrap;cursor:pointer;vertical-align:middle;"></span>
+      </div>
+      <div class="header-actions">
+        <a href="/static/map.html" class="map-btn" title="地图速览" data-i18n="map">地图</a>
+        <button class="me-btn" id="modeToggleBtn" data-i18n="me_mode">求职</button>
+        <button class="logout-btn" id="logoutBtn" data-i18n="logout">退出</button>
+      </div>
+    </div>
+
+    <div class="mode-badge" id="modeBadge">求职</div>
+    <div class="chat-messages" id="messages"></div>
+
+    <div class="chat-input-area">
+        <label class="upload-btn" id="uploadBtn" title="上传文件（PDF/图片/Word/TXT）·仅本地解析，不会上传云端" data-i18n-title="upload_title">
+            <input type="file" id="fileInput" accept=".txt,.md,.csv,.json,.xml,.pdf,.jpg,.jpeg,.png,.bmp,.webp,.docx" />
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        </label>
+        <div class="input-wrapper" id="inputWrapper">
+            <input type="text" id="input" placeholder="输入你的旅行问题…" data-i18n-ph="input_ph" />
+        </div>
+        <button id="sendBtn" data-i18n="send">发送</button>
+    </div>
+    <div class="file-indicator" id="fileIndicator">
+        <div class="file-progress">
+            <svg viewBox="0 0 24 24">
+                <circle class="track" cx="12" cy="12" r="10"/>
+                <circle class="fill-arc" id="progressCircle" cx="12" cy="12" r="10"
+                    stroke-dasharray="62.83" stroke-dashoffset="62.83"/>
+            </svg>
+            <span class="icon-overlay" id="progressIcon">📎</span>
+        </div>
+        <span class="file-label" id="fileLabel"></span>
+        <button class="file-close" id="clearFileBtn">✕</button>
+    </div>
+
+<!-- ========== 手机端历史弹窗 ========== -->
+<div class="mobile-overlay" id="mobileOverlay">
+  <div class="mobile-menu-panel">
+    <div class="panel-header">
+      <h3 id="mobilePanelTitle">历史对话</h3>
+      <button class="panel-close" id="mobileCloseBtn">✕</button>
+    </div>
+    <button class="panel-new-btn" id="mobileNewBtn"><span data-i18n="new_chat">＋ 开启新对话</span></button>
+    <div style="display:flex;gap:8px;margin-bottom:12px;">
+      <button class="panel-new-btn" id="mobileSettingsBtn" style="flex:1;background:var(--bg-body);color:var(--text-secondary);font-size:13px;padding:10px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-right:4px;"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span data-i18n="settings">设置</span>
+      </button>
+    </div>
+    <div style="margin-bottom:12px;padding:10px;background:var(--bg-body);border-radius:8px;">
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;" data-i18n="theme_label">更换主题</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;">
+        <button class="theme-btn-mb" data-theme="classic" style="padding:6px 0;border-radius:6px;border:1.5px solid var(--border-color);background:transparent;color:var(--text-secondary);font-size:12px;cursor:pointer;transition:all 0.2s;">经典绿</button>
+        <button class="theme-btn-mb" data-theme="glass" style="padding:6px 0;border-radius:6px;border:1.5px solid var(--border-color);background:transparent;color:var(--text-secondary);font-size:12px;cursor:pointer;transition:all 0.2s;">玻璃紫</button>
+        <button class="theme-btn-mb" data-theme="dark" style="padding:6px 0;border-radius:6px;border:1.5px solid var(--border-color);background:transparent;color:var(--text-secondary);font-size:12px;cursor:pointer;transition:all 0.2s;">暗夜蓝</button>
+      </div>
+    </div>
+    <div class="panel-history-list" id="mobileHistoryList"></div>
+  </div>
+</div>
+
+<!-- ========== 充值弹窗 ========== -->
+<div class="payment-overlay" id="rechargeOverlay">
+  <div class="payment-modal">
+    <div class="modal-header">
+      <h3 data-i18n="wallet_recharge">账户充值</h3>
+      <button class="tx-entry-btn" id="rechargeTxEntryBtn" style="margin-left:auto;margin-right:10px;padding:5px 12px;border-radius:20px;border:1px solid var(--border-color);background:var(--bg-body);color:var(--text-secondary);font-size:12px;cursor:pointer;transition:all 0.2s;">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-right:4px;"><path d="M3 3h18v18H3z"/><path d="M3 9h18"/><path d="M9 3v18"/></svg><span data-i18n="transactions">交易流水</span>
+      </button>
+      <button class="close-btn" id="rechargeCloseBtn">✕</button>
+    </div>
+    <div class="modal-body" id="rechargeBody">
+      <!-- 步骤1: 选择金额和渠道 -->
+      <div id="rechargeStep1">
+        <div class="recharge-rules">
+          <div class="rule-title" data-i18n="recharge_rules_title">模拟充值说明</div>
+          <ul>
+            <li data-i18n-html="rule_1">本系统为 <span class="highlight">完全模拟支付环境</span>，仅作演示用途</li>
+            <li data-i18n-html="rule_2">所有金额单位为 <strong>人民币（元）</strong>，仅数字为模拟数据</li>
+            <li data-i18n-html="rule_3">点击充值后生成 <span class="highlight">模拟二维码</span>，扫码无效</li>
+            <li data-i18n-html="rule_4">关闭二维码后自动 <span class="highlight">充值成功</span>，金额即时到账</li>
+            <li data-i18n-html="rule_5">充值记录可在 <span class="highlight">交易流水</span> 中查看</li>
+            <li data-i18n-html="rule_6">本系统不涉及真实资金交易</li>
+          </ul>
+          <div class="demo-note" data-i18n-html="demo_note">
+            <strong>核心提示：</strong>点击「去充值」后生成的二维码 <strong>仅做演示用</strong>，不可用于真实支付。关闭二维码即视为支付完成。
+          </div>
+        </div>
+        <label style="font-size:14px;font-weight:600;color:var(--text-primary);" data-i18n="recharge_amount">选择充值金额</label>
+        <div class="amount-grid" id="amountGrid">
+          <button data-amount="10">10 <span data-i18n="yuan">元</span></button>
+          <button data-amount="50">50 <span data-i18n="yuan">元</span></button>
+          <button data-amount="100">100 <span data-i18n="yuan">元</span></button>
+          <button data-amount="500">500 <span data-i18n="yuan">元</span></button>
+        </div>
+        <label style="font-size:14px;font-weight:600;color:var(--text-primary);margin-top:16px;display:block;" data-i18n="recharge_method">选择支付方式</label>
+        <div style="margin-top:8px;" id="channelList">
+          <div class="channel-option selected" data-channel="simulated_alipay">
+            <span class="channel-icon">
+              <svg width="28" height="28" viewBox="0 0 28 28" fill="none"><rect width="28" height="28" rx="6" fill="#1677FF"/><text x="14" y="20" text-anchor="middle" font-size="17" font-weight="700" fill="white" font-family="system-ui,-apple-system,sans-serif">支</text><path d="M4 22.5c3.6-1.6 9.2-3.5 16-4" stroke="#fff" stroke-width="1.2" stroke-linecap="round" opacity="0.7"/><path d="M18 21l-1.5 2.5" stroke="#fff" stroke-width="1.2" stroke-linecap="round" opacity="0.7"/></svg>
+            </span>
+            <span class="channel-name" data-i18n="channel_alipay">支付宝</span>
+            <div class="channel-radio"></div>
+          </div>
+          <div class="channel-option" data-channel="simulated_wxpay">
+            <span class="channel-icon">
+              <svg width="28" height="28" viewBox="0 0 28 28" fill="none"><rect width="28" height="28" rx="6" fill="#07C160"/><path d="M8 12.5c0-2.8 2.7-5 6-5s6 2.2 6 5-2.7 5-6 5c-.9 0-1.8-.1-2.6-.4l-2.6 1.2.6-2.4A3.8 3.8 0 018 12.5z" fill="#fff"/><path d="M11.5 11.2a.8.8 0 110 1.6.8.8 0 010-1.6zm4 0a.8.8 0 110 1.6.8.8 0 010-1.6z" fill="#07C160"/></svg>
+            </span>
+            <span class="channel-name" data-i18n="channel_wxpay">微信支付</span>
+            <div class="channel-radio"></div>
+          </div>
+          <div class="channel-option" data-channel="balance">
+            <span class="channel-icon">
+              <svg width="28" height="28" viewBox="0 0 28 28" fill="none"><rect width="28" height="28" rx="6" fill="#F59E0B"/><path d="M7 12h14v8a1 1 0 01-1 1H8a1 1 0 01-1-1v-8z" fill="#fff" opacity="0.9"/><path d="M7 12h14v-1a1 1 0 00-1-1H8a1 1 0 00-1 1v1z" fill="#fff"/><circle cx="14" cy="16" r="2" fill="#F59E0B"/></svg>
+            </span>
+            <span class="channel-name" data-i18n="channel_balance">余额支付</span>
+            <div class="channel-radio"></div>
+          </div>
+        </div>
+      </div>
+      <!-- 步骤2: 二维码展示 -->
+      <div id="rechargeStep2" style="display:none;">
+        <div class="qr-section">
+          <div class="qr-amount" id="qrAmount">100.00 元</div>
+          <div class="qr-order-no" id="qrOrderNo">订单号：PA20260728143025</div>
+          <div class="qr-box" id="qrBox">
+            <div class="qr-placeholder">
+              <svg viewBox="0 0 24 24" fill="none" stroke="#ddd" stroke-width="1.5">
+                <rect x="3" y="3" width="7" height="7" rx="1"/>
+                <rect x="14" y="3" width="7" height="7" rx="1"/>
+                <rect x="3" y="14" width="7" height="7" rx="1"/>
+                <rect x="14" y="14" width="7" height="7" rx="1"/>
+                <line x1="6.5" y1="6.5" x2="6.5" y2="6.5"/>
+                <line x1="6.5" y1="17.5" x2="6.5" y2="17.5"/>
+                <line x1="17.5" y1="6.5" x2="17.5" y2="6.5"/>
+                <line x1="17.5" y1="17.5" x2="17.5" y2="17.5"/>
+              </svg>
+              <span class="qr-code-text" data-i18n="qr_code_text">模拟二维码</span>
+            </div>
+            <canvas id="qrCanvas" style="display:none;"></canvas>
+          </div>
+          <div class="qr-tip" data-i18n="qr_tip">仅做演示用，关闭即视为支付成功</div>
+          <div style="font-size:12px;color:#999;margin-top:8px;" data-i18n="qr_close_hint">点击下方「关闭」按钮完成支付</div>
+        </div>
+      </div>
+      <!-- 步骤3: 充值成功 -->
+      <div id="rechargeStep3" style="display:none;">
+        <div class="success-section">
+          <svg width="56" height="56" viewBox="0 0 56 56" fill="none" style="display:block;margin:0 auto 12px;"><circle cx="28" cy="28" r="28" fill="#2d8a4e" opacity="0.1"/><circle cx="28" cy="28" r="22" fill="#2d8a4e" opacity="0.2"/><path d="M22 28l4 4 8-8" stroke="#2d8a4e" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+          <div class="success-title" data-i18n="recharge_success">充值成功</div>
+          <div class="success-details">
+            <div class="detail-row">
+              <span class="detail-label" data-i18n="order_no_label">订单编号</span>
+              <span class="detail-value" id="successOrderNo">—</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label" data-i18n="recharge_amount_label">充值金额</span>
+              <span class="detail-value" style="color:var(--primary);font-weight:700;" id="successAmount">—</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label" data-i18n="payment_method_label">支付方式</span>
+              <span class="detail-value" id="successMethod">—</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label" data-i18n="channel_no_label">渠道流水号</span>
+              <span class="detail-value" id="successChannelNo">—</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label" data-i18n="pay_time_label">支付时间</span>
+              <span class="detail-value" id="successTime">—</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label" data-i18n="current_balance_label">当前余额</span>
+              <span class="detail-value" style="color:var(--primary);font-size:18px;" id="successBalance">—</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer" id="rechargeFooter">
+      <button class="btn-secondary" id="rechargeBackBtn" style="display:none;" data-i18n="back">← 返回</button>
+      <button class="btn-secondary" id="rechargeCancelBtn" data-i18n="cancel">取消</button>
+      <button class="btn-primary" id="rechargeGoBtn" data-i18n="go_recharge">去充值</button>
+      <button class="btn-primary" id="rechargeCloseQrBtn" style="display:none;" data-i18n="close_pay">关闭 · 完成支付</button>
+      <button class="btn-primary" id="rechargeDoneBtn" style="display:none;" data-i18n="done">完成</button>
+    </div>
+  </div>
+</div>
+
+<!-- ========== 交易流水弹窗 ========== -->
+<div class="payment-overlay" id="txOverlay">
+  <div class="payment-modal">
+    <div class="modal-header">
+      <h3 data-i18n="transactions">交易流水</h3>
+      <button class="close-btn" id="txCloseBtn">✕</button>
+    </div>
+    <div class="modal-body">
+      <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;">
+        <button class="tx-filter-btn active" data-filter="" style="padding:6px 14px;border-radius:20px;border:1px solid var(--border-color);background:var(--primary);color:#fff;font-size:12px;cursor:pointer;" data-i18n="tx_all">全部</button>
+        <button class="tx-filter-btn" data-filter="recharge" style="padding:6px 14px;border-radius:20px;border:1px solid var(--border-color);background:var(--bg-body);color:var(--text-secondary);font-size:12px;cursor:pointer;" data-i18n="tx_recharge">充值</button>
+        <button class="tx-filter-btn" data-filter="consume" style="padding:6px 14px;border-radius:20px;border:1px solid var(--border-color);background:var(--bg-body);color:var(--text-secondary);font-size:12px;cursor:pointer;" data-i18n="tx_consume">消费</button>
+      </div>
+      <div id="txLoading" style="text-align:center;padding:30px;color:#999;" data-i18n="loading">加载中...</div>
+      <div class="tx-list" id="txList"></div>
+      <div id="txEmpty" style="display:none;text-align:center;padding:30px;color:#999;" data-i18n="tx_empty">暂无交易记录</div>
+      <div id="txPagination" style="display:none;text-align:center;margin-top:12px;">
+        <button id="txPrevBtn" style="padding:6px 14px;border:1px solid var(--border-color);border-radius:6px;background:var(--bg-body);cursor:pointer;font-size:12px;" data-i18n="prev_page">← 上一页</button>
+        <span id="txPageInfo" style="margin:0 12px;font-size:12px;color:#666;"></span>
+        <button id="txNextBtn" style="padding:6px 14px;border:1px solid var(--border-color);border-radius:6px;background:var(--bg-body);cursor:pointer;font-size:12px;" data-i18n="next_page">下一页 →</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ========== 设置弹窗 ========== -->
+<div class="payment-overlay" id="settingsOverlay">
+  <div class="payment-modal" style="max-width:420px;">
+    <div class="modal-header">
+      <h3 data-i18n="settings_title">设置</h3>
+      <button class="close-btn" id="settingsCloseBtn">✕</button>
+    </div>
+    <div class="modal-body">
+      <!-- 语言切换 -->
+      <div style="margin-bottom:20px;">
+        <div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:10px;" data-i18n="language">语言 / Language</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+          <button id="langZhBtn" style="padding:10px 0;border-radius:8px;border:1.5px solid var(--border-color);background:var(--bg-body);color:var(--text-secondary);font-size:14px;font-weight:600;cursor:pointer;transition:all 0.2s;">中文</button>
+          <button id="langEnBtn" style="padding:10px 0;border-radius:8px;border:1.5px solid var(--border-color);background:var(--bg-body);color:var(--text-secondary);font-size:14px;font-weight:600;cursor:pointer;transition:all 0.2s;">English</button>
+        </div>
+      </div>
+      <!-- 修改密码 -->
+      <div>
+        <div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:10px;" data-i18n="change_password">修改密码</div>
+        <input type="password" id="pwdOldInput" placeholder="当前密码" style="width:100%;padding:12px 14px;border:1.5px solid var(--border-color);border-radius:8px;font-size:14px;margin-bottom:10px;background:var(--bg-body);transition:var(--transition);outline:none;box-sizing:border-box;" data-i18n-ph="current_password" />
+        <input type="password" id="pwdNewInput" placeholder="新密码（至少6位）" style="width:100%;padding:12px 14px;border:1.5px solid var(--border-color);border-radius:8px;font-size:14px;margin-bottom:10px;background:var(--bg-body);transition:var(--transition);outline:none;box-sizing:border-box;" data-i18n-ph="new_password" />
+        <input type="password" id="pwdConfirmInput" placeholder="确认新密码" style="width:100%;padding:12px 14px;border:1.5px solid var(--border-color);border-radius:8px;font-size:14px;margin-bottom:12px;background:var(--bg-body);transition:var(--transition);outline:none;box-sizing:border-box;" data-i18n-ph="confirm_password" />
+        <div id="pwdMsg" style="display:none;font-size:13px;margin-bottom:10px;"></div>
+        <button id="pwdSaveBtn" style="width:100%;padding:12px;background:var(--primary);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:0.2s;" data-i18n="save_password">保存新密码</button>
+      </div>
+      <!-- 账号信息 -->
+      <div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--border-color);font-size:12px;color:var(--text-muted);">
+        <span data-i18n="account">账号</span>: <span id="settingsUsername" style="font-weight:600;color:var(--text-secondary);">—</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ========== 评分弹窗（1-5 星）========== -->
+<div class="payment-overlay" id="ratingOverlay">
+  <div class="payment-modal" style="max-width:380px;text-align:center;">
+    <div class="modal-header">
+      <h3 data-i18n="rate_answer">评分</h3>
+      <button class="close-btn" id="ratingCloseBtn">✕</button>
+    </div>
+    <div class="modal-body" style="padding:24px 20px;">
+      <div id="ratingMsg" style="font-size:14px;color:var(--text-secondary);margin-bottom:16px;">请为这次回答评分（1-5 星）</div>
+      <div id="ratingStars" style="display:flex;justify-content:center;gap:8px;font-size:34px;cursor:pointer;">
+        <span class="rate-star" data-star="1" style="color:#ddd;transition:all 0.15s;">★</span>
+        <span class="rate-star" data-star="2" style="color:#ddd;transition:all 0.15s;">★</span>
+        <span class="rate-star" data-star="3" style="color:#ddd;transition:all 0.15s;">★</span>
+        <span class="rate-star" data-star="4" style="color:#ddd;transition:all 0.15s;">★</span>
+        <span class="rate-star" data-star="5" style="color:#ddd;transition:all 0.15s;">★</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ========== 绑定手机号（GitHub 试用额度解锁）========== -->
+<div class="payment-overlay" id="bindPhoneOverlay">
+  <div class="payment-modal" style="max-width:400px;">
+    <div class="modal-header">
+      <h3 data-i18n="bind_phone_title">绑定手机号解锁额度</h3>
+    </div>
+    <div class="modal-body">
+      <div id="bindPhoneTip" style="font-size:13px;color:var(--text-secondary);margin-bottom:16px;line-height:1.6;"></div>
+      <input type="text" id="bindPhoneInput" placeholder="请输入手机号" style="width:100%;padding:12px 14px;border:1.5px solid var(--border-color);border-radius:8px;font-size:14px;margin-bottom:10px;background:var(--bg-body);transition:var(--transition);outline:none;box-sizing:border-box;" data-i18n-ph="phone_input_ph" />
+      <div style="display:flex;gap:6px;margin-bottom:14px;">
+        <input type="text" id="bindPhoneCodeInput" placeholder="验证码" style="flex:1;padding:12px 14px;border:1.5px solid var(--border-color);border-radius:8px;font-size:14px;background:var(--bg-body);transition:var(--transition);outline:none;box-sizing:border-box;" data-i18n-ph="code_ph" />
+        <button id="bindPhoneSendCodeBtn" style="width:110px;flex-shrink:0;padding:12px 0;background:var(--primary);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;transition:0.2s;box-sizing:border-box;" data-i18n="bind_phone_send_code">获取验证码</button>
+      </div>
+      <div id="bindPhoneError" style="display:none;font-size:13px;margin-bottom:10px;color:#ef4444;"></div>
+      <div style="display:flex;gap:8px;">
+        <button id="bindPhoneSubmitBtn" style="flex:1;padding:12px;background:var(--primary);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:0.2s;" data-i18n="bind_phone_btn">绑定手机号</button>
+        <button id="bindPhoneSkipBtn" style="flex:1;padding:12px;background:var(--bg-body);color:var(--text-secondary);border:1.5px solid var(--border-color);border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:0.2s;" data-i18n="skip_bind">暂不绑定</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  // ============================================================
+  // i18n 中英文切换
+  // ============================================================
+  const LANG_KEY = 'travel_lang';
+  let currentLang = localStorage.getItem(LANG_KEY) || 'zh';
+
+  const I18N = {
+    zh: {
+      app_title: '旅行规划助手',
+      login_subtitle: '请登录以继续',
+      tab_password: '密码登录',
+      tab_phone: '手机号登录',
+      username_ph: '用户名',
+      password_ph: '密码',
+      login_btn: '登录',
+      login_error: '用户名或密码错误',
+      phone_input_ph: '请输入手机号',
+      code_ph: '验证码',
+      get_code: '获取验证码',
+      resend: '重新获取',
+      phone_password_ph: '设置密码（可选，设置后可密码登录）',
+      agree_prefix: '我已阅读并同意',
+      phone_login_btn: '登录 / 注册',
+      phone_error_default: '操作失败',
+      bind_phone_title: '绑定手机号解锁额度',
+      bind_phone_trial_tip: '您当前为 GitHub 试用账号，可免费提问 20 次。绑定手机号后即可解锁完整功能。',
+      bind_phone_exhausted_tip: '您的免费提问次数（20 次）已用完，请绑定手机号后继续使用。',
+      bind_phone_btn: '绑定手机号',
+      skip_bind: '暂不绑定',
+      bind_phone_success: '✅ 绑定成功，已解锁完整功能',
+      quota_exhausted: '免费提问次数已用完，请绑定手机号后继续使用',
+      quota_badge: '剩余 {n} 次提问',
+      bind_phone_occupied: '该手机号已被其他账号绑定',
+      bind_phone_send_code: '获取验证码',
+      or_third_party: '或使用第三方账号登录',
+      github_login: '使用 GitHub 登录',
+      sidebar_title_1: '旅行规划',
+      sidebar_title_2: '助手',
+      new_chat: '＋ 开启新对话',
+      history_label: '历史对话',
+      theme_label: '更换主题',
+      theme_classic: '经典绿',
+      theme_glass: '玻璃紫',
+      theme_dark: '暗夜蓝',
+      sessions_saved_local: '会话保存在本地',
+      settings: '设置',
+      clear_history: '清空历史',
+      balance: '余额',
+      map: '地图',
+      me_mode: '求职',
+      logout: '退出',
+      input_ph: '输入你的旅行问题…',
+      input_ph_me: '输入你的求职问题…',
+      welcome: '你好！我是你的旅行规划助手，有什么可以帮你的？',
+      welcome_me: '你好！我是你的求职助理，有什么可以帮你的？',
+      upload_title: '上传文件（PDF/图片/Word/TXT）·仅本地解析，不会上传云端',
+      settings_title: '设置',
+      language: '语言 / Language',
+      change_password: '修改密码',
+      current_password: '当前密码',
+      new_password: '新密码（至少6位）',
+      confirm_password: '确认新密码',
+      save_password: '保存新密码',
+      account: '账号',
+      pwd_changed: '✅ 密码修改成功',
+      pwd_mismatch: '两次输入的新密码不一致',
+      pwd_old_wrong: '旧密码不正确',
+      pwd_too_short: '新密码至少6位',
+      pwd_loading: '保存中...',
+      wallet_recharge: '账户充值',
+      recharge_rules_title: '模拟充值说明',
+      recharge_amount: '选择充值金额',
+      recharge_method: '选择支付方式',
+      cancel: '取消',
+      go_recharge: '去充值',
+      close_pay: '关闭 · 完成支付',
+      done: '完成',
+      back: '← 返回',
+      recharge_success: '充值成功',
+      transactions: '交易流水',
+      tx_all: '全部',
+      tx_recharge: '充值',
+      tx_consume: '消费',
+      loading: '加载中...',
+      tx_empty: '暂无交易记录',
+      prev_page: '← 上一页',
+      next_page: '下一页 →',
+      default_pwd_hint: '您的账号为手机号，默认密码为 123456789，可在左下角「设置」中修改密码',
+      // ---- 支付弹窗 ----
+      rule_1: '本系统为 <span class="highlight">完全模拟支付环境</span>，仅作演示用途',
+      rule_2: '所有金额单位为 <strong>人民币（元）</strong>，仅数字为模拟数据',
+      rule_3: '点击充值后生成 <span class="highlight">模拟二维码</span>，扫码无效',
+      rule_4: '关闭二维码后自动 <span class="highlight">充值成功</span>，金额即时到账',
+      rule_5: '充值记录可在 <span class="highlight">交易流水</span> 中查看',
+      rule_6: '本系统不涉及真实资金交易',
+      demo_note: '<strong>核心提示：</strong>点击「去充值」后生成的二维码 <strong>仅做演示用</strong>，不可用于真实支付。关闭二维码即视为支付完成。',
+      channel_alipay: '支付宝',
+      channel_wxpay: '微信支付',
+      channel_balance: '余额支付',
+      qr_code_text: '模拟二维码',
+      qr_tip: '仅做演示用，关闭即视为支付成功',
+      qr_close_hint: '点击下方「关闭」按钮完成支付',
+      order_no_label: '订单编号',
+      recharge_amount_label: '充值金额',
+      payment_method_label: '支付方式',
+      channel_no_label: '渠道流水号',
+      pay_time_label: '支付时间',
+      current_balance_label: '当前余额',
+      yuan: '元',
+      order_no_prefix: '订单号：',
+      processing: '处理中...',
+      recharge_failed: '充值失败: ',
+      pay_failed: '支付确认失败: ',
+      create_order_failed: '创建订单失败',
+      // ---- 流水类型 ----
+      tx_refund: '退款',
+      tx_fee: '手续费',
+      tx_transfer: '转账',
+      tx_load_failed: '获取失败',
+      // ---- 通用消息 ----
+      keep_one_session: '至少保留一个会话',
+      delete_this_conversation: '删除这个对话？',
+      delete_this_qa: '确定删除本次问答？',
+      file_too_large: '文件过大，最大支持 20MB',
+      unsupported_file_type: '不支持的文件类型',
+      upload_failed: '上传失败: ',
+      login_expired: '登录已过期，请重新登录',
+      no_stream_response: '后端未返回可流式读取的响应',
+      clear_all_history_confirm: '确定要清空所有历史对话吗？此操作不可恢复。',
+      please_login: '请先登录',
+      login_failed_2: '登录失败: ',
+      // ---- 求职欢迎卡片 ----
+      me_welcome_title: '你好，我是黎忠南',
+      me_welcome_subtitle: 'AI 应用开发 / 23岁 / 广州-深圳',
+      me_label_intent: '求职意向',
+      me_value_intent: 'AI应用开发',
+      me_label_edu: '教育',
+      me_value_edu: '广西科技大学 本科',
+      me_label_project: '核心项目',
+      me_value_project: '自研 Multi-Agent 网关',
+      me_label_speed: '学习速度',
+      me_value_speed: '3个月从零到上线公网',
+      me_contact: '电话 13357308241 / 微信 CXKSBLi / QQ 1270345165@qq.com',
+      me_hint: '你可以问我任何关于我的问题 -- 技术、项目、求职、学习经历都可以',
+      me_preset_1: '介绍一下你自己',
+      me_preset_2: '技术栈',
+      me_preset_3: '为什么转行AI',
+      me_preset_4: '项目是一个人做的？',
+      me_preset_5: '期望薪资',
+      me_preset_6: '学习能力',
+      me_preset_7: '你会哪些技术',
+      // ---- 聊天动态文本 ----
+      thinking: '思考中，请稍候...',
+      send_file_query: '请分析这个文件',
+      send_file_display: '📎 请分析这个文件',
+      stream_interrupted: '❌ 连接被中断，已使用离线兜底回复，请稍后重试。',
+      load_failed: '加载失败: ',
+      no_history: '暂无历史对话',
+      empty_login: '👋 请登录后使用',
+      // ---- 登录相关 ----
+      enter_username_pwd: '请输入用户名和密码',
+      enter_valid_phone: '请输入有效手机号',
+      fill_phone_code: '请填写手机号和验证码',
+      agree_required: '请阅读并同意用户协议',
+      code_sent: '✅ 验证码已发送，请查收短信',
+      send_failed_2: '发送失败',
+      analyze_file: '请分析这个文件',
+      // ---- 扩展（求职模式/工具/通用）----
+      travel_mode: '旅行',
+      me_history: '求职对话',
+      stream_interrupted_2: '❌ 后端响应异常或浏览器扩展干扰，已使用兜底回复，请稍后重试。',
+      tool_weather: '查询天气',
+      tool_hotel: '查找酒店',
+      tool_route: '规划路线',
+      tool_food: '推荐美食',
+      tool_fetch_weather: '获取天气',
+      tool_sub_agent: '调用助手',
+      tool_web_search: '联网搜索',
+      tool_knowledge_search: '法律知识库',
+      tool_project_search: '项目知识库',
+      tool_call_id: '工具调用',
+      location_confirm: '📍 为了让 AI 更准确地规划旅行路线、查询天气等，是否允许浏览器获取你的位置信息？\n\n点击「确定」后，浏览器将弹出定位授权请求。',
+      new_chat_title: '新对话',
+      rename: '重命名',
+      rename_prompt: '输入新名称:',
+      delete_btn: '删除',
+      think_process: '思考过程',
+      copy_content: '复制内容',
+      delete_qa: '删除本次问答',
+      file_local_only: '📖 文件仅用于本地解析，不会上传至外部云端',
+      recognizing: '识别中…',
+      chars: '字',
+      followup_weather: ['明天天气怎么样？', '需要带伞吗？', '适合户外活动吗？'],
+      followup_food: ['附近还有哪些好吃的？', '有什么特色菜？', '人均消费多少？'],
+      followup_hotel: ['还有其他推荐吗？', '交通方便吗？', '价格区间是多少？'],
+      followup_scenic: ['门票多少钱？', '开放时间是什么？', '需要提前预约吗？'],
+      followup_route: ['大概需要多久？', '打车方便吗？', '有更快的路线吗？'],
+      followup_default: ['推荐一下当地美食', '住宿有什么推荐？', '天气怎么样？'],
+      no_reply: '（未收到回复，请稍后重试）',
+      calling_tool: '调用：',
+      result_prefix: '结果：',
+      query_done: '查询完成',
+      found_restaurants: '找到 {n} 家餐厅',
+      found_hotels: '找到 {n} 家酒店',
+      route_done: '路线规划完成',
+      request_failed: '❌ 请求失败，请稍后重试。',
+      operation_failed: '操作失败',
+      qr_demo_text: '演示',
+      qr_no_scan: '不可扫码',
+      login_error_2: '用户名或密码错误',
+      send: '发送',
+      cancel_stream: '取消',
+      regenerate: '重新生成',
+      rate_answer: '评分',
+      rate_thanks: '感谢你的评价！',
+      rate_choose: '为这次回答评分（1-5 星）',
+    },
+    en: {
+      app_title: 'Travel Planner',
+      login_subtitle: 'Please log in to continue',
+      tab_password: 'Password',
+      tab_phone: 'Phone',
+      username_ph: 'Username',
+      password_ph: 'Password',
+      login_btn: 'Log In',
+      login_error: 'Invalid username or password',
+      phone_input_ph: 'Enter phone number',
+      code_ph: 'Code',
+      get_code: 'Get Code',
+      resend: 'Resend',
+      phone_password_ph: 'Set password (optional)',
+      agree_prefix: 'I have read and agree to the',
+      phone_login_btn: 'Log In / Register',
+      phone_error_default: 'Operation failed',
+      bind_phone_title: 'Bind phone to unlock quota',
+      bind_phone_trial_tip: 'You are on a GitHub trial account with 20 free questions. Bind your phone number to unlock full features.',
+      bind_phone_exhausted_tip: 'Your free questions (20) are used up. Please bind your phone number to continue.',
+      bind_phone_btn: 'Bind phone',
+      skip_bind: 'Not now',
+      bind_phone_success: '✅ Bound successfully, full access unlocked',
+      quota_exhausted: 'Free questions used up, please bind your phone to continue',
+      quota_badge: '{n} questions left',
+      bind_phone_occupied: 'This phone number is already bound to another account',
+      bind_phone_send_code: 'Get code',
+      or_third_party: 'or log in with',
+      github_login: 'Log in with GitHub',
+      sidebar_title_1: 'Travel',
+      sidebar_title_2: 'Planner',
+      new_chat: '＋ New Chat',
+      history_label: 'History',
+      theme_label: 'Theme',
+      theme_classic: 'Classic',
+      theme_glass: 'Glass',
+      theme_dark: 'Dark',
+      sessions_saved_local: 'Sessions saved locally',
+      settings: 'Settings',
+      clear_history: 'Clear History',
+      balance: 'Balance',
+      map: 'Map',
+      me_mode: 'Career',
+      logout: 'Log Out',
+      input_ph: 'Ask about your trip…',
+      input_ph_me: 'Ask about your job search…',
+      welcome: 'Hi! I am your travel planning assistant. How can I help?',
+      welcome_me: 'Hi! I am your job search assistant. How can I help?',
+      upload_title: 'Upload file (PDF/Image/Word/TXT) · parsed locally only',
+      settings_title: 'Settings',
+      language: 'Language',
+      change_password: 'Change Password',
+      current_password: 'Current password',
+      new_password: 'New password (min 6 chars)',
+      confirm_password: 'Confirm new password',
+      save_password: 'Save New Password',
+      account: 'Account',
+      pwd_changed: '✅ Password changed successfully',
+      pwd_mismatch: 'New passwords do not match',
+      pwd_old_wrong: 'Current password is incorrect',
+      pwd_too_short: 'New password must be at least 6 characters',
+      pwd_loading: 'Saving...',
+      wallet_recharge: 'Recharge',
+      recharge_rules_title: 'Simulated Recharge',
+      recharge_amount: 'Select amount',
+      recharge_method: 'Select payment method',
+      cancel: 'Cancel',
+      go_recharge: 'Recharge',
+      close_pay: 'Close · Complete Payment',
+      done: 'Done',
+      back: '← Back',
+      recharge_success: 'Recharge Successful',
+      transactions: 'Transactions',
+      tx_all: 'All',
+      tx_recharge: 'Recharge',
+      tx_consume: 'Spend',
+      loading: 'Loading...',
+      tx_empty: 'No transactions yet',
+      prev_page: '← Prev',
+      next_page: 'Next →',
+      default_pwd_hint: 'Your account is your phone number. Default password is 123456789. You can change it in Settings (bottom-left).',
+      // ---- Payment modal ----
+      rule_1: 'This is a <span class="highlight">fully simulated payment environment</span>, for demo purposes only',
+      rule_2: 'All amounts are in <strong>CNY (RMB)</strong>; numbers are simulated data',
+      rule_3: 'Clicking recharge generates a <span class="highlight">simulated QR code</span>; scanning it does nothing',
+      rule_4: 'Closing the QR code marks the <span class="highlight">recharge as successful</span>, credited instantly',
+      rule_5: 'Recharge records can be viewed in <span class="highlight">Transactions</span>',
+      rule_6: 'This system does not involve real money transactions',
+      demo_note: '<strong>Important:</strong> The QR code generated after clicking "Recharge" is <strong>for display only</strong> and cannot be used for real payment. Closing the QR code counts as payment complete.',
+      channel_alipay: 'Alipay',
+      channel_wxpay: 'WeChat Pay',
+      channel_balance: 'Balance',
+      qr_code_text: 'Simulated QR',
+      qr_tip: 'Display only; closing it counts as payment success',
+      qr_close_hint: 'Click the "Close" button below to complete payment',
+      order_no_label: 'Order No.',
+      recharge_amount_label: 'Amount',
+      payment_method_label: 'Payment Method',
+      channel_no_label: 'Channel Ref No.',
+      pay_time_label: 'Paid At',
+      current_balance_label: 'Current Balance',
+      yuan: 'CNY',
+      order_no_prefix: 'Order: ',
+      processing: 'Processing...',
+      recharge_failed: 'Recharge failed: ',
+      pay_failed: 'Payment failed: ',
+      create_order_failed: 'Failed to create order',
+      // ---- Transaction types ----
+      tx_refund: 'Refund',
+      tx_fee: 'Fee',
+      tx_transfer: 'Transfer',
+      tx_load_failed: 'Failed to load',
+      // ---- Common messages ----
+      keep_one_session: 'At least one conversation must be kept',
+      delete_this_conversation: 'Delete this conversation?',
+      delete_this_qa: 'Delete this Q&A?',
+      file_too_large: 'File too large, max 20MB',
+      unsupported_file_type: 'Unsupported file type',
+      upload_failed: 'Upload failed: ',
+      login_expired: 'Session expired, please log in again',
+      no_stream_response: 'No streamable response from server',
+      clear_all_history_confirm: 'Clear all conversation history? This cannot be undone.',
+      please_login: 'Please log in first',
+      login_failed_2: 'Login failed: ',
+      // ---- Career welcome card ----
+      me_welcome_title: 'Hi, I am Li Zhongnan',
+      me_welcome_subtitle: 'AI Application Developer / 23 / Guangzhou-Shenzhen',
+      me_label_intent: 'Target Role',
+      me_value_intent: 'AI Application Developer',
+      me_label_edu: 'Education',
+      me_value_edu: 'Guangxi University of Science and Technology, B.S.',
+      me_label_project: 'Core Project',
+      me_value_project: 'Self-built Multi-Agent Gateway',
+      me_label_speed: 'Learning Speed',
+      me_value_speed: 'From zero to public launch in 3 months',
+      me_contact: 'Tel 13357308241 / WeChat CXKSBLi / QQ 1270345165@qq.com',
+      me_hint: 'Ask me anything about myself -- tech, projects, job search, learning journey',
+      me_preset_1: 'Introduce yourself',
+      me_preset_2: 'Tech stack',
+      me_preset_3: 'Why switch to AI',
+      me_preset_4: 'Did you build the gateway alone?',
+      me_preset_5: 'Expected salary',
+      me_preset_6: 'Learning ability',
+      me_preset_7: 'Which technologies do you know',
+      // ---- Chat dynamic text ----
+      thinking: 'Thinking, please wait...',
+      send_file_query: 'Please analyze this file',
+      send_file_display: '📎 Please analyze this file',
+      stream_interrupted: '❌ Connection interrupted, using offline fallback reply. Please try again later.',
+      load_failed: 'Failed to load: ',
+      no_history: 'No conversations yet',
+      empty_login: '👋 Please log in to use',
+      // ---- Login related ----
+      enter_username_pwd: 'Please enter username and password',
+      enter_valid_phone: 'Please enter a valid phone number',
+      fill_phone_code: 'Please enter phone number and code',
+      agree_required: 'Please read and agree to the User Agreement',
+      code_sent: '✅ Code sent, please check your SMS',
+      send_failed_2: 'Failed to send',
+      analyze_file: 'Please analyze this file',
+      // ---- Extended (career mode / tools / general) ----
+      travel_mode: 'Travel',
+      me_history: 'Career History',
+      stream_interrupted_2: '❌ Backend responded abnormally or a browser extension interfered. Using offline fallback reply. Please try again later.',
+      tool_weather: 'Check weather',
+      tool_hotel: 'Find hotels',
+      tool_route: 'Plan route',
+      tool_food: 'Find food',
+      tool_fetch_weather: 'Get weather',
+      tool_sub_agent: 'Call sub-agent',
+      tool_web_search: 'Web search',
+      tool_knowledge_search: 'Legal knowledge',
+      tool_project_search: 'Project knowledge',
+      tool_call_id: 'Tool call',
+      location_confirm: '📍 To help AI plan your trip more accurately (weather, routes, etc.), allow browser to access your location?\n\nClick "OK" and the browser will show the location permission request.',
+      new_chat_title: 'New Chat',
+      rename: 'Rename',
+      rename_prompt: 'Enter new name:',
+      delete_btn: 'Delete',
+      think_process: 'Thinking Process',
+      copy_content: 'Copy content',
+      delete_qa: 'Delete this Q&A',
+      file_local_only: '📖 File is parsed locally only and never uploaded to external clouds',
+      recognizing: 'Recognizing…',
+      chars: 'chars',
+      followup_weather: ['What about tomorrow?', 'Do I need an umbrella?', 'Good for outdoor activities?'],
+      followup_food: ['Any more good places nearby?', 'Any signature dishes?', 'Average cost per person?'],
+      followup_hotel: ['Any other recommendations?', 'Is transportation convenient?', 'What is the price range?'],
+      followup_scenic: ['How much is the ticket?', 'What are the opening hours?', 'Do I need to book in advance?'],
+      followup_route: ['How long does it take?', 'Is taxi convenient?', 'Is there a faster route?'],
+      followup_default: ['Recommend local food', 'Any accommodation suggestions?', 'What about the weather?'],
+      no_reply: '(No reply received, please try again later)',
+      calling_tool: 'Calling: ',
+      result_prefix: 'Result: ',
+      query_done: 'Query complete',
+      found_restaurants: 'Found {n} restaurants',
+      found_hotels: 'Found {n} hotels',
+      route_done: 'Route planned',
+      request_failed: '❌ Request failed, please try again later.',
+      operation_failed: 'Operation failed',
+      qr_demo_text: 'Demo',
+      qr_no_scan: 'No scanning',
+      login_error_2: 'Invalid username or password',
+      send: 'Send',
+      cancel_stream: 'Stop',
+      regenerate: 'Regenerate',
+      rate_answer: 'Rate',
+      rate_thanks: 'Thank you for your feedback!',
+      rate_choose: 'Rate this answer (1-5 stars)',
+    }
+  };
+
+  function t(key) {
+    const dict = I18N[currentLang] || I18N.zh;
+    return dict[key] || I18N.zh[key] || key;
+  }
+
+  // 应用语言到所有 data-i18n / data-i18n-ph 元素
+  function applyLang(lang) {
+    currentLang = lang;
+    localStorage.setItem(LANG_KEY, lang);
+    document.documentElement.lang = lang === 'en' ? 'en' : 'zh-CN';
+    document.querySelectorAll('[data-i18n]').forEach(function(el) {
+      const key = el.getAttribute('data-i18n');
+      if (key && t(key)) el.textContent = t(key);
+    });
+    document.querySelectorAll('[data-i18n-html]').forEach(function(el) {
+      const key = el.getAttribute('data-i18n-html');
+      if (key && t(key)) el.innerHTML = t(key);
+    });
+    document.querySelectorAll('[data-i18n-ph]').forEach(function(el) {
+      const key = el.getAttribute('data-i18n-ph');
+      if (key && t(key)) el.placeholder = t(key);
+    });
+    document.querySelectorAll('[data-i18n-title]').forEach(function(el) {
+      const key = el.getAttribute('data-i18n-title');
+      if (key && t(key)) el.setAttribute('title', t(key));
+    });
+    // 标题
+    document.title = t('app_title');
+    // 主题按钮（PC 和移动端）
+    document.querySelectorAll('.theme-btn-pc').forEach(function(b) {
+      const th = b.getAttribute('data-theme');
+      b.textContent = t('theme_' + th);
+    });
+    document.querySelectorAll('.theme-btn-mb').forEach(function(b) {
+      const th = b.getAttribute('data-theme');
+      b.textContent = t('theme_' + th);
+    });
+    // 语言按钮高亮
+    const zhBtn = document.getElementById('langZhBtn');
+    const enBtn = document.getElementById('langEnBtn');
+    if (zhBtn && enBtn) {
+      const activeStyle = 'border-color:var(--primary);background:var(--primary);color:#fff;';
+      const idleStyle = 'border-color:var(--border-color);background:var(--bg-body);color:var(--text-secondary);';
+      zhBtn.setAttribute('style', lang === 'zh' ? activeStyle : idleStyle);
+      enBtn.setAttribute('style', lang === 'en' ? activeStyle : idleStyle);
+    }
+    // 动态 UI 重新渲染（模式徽标、历史标签、欢迎卡片等）
+    try { if (typeof updateModeUI === 'function') updateModeUI(); } catch (e) {}
+    try { if (typeof renderMessages === 'function') renderMessages(); } catch (e) {}
+    try { if (typeof renderHistory === 'function') renderHistory(); } catch (e) {}
+    try { if (typeof renderMobileHistory === 'function') renderMobileHistory(); } catch (e) {}
+    // 钱包/支付弹窗内动态文本
+    try { if (typeof refreshWallet === 'function') refreshWallet(); } catch (e) {}
+  }
+
+  // ---------- 设置弹窗 ----------
+  function openSettings() {
+    const username = localStorage.getItem('travel_username') || '';
+    document.getElementById('settingsUsername').textContent = username || '—';
+    document.getElementById('settingsOverlay').classList.add('show');
+    document.getElementById('pwdMsg').style.display = 'none';
+    document.getElementById('pwdOldInput').value = '';
+    document.getElementById('pwdNewInput').value = '';
+    document.getElementById('pwdConfirmInput').value = '';
+  }
+  function closeSettings() {
+    document.getElementById('settingsOverlay').classList.remove('show');
+  }
+
+  async function savePassword() {
+    const oldPwd = document.getElementById('pwdOldInput').value;
+    const newPwd = document.getElementById('pwdNewInput').value;
+    const confirmPwd = document.getElementById('pwdConfirmInput').value;
+    const msg = document.getElementById('pwdMsg');
+    function showMsg(text, color) {
+      msg.textContent = text;
+      msg.style.color = color || '#ef4444';
+      msg.style.display = 'block';
+    }
+    if (!oldPwd || !newPwd || !confirmPwd) { showMsg(t('current_password') + ' / ' + t('new_password')); return; }
+    if (newPwd !== confirmPwd) { showMsg(t('pwd_mismatch')); return; }
+    if (newPwd.length < 6) { showMsg(t('pwd_too_short')); return; }
+    const btn = document.getElementById('pwdSaveBtn');
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = t('pwd_loading');
+    try {
+      const resp = await apiFetch('/api/user/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ old_password: oldPwd, new_password: newPwd })
+      });
+      const data = await resp.json().catch(function() { return {}; });
+      if (!resp.ok) {
+        const detail = data.detail;
+        showMsg(detail === '旧密码不正确' ? t('pwd_old_wrong') : (detail || t('pwd_old_wrong')));
+        return;
+      }
+      showMsg(t('pwd_changed'), 'var(--primary)');
+    } catch (e) {
+      showMsg(e.message || t('pwd_old_wrong'));
+    } finally {
+      btn.disabled = false;
+      btn.textContent = orig;
+    }
+  }
+
+  // ---------- DOM 元素 ----------
+  const loginContainer = document.getElementById('login-container');
+  const appContainer = document.getElementById('appContainer');
+  const loginBtn = document.getElementById('loginBtn');
+  const loginError = document.getElementById('loginError');
+  const loginUsername = document.getElementById('loginUsername');
+  const loginPassword = document.getElementById('loginPassword');
+  const logoutBtn = document.getElementById('logoutBtn');
+
+  const messagesEl = document.getElementById('messages');
+  const inputEl = document.getElementById('input');
+  const sendBtn = document.getElementById('sendBtn');
+  const historyList = document.getElementById('historyList');
+  const newChatBtn = document.getElementById('newChatBtn');
+
+  const mobileMenuBtn = document.getElementById('mobileMenuBtn');
+  const mobileOverlay = document.getElementById('mobileOverlay');
+  const mobileCloseBtn = document.getElementById('mobileCloseBtn');
+  const mobileNewBtn = document.getElementById('mobileNewBtn');
+  const mobileHistoryList = document.getElementById('mobileHistoryList');
+  const modeToggleBtn = document.getElementById('modeToggleBtn');
+  const modeBadge = document.getElementById('modeBadge');
+
+  // 模式管理
+  let currentMode = localStorage.getItem('travel_current_mode') || 'travel';
+
+  const API_URL_TRAVEL = '/v2/chat/stream';
+  const API_URL_ME = '/v2/chat/stream';
+  const LOGIN_URL = '/api/login';
+  const STORAGE_KEY_TRAVEL = 'travel_chat_sessions';
+  const STORAGE_KEY_ME = 'me_chat_sessions';
+  const TOKEN_KEY = 'travel_token';
+  const REFRESH_KEY = 'travel_refresh_token';
+
+  function getApiUrl() { return currentMode === 'me' ? API_URL_ME : API_URL_TRAVEL; }
+  function getStorageKey() { return currentMode === 'me' ? STORAGE_KEY_ME : STORAGE_KEY_TRAVEL; }
+  function getLastSessionKey() { return currentMode === 'me' ? 'me_last_session' : 'travel_last_session'; }
+
+  // ---------- Token 自动续期 ----------
+  let refreshPromise = null;
+  function refreshToken() {
+    if (refreshPromise) return refreshPromise;
+    refreshPromise = (async () => {
+      const refreshToken = localStorage.getItem(REFRESH_KEY);
+      if (!refreshToken) return null;
+      try {
+        const resp = await fetch('/api/refresh', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + refreshToken }
+        });
+        if (!resp.ok) {
+          localStorage.removeItem(TOKEN_KEY);
+          localStorage.removeItem(REFRESH_KEY);
+          return null;
+        }
+        const data = await resp.json();
+        localStorage.setItem(TOKEN_KEY, data.access_token);
+        if (data.refresh_token) localStorage.setItem(REFRESH_KEY, data.refresh_token);
+        return data.access_token;
+      } catch (e) {
+        return null;
+      } finally {
+        refreshPromise = null;
+      }
+    })();
+    return refreshPromise;
+  }
+
+  // 统一请求入口：自动携带 token，遇 401 自动续期后重试一次
+  async function apiFetch(url, options) {
+    options = options || {};
+    const headers = new Headers(options.headers || {});
+    if (!headers.has('Authorization')) {
+      const token = localStorage.getItem(TOKEN_KEY);
+      if (token) headers.set('Authorization', 'Bearer ' + token);
+    }
+    options.headers = headers;
+    let resp = await fetch(url, options);
+    if (resp.status === 401) {
+      const newToken = await refreshToken();
+      if (newToken) {
+        headers.set('Authorization', 'Bearer ' + newToken);
+        resp = await fetch(url, options);
+      }
+    }
+    return resp;
+  }
+
+  function updateModeUI() {
+    const isMe = currentMode === 'me';
+    // 徽标
+    modeBadge.classList.toggle('show', isMe);
+    modeBadge.textContent = t('me_mode');
+    // 按钮
+    modeToggleBtn.textContent = isMe ? t('travel_mode') : t('me_mode');
+    modeToggleBtn.style.background = isMe ? 'var(--bg-body)' : '#2563eb';
+    modeToggleBtn.style.color = isMe ? 'var(--text-secondary)' : '#fff';
+    modeToggleBtn.style.borderColor = isMe ? 'var(--border-color)' : '#2563eb';
+    // chat-area 模式类
+    document.querySelector('.chat-area').classList.toggle('me-mode', isMe);
+    // 侧边栏标题
+    document.querySelector('.sidebar-title').innerHTML = isMe ? '<span>' + t('sidebar_title_1') + '</span><span>' + t('sidebar_title_2') + '</span>' : '<span>' + t('sidebar_title_1') + '</span><span>' + t('sidebar_title_2') + '</span>';
+    // 新对话按钮文字
+    document.getElementById('newChatBtn').innerHTML = isMe ? '+ ' + t('new_chat').replace('＋ ', '') : t('new_chat');
+    // 历史标签
+    document.querySelector('.history-label').textContent = isMe ? t('me_history') : t('history_label');
+    // 手机面板标题
+    const panelTitle = document.getElementById('mobilePanelTitle');
+    if (panelTitle) panelTitle.textContent = isMe ? '黎忠南 - ' + t('history_label') : t('history_label');
+    // 输入框占位符
+    inputEl.placeholder = isMe ? t('input_ph_me') : t('input_ph');
+    // 切换时清空并重新加载会话
+    loadSessions();
+    localStorage.setItem('travel_current_mode', currentMode);
+  }
+
+  function toggleMode() {
+    if (isStreaming) return;
+    currentMode = currentMode === 'me' ? 'travel' : 'me';
+    // 切换模式时创建新会话（避免历史混淆）
+    createNewSession();
+    updateModeUI();
+    inputEl.focus();
+  }
+
+  let sessions = [];
+  let currentSessionId = null;
+  let isStreaming = false;
+  let activeAbortController = null;   // 当前流式请求的取消控制器
+
+  // 全局未捕获 Promise 拒绝与错误处理，避免第三方扩展或环境异常导致未处理异常
+  window.addEventListener('unhandledrejection', function(evt) {
+    try {
+      const err = evt.reason;
+      console.warn('Unhandled rejection caught:', err);
+      // 如果正在流式中断，给用户友好提示并重置状态
+      if (isStreaming) {
+        const session = getCurrentSession();
+        const msg = session && session.messages && session.messages[session.messages.length - 1];
+        if (msg) {
+          msg.text = t('stream_interrupted');
+          renderMessages();
+        }
+        isStreaming = false;
+        sendBtn.disabled = false;
+        saveSessions();
+      }
+      // 防止控制台继续抛出
+      evt.preventDefault && evt.preventDefault();
+    } catch (e) {
+      console.error('处理 unhandledrejection 失败', e);
+    }
+  });
+
+  window.addEventListener('error', function(evt) {
+    try {
+      console.warn('Global error caught:', evt.message || evt.error);
+      // 特殊处理 message channel 关闭类错误，避免页面卡死
+      if ((evt.message || '').includes('A listener indicated an asynchronous response')) {
+        const session = getCurrentSession();
+        const msg = session && session.messages && session.messages[session.messages.length - 1];
+        if (msg && isStreaming) {
+          msg.text = t('stream_interrupted_2');
+          renderMessages();
+          isStreaming = false;
+          sendBtn.disabled = false;
+          saveSessions();
+        }
+        evt.preventDefault && evt.preventDefault();
+      }
+    } catch (e) {
+      console.error('处理 global error 失败', e);
+    }
+  });
+
+  // ---------- 工具函数 ----------
+  function cleanReasoning(text) {
+    if (!text) return '';
+    // 兜底过滤：系统提示词/内部指令/负面信号（后端已过滤，此处双保险）
+    const leakPats = [
+      /system prompt/i, /system_prompt/i, /systemPrompt/,
+      /我的系统提示词/, /系统提示词要求/, /按照系统提示词/, /根据我的系统提示词/,
+      /my system prompt/i, /according to my system/i,
+      /the instruction says/i, /instructions say/i, /per my instructions/i,
+      /as instructed/i, /output language requirement/i, /always respond in/i,
+      /do not output chinese/i, /输出语言要求/, /请始终使用/, /不要输出英文/, /不要输出中文/,
+      /系统设定/, /系统限制/, /系统配置/, /根据人设/, /按人设/, /角色设定/, /人设要求/,
+      /工具调用失败/, /调用失败/, /工具执行失败/, /工具超时/, /工具报错/,
+      /tool call failed/i, /tool execution failed/i, /tool timeout/i,
+      /重试失败/, /重试仍失败/, /请求失败/, /请求超时/,
+      /response_format/, /json_object/, /llm_semaphore/,
+      /## 核心原则/, /## 可用工具/, /## 默认值/, /防幻觉/, /最小工具调用/,
+      /【输出格式】/, /只输出JSON/,
+    ];
+    let filtered = text.split('\n').filter(function(line) {
+      const s = line.trim();
+      if (!s) return true;
+      return !leakPats.some(function(re) { return re.test(s); });
+    }).join('\n');
+    // 替换内部代码名为可读描述（跟随界面语言）
+    return filtered
+      .replace(/query_weather/g, t('tool_weather'))
+      .replace(/query_hotel/g, t('tool_hotel'))
+      .replace(/query_route/g, t('tool_route'))
+      .replace(/query_food/g, t('tool_food'))
+      .replace(/fetch_weather_async/g, t('tool_fetch_weather'))
+      .replace(/call_sub_agent/g, t('tool_sub_agent'))
+      .replace(/web_search/g, t('tool_web_search'))
+      .replace(/search_knowledge/g, t('tool_knowledge_search'))
+      .replace(/search_project_knowledge/g, t('tool_project_search'))
+      .replace(/tool_call_id/g, t('tool_call_id'))
+      .replace(/"departure"\s*:\s*"[^"]*"/g, '')
+      .replace(/"destination"\s*:\s*"[^"]*"/g, '')
+      .replace(/"preference"\s*:\s*"[^"]*"/g, '')
+      .replace(/"cuisine"\s*:\s*"[^"]*"/g, '')
+      .replace(/"location"\s*:\s*"[^"]*"/g, '')
+      .replace(/{[^}]*"success"[^}]*}/g, '')
+      // 压缩多余空行
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function updateMessageText(msg) {
+    const lastAssistantDiv = messagesEl.querySelector('.message.assistant:last-child');
+    if (!lastAssistantDiv) return;
+    // 找到文本容器（排除思考区块和按钮）
+    let textDiv = lastAssistantDiv.querySelector('.answer-box');
+    if (!textDiv) {
+        renderMessages();
+        return;
+    }
+    textDiv.innerHTML = marked.parse(msg.text || '');
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+  // ---------- 界面切换 ----------
+  function showLogin() {
+    loginContainer.style.display = 'flex';
+    appContainer.classList.remove('show');
+    loginError.style.display = 'none';
+  }
+
+  function showApp() {
+    loginContainer.style.display = 'none';
+    appContainer.classList.add('show');
+    // 登录成功后请求位置权限，供地图页面使用
+    requestUserLocationForChat();
+  }
+
+  function requestUserLocationForChat() {
+    if (!navigator.geolocation) return;
+    // 清理历史"局域网"垃圾定位（私有IP定位旧值），视为未定位
+    if (localStorage.getItem('user_city') === '局域网') {
+      try { localStorage.removeItem('user_city'); localStorage.removeItem('user_city_ts'); } catch (e) {}
+    }
+    // 如果已有缓存且在有效期内（1小时），不重复请求
+    if (localStorage.getItem('user_city') && localStorage.getItem('user_city_ts')) {
+      const ts = parseInt(localStorage.getItem('user_city_ts'));
+      if (Date.now() - ts < 3600000) return;
+    }
+    // 首次进入时请求授权，失败后不反复弹窗
+    if (localStorage.getItem('user_city_prompt_shown')) return;
+    localStorage.setItem('user_city_prompt_shown', '1');
+
+    if (!confirm(t('location_confirm'))) {
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(async function(pos) {
+      try {
+        const resp = await fetch('/api/map/regeo?lat=' + pos.coords.latitude + '&lng=' + pos.coords.longitude);
+        if (resp.ok) {
+          const data = await resp.json();
+          if (data.city) {
+            localStorage.setItem('user_city', data.city);
+            localStorage.setItem('user_city_ts', Date.now().toString());
+          }
+        }
+      } catch(e) {
+        console.warn('定位转城市失败:', e);
+      }
+    }, function(err) {
+      console.warn('浏览器定位未授权或失败:', err);
+    }, { timeout: 8000, enableHighAccuracy: false });
+  }
+
+  // ---------- 存储（按模式隔离）----------
+  function loadSessions() {
+    try {
+      const raw = localStorage.getItem(getStorageKey());
+      sessions = raw ? JSON.parse(raw) : [];
+    } catch { sessions = []; }
+    if (!sessions.length) createNewSession();
+    const lastId = localStorage.getItem(getLastSessionKey());
+    if (lastId && sessions.find(s => s.id === lastId)) currentSessionId = lastId;
+    else currentSessionId = sessions[0].id;
+    renderHistory();
+    renderMobileHistory();
+    renderMessages();
+  }
+
+  function saveSessions() {
+    localStorage.setItem(getStorageKey(), JSON.stringify(sessions));
+    if (currentSessionId) localStorage.setItem(getLastSessionKey(), currentSessionId);
+  }
+
+  function createNewSession() {
+    const s = {
+      id: 'sess_' + Date.now(),
+      title: t('new_chat_title'),
+      messages: [],
+      conversation_id: crypto.randomUUID ? crypto.randomUUID() : 'conv_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6)
+    };
+    sessions.unshift(s);
+    currentSessionId = s.id;
+    saveSessions();
+    renderHistory();
+    renderMobileHistory();
+    renderMessages();
+    mobileOverlay.classList.remove('show');
+    return s;
+  }
+
+  function getCurrentSession() {
+    return sessions.find(s => s.id === currentSessionId) || sessions[0];
+  }
+
+  function switchSession(id) {
+    if (id === currentSessionId) return;
+    currentSessionId = id;
+    saveSessions();
+    renderHistory();
+    renderMobileHistory();
+    renderMessages();
+    mobileOverlay.classList.remove('show');
+  }
+
+  function deleteSession(id) {
+    if (sessions.length <= 1) { alert(t('keep_one_session')); return; }
+    if (!confirm(t('delete_this_conversation'))) return;
+    sessions = sessions.filter(s => s.id !== id);
+    if (currentSessionId === id) currentSessionId = sessions[0].id;
+    saveSessions();
+    renderHistory();
+    renderMobileHistory();
+    renderMessages();
+  }
+
+  // ---------- 渲染 ----------
+  function renderHistory() {
+    historyList.innerHTML = '';
+    sessions.forEach(s => {
+      const item = document.createElement('div');
+      item.className = 'history-item' + (s.id === currentSessionId ? ' active' : '');
+      const title = s.title || s.messages?.[0]?.text?.slice(0, 30) || t('new_chat_title');
+
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'item-name';
+      nameSpan.textContent = title;
+      item.appendChild(nameSpan);
+
+      const renameBtn = document.createElement('button');
+      renameBtn.className = 'rename-btn';
+      renameBtn.textContent = '✏️';
+      renameBtn.title = t('rename');
+      renameBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const newName = prompt(t('rename_prompt'), title);
+        if (newName && newName.trim()) {
+          s.title = newName.trim();
+          saveSessions();
+          renderHistory();
+          renderMobileHistory();
+        }
+      });
+      item.appendChild(renameBtn);
+
+      const del = document.createElement('button');
+      del.className = 'delete-btn';
+      del.textContent = '✕';
+      del.title = t('delete_btn');
+      del.addEventListener('click', (e) => {
+        e.stopPropagation();
+        deleteSession(s.id);
+      });
+      item.appendChild(del);
+
+      item.addEventListener('click', (e) => {
+        if (e.target.tagName === 'BUTTON') return;
+        switchSession(s.id);
+      });
+      historyList.appendChild(item);
+    });
+  }
+
+  function renderMobileHistory() {
+    mobileHistoryList.innerHTML = '';
+    if (!sessions.length) {
+      mobileHistoryList.innerHTML = '<div class="panel-empty">' + t('no_history') + '</div>';
+      return;
+    }
+    sessions.forEach(s => {
+      const item = document.createElement('div');
+      item.className = 'panel-history-item' + (s.id === currentSessionId ? ' active' : '');
+      const title = s.title || s.messages?.[0]?.text?.slice(0, 30) || t('new_chat_title');
+      
+      const nameSpan = document.createElement('span');
+      nameSpan.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+      nameSpan.textContent = title;
+      item.appendChild(nameSpan);
+
+      const renameBtn = document.createElement('button');
+      renameBtn.textContent = '✏️';
+      renameBtn.style.cssText = 'background:none;border:none;cursor:pointer;padding:0 6px;font-size:15px;color:#888;';
+      renameBtn.title = t('rename');
+      renameBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const newName = prompt(t('rename_prompt'), title);
+        if (newName && newName.trim()) {
+          s.title = newName.trim();
+          saveSessions();
+          renderHistory();
+          renderMobileHistory();
+        }
+      });
+      item.appendChild(renameBtn);
+
+      const del = document.createElement('button');
+      del.textContent = '✕';
+      del.className = 'del-btn';
+      del.title = t('delete_btn');
+      del.addEventListener('click', (e) => {
+        e.stopPropagation();
+        deleteSession(s.id);
+      });
+      item.appendChild(del);
+
+      item.addEventListener('click', (e) => {
+        if (e.target.tagName === 'BUTTON' || e.target.classList.contains('del-btn')) return;
+        switchSession(s.id);
+      });
+      mobileHistoryList.appendChild(item);
+    });
+  }
+
+  // ----- 创建单条消息 DOM 元素（用于增量更新） -----
+  function createMessageElement(msg) {
+    const div = document.createElement('div');
+    div.className = `message ${msg.role}`;
+
+    // 思考面板（参考 DeepSeek 网页版，含工具调用标记）
+    const thinkText = msg.thinkClean || msg.think || '';
+    const hasThink = thinkText.trim().length > 0;
+    if (hasThink) {
+        const details = document.createElement('details');
+        details.className = 'think-block-top';
+        details.open = true;
+        const summary = document.createElement('summary');
+        summary.textContent = t('think_process');
+        details.appendChild(summary);
+        const contentDiv = document.createElement('div');
+        const lines = thinkText.split('\n').filter(line => line.trim());
+        lines.forEach(line => {
+            const p = document.createElement('div');
+            const trimmed = line.trim();
+            if (trimmed.indexOf(t('calling_tool')) === 0 || /^调用[:：]/.test(trimmed)) {
+                p.className = 'think-tool';
+            } else if (trimmed.indexOf(t('result_prefix')) === 0 || /^结果[:：]/.test(trimmed)) {
+                p.className = 'think-result';
+            }
+            p.textContent = line;
+            contentDiv.appendChild(p);
+        });
+        details.appendChild(contentDiv);
+        div.insertBefore(details, div.firstChild);
+    }
+
+    // 消息文本（Markdown 渲染）— 放入生成框
+    const textDiv = document.createElement('div');
+    textDiv.className = 'answer-box';
+    textDiv.innerHTML = msg.text ? marked.parse(msg.text) : '';
+    div.appendChild(textDiv);
+
+    // 用户消息：显示附件文件信息
+    if (msg.role === 'user' && msg.files && msg.files.length) {
+        const fileInfo = document.createElement('div');
+        fileInfo.style.cssText = 'font-size:12px;color:#fff;margin-top:8px;padding-top:6px;border-top:1px dashed rgba(255,255,255,0.3);display:flex;flex-wrap:wrap;gap:4px;';
+        msg.files.forEach(fname => {
+            const tag = document.createElement('span');
+            tag.style.cssText = 'background:rgba(255,255,255,0.25);padding:2px 8px;border-radius:10px;font-size:11px;color:#fff;';
+            tag.textContent = '📎 ' + fname;
+            fileInfo.appendChild(tag);
+        });
+        div.appendChild(fileInfo);
+    }
+
+    // 底部栏：时间戳（左）+ 操作按钮（右）
+    const bottomRow = document.createElement('div');
+    bottomRow.style.cssText = 'display: flex; align-items: center; justify-content: space-between; margin-top: 6px; gap: 8px;';
+
+    // 时间戳（左下）
+    const timeDiv = document.createElement('span');
+    timeDiv.className = 'msg-time';
+    if (msg.timestamp) {
+        const d = new Date(msg.timestamp);
+        const month = d.getMonth() + 1;
+        const day = d.getDate();
+        const hours = String(d.getHours()).padStart(2, '0');
+        const minutes = String(d.getMinutes()).padStart(2, '0');
+        timeDiv.textContent = `${month}.${day} ${hours}:${minutes}`;
+    }
+    bottomRow.appendChild(timeDiv);
+
+    // 操作按钮（右下）
+    const actionsDiv = document.createElement('span');
+    actionsDiv.className = 'msg-actions';
+
+    // 复制按钮
+    const copyBtn = document.createElement('button');
+    copyBtn.textContent = '📋';
+    copyBtn.title = t('copy_content');
+    copyBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const displayThink = msg.thinkClean || msg.think || '';
+        const fullText = msg.text + (displayThink ? '\n\n--- ' + t('think_process') + ' ---\n' + displayThink : '');
+        navigator.clipboard?.writeText(fullText).then(() => {
+            copyBtn.textContent = '✅';
+            setTimeout(() => copyBtn.textContent = '📋', 1500);
+        }).catch(() => {
+            const ta = document.createElement('textarea');
+            ta.value = fullText;
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            ta.remove();
+            copyBtn.textContent = '✅';
+            setTimeout(() => copyBtn.textContent = '📋', 1500);
+        });
+    });
+    actionsDiv.appendChild(copyBtn);
+
+    // 删除按钮（仅对已完成的 assistant 消息显示）
+    if (msg.role === 'assistant' && msg.text && msg.text !== t('thinking')) {
+        const delBtn = document.createElement('button');
+        delBtn.textContent = '🗑️';
+        delBtn.title = t('delete_qa');
+        delBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (confirm(t('delete_this_qa'))) {
+                deleteCurrentQA(msg);
+            }
+        });
+        actionsDiv.appendChild(delBtn);
+    }
+
+    // 重新生成按钮（仅对已完成的 assistant 消息）
+    if (msg.role === 'assistant' && msg.text && msg.text !== t('thinking')) {
+        const regenBtn = document.createElement('button');
+        regenBtn.textContent = '🔄';
+        regenBtn.title = t('regenerate');
+        regenBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            regenerateAnswer(msg);
+        });
+        actionsDiv.appendChild(regenBtn);
+    }
+
+    // 评分按钮（仅对已完成且未评分的 assistant 消息）
+    if (msg.role === 'assistant' && msg.text && msg.text !== t('thinking') && !msg.rated) {
+        const rateBtn = document.createElement('button');
+        rateBtn.textContent = '⭐';
+        rateBtn.title = t('rate_answer');
+        rateBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            openRatingModal(msg);
+        });
+        actionsDiv.appendChild(rateBtn);
+    }
+
+    bottomRow.appendChild(actionsDiv);
+    div.appendChild(bottomRow);
+
+    return div;
+  }
+
+  function renderMessages() {
+    const session = getCurrentSession();
+    const messages = session.messages;
+
+    // 空消息
+    if (!messages.length) {
+      if (currentMode === 'me') {
+        const presets = [
+          { q: t('me_preset_1'), label: t('me_preset_1') },
+          { q: t('me_preset_2'), label: t('me_preset_2') },
+          { q: t('me_preset_3'), label: t('me_preset_3') },
+          { q: t('me_preset_4'), label: t('me_preset_4') },
+          { q: t('me_preset_5'), label: t('me_preset_5') },
+          { q: t('me_preset_6'), label: t('me_preset_6') },
+          { q: t('me_preset_7'), label: t('me_preset_7') }
+        ];
+        messagesEl.innerHTML = `
+          <div class="welcome-card">
+            <h1>${t('me_welcome_title')}</h1>
+            <div class="subtitle">${t('me_welcome_subtitle')}</div>
+            <div class="info-grid">
+              <div><span class="label">${t('me_label_intent')}</span><br><span class="value">${t('me_value_intent')}</span></div>
+              <div><span class="label">${t('me_label_edu')}</span><br><span class="value">${t('me_value_edu')}</span></div>
+              <div><span class="label">${t('me_label_project')}</span><br><span class="value">${t('me_value_project')}</span></div>
+              <div><span class="label">${t('me_label_speed')}</span><br><span class="value">${t('me_value_speed')}</span></div>
+            </div>
+            <div class="tag-list">
+              <span class="tag">Python</span>
+              <span class="tag">FastAPI</span>
+              <span class="tag">Multi-Agent</span>
+              <span class="tag">RAG</span>
+              <span class="tag">Docker</span>
+              <span class="tag">DeepSeek</span>
+              <span class="tag">PostgreSQL</span>
+              <span class="tag">Redis</span>
+            </div>
+            <div class="hint" style="font-size:12px;color:#6b7280;">${t('me_contact')}</div>
+            <div class="hint">${t('me_hint')}</div>
+            <div class="presets" id="welcomePresets">
+              ${presets.map(function(p) { return '<button data-q="' + p.q + '">' + p.label + '</button>'; }).join('')}
+            </div>
+          </div>
+        `;
+      } else {
+        messagesEl.innerHTML = '<div>' + t('welcome') + '</div>';
+      }
+      return;
+    }
+
+    // 增量更新：如果 DOM 中消息数量与列表一致，且最后一条是 assistant，只更新最后一条
+    const existingChildren = messagesEl.children;
+    if (existingChildren.length === messages.length && messages.length > 0) {
+      const lastMsg = messages[messages.length - 1];
+      if (lastMsg.role === 'assistant') {
+        // 移除旧的最后一条 assistant 消息
+        existingChildren[existingChildren.length - 1].remove();
+        // 创建新的消息元素并追加
+        const newDiv = createMessageElement(lastMsg);
+        messagesEl.appendChild(newDiv);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+    }
+
+    // 全量重建（非 assistant 消息或数量不匹配时）
+    messagesEl.innerHTML = '';
+    messages.forEach(msg => {
+      const div = createMessageElement(msg);
+      messagesEl.appendChild(div);
+    });
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  // ---------- Toast 通知 ----------
+  function showToast(msg, duration) {
+    duration = duration || 3000;
+    var existing = document.querySelector('.toast-notice');
+    if (existing) existing.remove();
+    var t = document.createElement('div');
+    t.className = 'toast-notice';
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(function() {
+      t.classList.add('hide');
+      setTimeout(function() { t.remove(); }, 300);
+    }, duration);
+  }
+
+  // ---------- 文件上传 ----------
+  let pendingFileIds = [];
+  const fileInput = document.getElementById('fileInput');
+  const fileIndicator = document.getElementById('fileIndicator');
+  const fileLabel = document.getElementById('fileLabel');
+  const clearFileBtn = document.getElementById('clearFileBtn');
+  const uploadBtn = document.getElementById('uploadBtn');
+
+  fileInput.addEventListener('change', async function() {
+    const file = this.files && this.files[0];
+    if (!file) return;
+    showToast(t('file_local_only'), 3000);
+    if (file.size > 20 * 1024 * 1024) { alert(t('file_too_large')); this.value = ''; return; }
+    const ext = '.' + file.name.split('.').pop().toLowerCase();
+    const allowed = ['.txt','.md','.csv','.json','.xml','.pdf','.jpg','.jpeg','.png','.bmp','.webp','.docx'];
+    if (!allowed.includes(ext)) { alert(t('unsupported_file_type')); this.value = ''; return; }
+    try {
+      uploadBtn.classList.add('has-file');
+      fileLabel.textContent = file.name;
+      fileIndicator.className = 'file-indicator uploading';
+      fileIndicator.style.display = 'flex';
+      const circle = document.getElementById('progressCircle');
+      const icon = document.getElementById('progressIcon');
+      const total = 62.83;
+
+      // 阶段1：上传中 — 圆圈顺时针从空到满
+      circle.style.strokeDashoffset = total + '';
+      circle.style.transform = 'rotate(-90deg)';
+      let offset = total;
+      const fillInterval = setInterval(() => {
+        offset -= 5;
+        if (offset <= 0) { offset = 0; clearInterval(fillInterval); }
+        circle.style.strokeDashoffset = offset + '';
+      }, 60);
+
+      const formData = new FormData();
+      formData.append('file', file);
+      const resp = await apiFetch('/v2/upload', {
+        method: 'POST',
+        body: formData
+      });
+      clearInterval(fillInterval);
+      if (!resp.ok) { const err = await resp.json(); throw new Error(err.detail || t('upload_failed')); }
+
+      // 阶段2：OCR识别 — 圆圈从底部从空到满填充
+      fileIndicator.className = 'file-indicator processing';
+      circle.style.transform = 'rotate(90deg)';  // 从6点开始
+      circle.style.strokeDashoffset = total + '';
+      icon.textContent = '🔍';
+      fileLabel.textContent = file.name + ' ' + t('recognizing');
+      // 用 CSS animation fillFromBottom 自动播放
+      circle.style.animation = 'none';
+      void circle.offsetWidth;  // 强制回流，触发重播
+      circle.style.animation = 'fillFromBottom 1.8s ease-in-out forwards';
+
+      const data = await resp.json();
+      // 阶段3：完成 — 打勾
+      fileIndicator.className = 'file-indicator done';
+      circle.style.transform = 'rotate(-90deg)';
+      circle.style.strokeDashoffset = '0';
+      circle.style.animation = 'none';
+      icon.textContent = '✓';
+      pendingFileIds.push(data.file_id);
+      fileLabel.textContent = file.name + ' (' + (data.text_length || '?') + ' ' + t('chars') + ')';
+    } catch (e) {
+      alert(t('upload_failed') + e.message);
+      fileIndicator.className = 'file-indicator';
+      fileLabel.textContent = '';
+      fileIndicator.style.display = 'none';
+      uploadBtn.classList.remove('has-file');
+    }
+  });
+
+  clearFileBtn.addEventListener('click', function() {
+    pendingFileIds = [];
+    fileIndicator.className = 'file-indicator';
+    fileIndicator.style.display = 'none';
+    fileLabel.textContent = '';
+    fileInput.value = '';
+    uploadBtn.classList.remove('has-file');
+  });
+
+  // ---------- 建议功能（放在最后一条 AI 消息下方，动态生成） ----------
+  function generateSuggestions() {
+    const session = getCurrentSession();
+    const msgs = session.messages || [];
+    const lastAssistant = [...msgs].reverse().find(m => m.role === 'assistant');
+    const text = (lastAssistant && lastAssistant.text) || '';
+
+    if (/天气|气温|下雨|刮风|晴天|阴天|温度/.test(text)) {
+      return t('followup_weather');
+    }
+    if (/美食|餐厅|吃饭|小吃|菜系|好吃|味道/.test(text)) {
+      return t('followup_food');
+    }
+    if (/酒店|住宿|民宿|住|房间|旅馆/.test(text)) {
+      return t('followup_hotel');
+    }
+    if (/景点|游玩|公园|门票|景区|好玩/.test(text)) {
+      return t('followup_scenic');
+    }
+    if (/路线|交通|怎么去|地铁路线|开车|公交/.test(text)) {
+      return t('followup_route');
+    }
+    return t('followup_default');
+  }
+
+  // ---------- 删除本次问答 ----------
+  async function deleteCurrentQA(assistantMsg) {
+    const session = getCurrentSession();
+    const idx = session.messages.indexOf(assistantMsg);
+    if (idx < 1) return;
+    const userMsg = session.messages[idx - 1];
+    if (!userMsg || userMsg.role !== 'user') return;
+    try {
+      await apiFetch('/v2/chat/delete-qa', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: session.conversation_id,
+          user_message: userMsg.text || userMsg.content || '',
+          assistant_message: assistantMsg.text || ''
+        })
+      });
+    } catch (e) { /* ignore */ }
+    session.messages.splice(idx - 1, 2);
+    saveSessions();
+    renderMessages();
+  }
+
+  // ---------- 重新生成 ----------
+  function regenerateAnswer(assistantMsg) {
+    if (isStreaming) return;
+    const session = getCurrentSession();
+    const idx = session.messages.indexOf(assistantMsg);
+    if (idx < 1) return;
+    const userMsg = session.messages[idx - 1];
+    if (!userMsg || userMsg.role !== 'user') return;
+    const query = userMsg.text || userMsg.content || '';
+    if (!query) return;
+    // 移除该 QA 对
+    session.messages.splice(idx - 1, 2);
+    saveSessions();
+    renderMessages();
+    // 重新发送用户问题（自动触发新一轮生成）
+    inputEl.value = query;
+    sendMessage();
+  }
+
+  // ---------- 评分弹窗（1-5 星）----------
+  let ratingTargetMsg = null;
+
+  function openRatingModal(assistantMsg) {
+    ratingTargetMsg = assistantMsg;
+    document.getElementById('ratingMsg').textContent = t('rate_choose');
+    // 重置星星高亮
+    document.querySelectorAll('#ratingStars .rate-star').forEach(function(s) {
+      s.classList.remove('selected');
+    });
+    document.getElementById('ratingOverlay').classList.add('show');
+  }
+
+  function closeRatingModal() {
+    document.getElementById('ratingOverlay').classList.remove('show');
+    ratingTargetMsg = null;
+  }
+
+  async function submitRating(star) {
+    if (!ratingTargetMsg) return;
+    const session = getCurrentSession();
+    const idx = session.messages.indexOf(ratingTargetMsg);
+    const userMsg = idx >= 1 ? session.messages[idx - 1] : null;
+    const payload = {
+      rating: star,
+      session_id: session.conversation_id || '',
+      user_message: (userMsg && (userMsg.text || userMsg.content)) || '',
+      assistant_message: ratingTargetMsg.text || ''
+    };
+    try {
+      const resp = await apiFetch('/api/message/rate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      let alreadyRated = false;
+      try {
+        const j = await resp.json();
+        alreadyRated = !!(j && j.already_rated);
+      } catch (e) {}
+      // 标记该回复已评分（持久化，刷新后评分按钮也不再显示）
+      ratingTargetMsg.rated = true;
+      saveSessions();
+      // 显示感谢并自动返回（无需用户点击）
+      document.getElementById('ratingMsg').textContent = t('rate_thanks') + ' ⭐'.repeat(star);
+      document.querySelectorAll('#ratingStars .rate-star').forEach(function(s) {
+        s.classList.remove('selected');
+      });
+      if (alreadyRated) {
+        // 后端判定已评过（如另一设备已评）→ 直接关闭
+        setTimeout(function() {
+          closeRatingModal();
+          renderMessages();
+        }, 1200);
+        return;
+      }
+      setTimeout(function() {
+        closeRatingModal();
+        renderMessages();
+      }, 1200);
+    } catch (e) {
+      document.getElementById('ratingMsg').textContent = t('operation_failed');
+    }
+  }
+
+  function showSuggestions() {
+    const suggestions = generateSuggestions();
+    const lastAssistant = messagesEl.querySelector('.message.assistant:last-child');
+    if (!lastAssistant) return;
+
+    // 移除旧的建议容器（如果有）
+    const oldContainer = lastAssistant.querySelector('.message-suggestions');
+    if (oldContainer) oldContainer.remove();
+
+    const container = document.createElement('div');
+    container.className = 'message-suggestions';
+    suggestions.forEach(s => {
+        const btn = document.createElement('button');
+        btn.textContent = s;
+        btn.addEventListener('click', () => {
+            document.getElementById('input').value = s;
+            sendMessage();
+        });
+        container.appendChild(btn);
+    });
+    lastAssistant.appendChild(container);
+  }
+
+  // ---------- 登录 ----------
+  async function handleLogin() {
+    const username = loginUsername.value.trim();
+    const password = loginPassword.value.trim();
+    if (!username || !password) {
+      loginError.textContent = t('enter_username_pwd');
+      loginError.style.display = 'block';
+      return;
+    }
+    try {
+      const resp = await fetch(LOGIN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+      if (!resp.ok) {
+        const err = await resp.json();
+        throw new Error(err.detail || t('login_failed_2'));
+      }
+      const data = await resp.json();
+      const token = data.access_token;
+      localStorage.setItem(TOKEN_KEY, token);
+      if (data.refresh_token) localStorage.setItem(REFRESH_KEY, data.refresh_token);
+      localStorage.setItem('travel_username', data.username || username);
+      loginError.style.display = 'none';
+      showApp();
+      loadSessions();
+      inputEl.focus();
+    } catch (e) {
+      loginError.textContent = e.message || t('login_error_2');
+      loginError.style.display = 'block';
+    }
+  }
+
+  // ---------- 退出登录 ----------
+  function logout() {
+    const rt = localStorage.getItem(REFRESH_KEY);
+    if (rt) {
+      fetch('/api/logout', { method: 'POST', headers: { 'Authorization': 'Bearer ' + rt } }).catch(() => {});
+    }
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(REFRESH_KEY);
+    localStorage.removeItem(getStorageKey());
+    localStorage.removeItem(getLastSessionKey());
+    sessions = [];
+    currentSessionId = null;
+    showLogin();
+    messagesEl.innerHTML = '<div class="empty-state">' + t('empty_login') + '</div>';
+    renderHistory();
+    renderMobileHistory();
+  }
+
+function updateThoughtPanel(msg) {
+    const lastAssistantDiv = messagesEl.querySelector('.message.assistant:last-child');
+    if (!lastAssistantDiv) return;
+
+    let thinkBlock = lastAssistantDiv.querySelector('.think-block-top');
+    if (!thinkBlock) {
+        // 如果不存在，创建新的 details
+        const details = document.createElement('details');
+        details.className = 'think-block-top';
+        details.open = true;
+        const summary = document.createElement('summary');
+        summary.textContent = t('think_process');
+        details.appendChild(summary);
+        const contentDiv = document.createElement('div');
+        details.appendChild(contentDiv);
+        // 插入到消息顶部
+        const textDiv = lastAssistantDiv.querySelector('.answer-box');
+        if (textDiv) {
+            lastAssistantDiv.insertBefore(details, textDiv);
+        } else {
+            lastAssistantDiv.prepend(details);
+        }
+        thinkBlock = details;
+    }
+
+    const contentDiv = thinkBlock.querySelector('div:not(summary)') || thinkBlock.querySelector('div:last-child');
+    if (contentDiv) {
+        contentDiv.innerHTML = '';
+        const thinkText = msg.thinkClean || msg.think || '';
+        const lines = thinkText.split('\n').filter(line => line.trim());
+        lines.forEach(line => {
+            const p = document.createElement('div');
+            const trimmed = line.trim();
+            // 工具调用 / 工具结果行加区分样式
+            if (trimmed.indexOf(t('calling_tool')) === 0 || /^调用[:：]/.test(trimmed)) {
+                p.className = 'think-tool';
+            } else if (trimmed.indexOf(t('result_prefix')) === 0 || /^结果[:：]/.test(trimmed)) {
+                p.className = 'think-result';
+            }
+            p.textContent = line;
+            contentDiv.appendChild(p);
+        });
+    }
+}
+
+  // ---------- 取消当前流式生成 ----------
+  function cancelCurrentStream() {
+    if (activeAbortController) {
+      activeAbortController.abort();
+    }
+    // 立即恢复按钮（流循环 break 后会走 finally）
+    isStreaming = false;
+    sendBtn.classList.remove('btn-cancel');
+    sendBtn.textContent = t('send');
+    sendBtn.disabled = false;
+    inputEl.focus();
+  }
+
+async function sendMessage() {
+    // 生成中点击 = 取消当前生成
+    if (isStreaming) {
+        cancelCurrentStream();
+        return;
+    }
+    const text = inputEl.value.trim();
+    // 如果没有文字但有已上传的文件，用占位符作为 query
+    const hasFile = pendingFileIds && pendingFileIds.length > 0;
+    if (!text && !hasFile) return;
+
+    const session = getCurrentSession();
+    if (!session.conversation_id) {
+        session.conversation_id = crypto.randomUUID ? crypto.randomUUID() : 'conv_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+        saveSessions();
+    }
+
+    if (!session.messages.length) {
+        session.title = text.slice(0, 30) + (text.length > 30 ? '…' : '');
+        saveSessions();
+        renderHistory();
+        renderMobileHistory();
+    }
+
+    // 决定实际发送的 query 和用户消息显示的文字
+    const sendQuery = text || t('send_file_query');
+    const displayText = text || t('send_file_display');
+
+    session.messages.push({ role: 'user', text: displayText, timestamp: new Date() });
+    renderMessages();
+    inputEl.value = '';
+    // 发送中：按钮变为"取消"（不禁用，可点击中断）
+    sendBtn.textContent = t('cancel_stream');
+    sendBtn.classList.add('btn-cancel');
+    isStreaming = true;
+
+    const placeholder = { role: 'assistant', text: t('thinking'), think: '', timestamp: new Date() };
+    session.messages.push(placeholder);
+    renderMessages();
+
+    let conversationId = session.conversation_id || null;
+    let isFirstChunk = true;
+
+    try {
+        // 收集待发送的文件ID并清空
+        let fileIds = [];
+        let fileNames = [];
+        if (pendingFileIds && pendingFileIds.length) {
+            fileIds = [...pendingFileIds];
+            // 从fileLabel取已上传的文件名
+            const label = fileLabel.textContent || '';
+            const match = label.match(/✅\s*(.+?)\s*\(/);
+            if (match) fileNames.push(match[1]);
+            pendingFileIds = [];
+            // 重置文件指示器
+            fileIndicator.style.display = 'none';
+            fileLabel.textContent = '';
+            fileInput.value = '';
+            uploadBtn.classList.remove('has-file');
+        } else if (session.pendingFileIds && session.pendingFileIds.length) {
+            fileIds = [...session.pendingFileIds];
+            session.pendingFileIds = [];
+            saveSessions();
+        }
+        const payload = { query: sendQuery, user: 'web-user', lang: currentLang };
+        if (conversationId) payload.conversation_id = conversationId;
+        if (fileIds.length) payload.file_ids = fileIds;
+        if (currentMode === 'me') payload.persona_id = 'me';
+
+        // 如果附带了文件，更新用户消息对象显示附件信息
+        if (fileNames.length) {
+            const userMsg = session.messages[session.messages.length - 2];
+            if (userMsg && userMsg.role === 'user') {
+                userMsg.files = fileNames;
+                // 重新渲染消息显示附件标签
+                const msgsEl = document.getElementById('messages');
+                const children = msgsEl.children;
+                if (children.length >= 2) {
+                    const userDiv = children[children.length - 2];
+                    const existing = userDiv.querySelector('.file-attach');
+                    if (!existing) {
+                        const fileInfo = document.createElement('div');
+                        fileInfo.className = 'file-attach';
+                        fileInfo.style.cssText = 'font-size:12px;color:#fff;margin-top:8px;padding-top:6px;border-top:1px dashed rgba(255,255,255,0.3);display:flex;flex-wrap:wrap;gap:4px;';
+                        fileNames.forEach(fname => {
+                            const tag = document.createElement('span');
+                            tag.style.cssText = 'background:rgba(255,255,255,0.25);padding:2px 8px;border-radius:10px;font-size:11px;color:#fff;';
+                            tag.textContent = '📎 ' + fname;
+                            fileInfo.appendChild(tag);
+                        });
+                        userDiv.appendChild(fileInfo);
+                    }
+                }
+            }
+        }
+        // 附加用户定位城市（由浏览器定位获取）
+        const userCity = localStorage.getItem('user_city');
+        if (userCity) {
+            payload.user_location = userCity;
+        }
+
+        // 创建取消控制器（发送中按钮变"取消"，点击可中断）
+        activeAbortController = new AbortController();
+        const currentAbort = activeAbortController.signal;
+        sendBtn.textContent = t('cancel_stream');
+        sendBtn.classList.add('btn-cancel');
+        sendBtn.disabled = false;
+
+        const response = await apiFetch(getApiUrl(), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            signal: currentAbort
+        });
+        if (response.status === 401) { logout(); alert(t('login_expired')); return; }
+        if (response.status === 402) {
+          // GitHub 试用额度用尽：重置按钮并弹绑定手机号引导
+          const lastMsg = session.messages[session.messages.length - 1];
+          if (lastMsg && (!lastMsg.text || lastMsg.text === t('thinking'))) {
+            lastMsg.text = t('quota_exhausted');
+            updateMessageText(lastMsg);
+          }
+          isStreaming = false;
+          sendBtn.classList.remove('btn-cancel');
+          sendBtn.textContent = t('send');
+          sendBtn.disabled = false;
+          saveSessions();
+          openBindPhoneModal(t('bind_phone_exhausted_tip'));
+          return;
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const reader = response.body && response.body.getReader ? response.body.getReader() : null;
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+
+        // 绑定取消：点击发送按钮（此时为"取消"态）会中断流
+        sendBtn.textContent = t('cancel_stream');
+        sendBtn.classList.add('btn-cancel');
+        sendBtn.disabled = false;
+
+        if (!reader) throw new Error(t('no_stream_response'));
+
+        while (true) {
+          let readRes;
+          try {
+            readRes = await reader.read();
+          } catch (streamErr) {
+            // 用户主动取消（AbortError）→ 静默结束，保留已生成内容
+            if (streamErr && (streamErr.name === 'AbortError' || activeAbortController && activeAbortController.signal.aborted)) {
+              break;
+            }
+            console.error('流读取失败:', streamErr);
+            // 友好提示并走兜底逻辑
+            const msg = session.messages[session.messages.length - 1];
+            if (msg) {
+              msg.text = t('stream_interrupted');
+              updateMessageText(msg);
+            }
+            isStreaming = false;
+            sendBtn.disabled = false;
+            saveSessions();
+            return;
+          }
+          const { done, value } = readRes;
+          if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed.startsWith('data: ')) continue;
+                const data = trimmed.slice(6);
+                if (data === '[DONE]') {
+                    const msg = session.messages[session.messages.length - 1];
+                    if (msg) {
+                        if (!msg.text || msg.text === t('thinking')) {
+                            msg.text = t('no_reply');
+                        }
+                        updateMessageText(msg);
+                        if ((msg.thinkClean || msg.think) && (msg.thinkClean || msg.think).trim()) {
+                            updateThoughtPanel(msg);
+                        }
+                    }
+                    if (msg) renderMessages();
+                    saveSessions();
+                    isStreaming = false;
+                    sendBtn.disabled = false;
+                    continue;
+                }
+
+                try {
+                    const json = JSON.parse(data);
+                    if (json.conversation_id && !session.conversation_id) {
+                        session.conversation_id = json.conversation_id;
+                        saveSessions();
+                    }
+                    const type = json.type || 'answer';
+                    const msg = session.messages[session.messages.length - 1];
+                    if (!msg) continue;
+
+                    // 思考类事件
+                    if (type === 'thought' || type === 'tool_call' || type === 'tool_result') {
+                        let lineText = '';
+                        if (type === 'thought') {
+                            lineText = (json.content || '').replace(/[🤔💭]/g, '').trim();
+                        } else if (type === 'tool_call') {
+                            const toolName = json.name || '';
+                            const args = json.args || {};
+                            // 工具名映射为可读名称（跟随语言）；未知工具不展示，防止暴露内部函数签名
+                            const NAME_MAP = {
+                                'query_weather': t('tool_weather'),
+                                'query_hotel': t('tool_hotel'),
+                                'query_route': t('tool_route'),
+                                'query_food': t('tool_food'),
+                                'fetch_weather_async': t('tool_fetch_weather'),
+                                'call_sub_agent': t('tool_sub_agent'),
+                                'web_search': t('tool_web_search'),
+                                'search_knowledge': t('tool_knowledge_search'),
+                                'search_project_knowledge': t('tool_project_search')
+                            };
+                            const cnName = NAME_MAP[toolName];
+                            if (!cnName) continue;
+                            // 只取字符串参数值，不展示 key=value 代码签名
+                            const vals = Object.values(args).filter(v => typeof v === 'string' && v.trim());
+                            lineText = t('calling_tool') + cnName + (vals.length ? '（' + vals.join('，') + '）' : '');
+                        } else if (type === 'tool_result') {
+                            const result = json.result || {};
+                            // 工具失败时不要显示负面信号给用户（静默跳过）
+                            if (result && result.error) {
+                                continue;
+                            }
+                            let summary = t('query_done');
+                            if (result.restaurants) summary = t('found_restaurants').replace('{n}', result.restaurants.length);
+                            else if (result.hotels) summary = t('found_hotels').replace('{n}', result.hotels.length);
+                            else if (result.route) summary = t('route_done');
+                            lineText = t('result_prefix') + summary;
+                        }
+                        if (lineText) {
+                            msg.think = (msg.think || '') + '\n' + lineText;
+                            updateThoughtPanel(msg);
+                            await new Promise(resolve => setTimeout(resolve, 30));
+                        }
+                        continue;
+                    }
+
+                    // 处理流式思考片段（实时推理内容）
+                    if (type === 'reasoning_chunk') {
+                        const chunk = json.content || '';
+                        if (chunk) {
+                            msg.think = (msg.think || '') + chunk;
+                            // 实时清洗：替换内部代码名为中文
+                            msg.thinkClean = cleanReasoning(msg.think);
+                            updateThoughtPanel(msg);
+                            await new Promise(resolve => setTimeout(resolve, 30));
+                        }
+                        continue;
+                    }
+
+                    // 思考结束信号
+                    if (type === 'reasoning_done') {
+                        continue;
+                    }
+
+                    // 处理流式答案片段（推理结束后才发送）
+                    if (type === 'answer_chunk') {
+                        const chunk = json.content || '';
+                        if (chunk) {
+                            if (isFirstChunk) {
+                                msg.text = chunk;
+                                isFirstChunk = false;
+                            } else {
+                                msg.text = (msg.text || '') + chunk;
+                            }
+                            updateMessageText(msg);
+                            // 每帧（16ms）渲染，配合后端动态节流保持流畅
+                            await new Promise(resolve => setTimeout(resolve, 16));
+                        }
+                        continue;
+                    }
+
+                    // 答案生成完成（接收完整结果，不做覆盖，仅标记）
+                    if (type === 'answer_complete') {
+                        if (json.content && json.content !== msg.text) {
+                            msg.text = json.content;
+                            updateMessageText(msg);
+                        }
+                        saveSessions();
+                        continue;
+                    }
+                } catch (e) {
+                    // 忽略非 JSON
+                }
+            }
+        }
+
+        // 对话完成后刷新钱包余额
+        refreshWallet();
+
+        saveSessions();
+        renderHistory();
+        renderMobileHistory();
+
+    } catch (error) {
+        // 用户主动取消：不当作错误处理，保留已生成内容
+        if (activeAbortController && activeAbortController.signal.aborted) {
+            isStreaming = false;
+            sendBtn.disabled = false;
+            saveSessions();
+            renderMessages();
+            return;
+        }
+        console.error('发送消息失败:', error);
+        isStreaming = false;
+        sendBtn.disabled = false;
+        const msg = session.messages[session.messages.length - 1];
+        if (msg) {
+            msg.text = t('request_failed');
+            renderMessages();
+        }
+    } finally {
+        // 恢复发送按钮（移除取消态）
+        if (activeAbortController) {
+            activeAbortController = null;
+        }
+        sendBtn.classList.remove('btn-cancel');
+        sendBtn.textContent = t('send');
+        sendBtn.disabled = false;
+        isStreaming = false;
+        inputEl.focus();
+        saveSessions();
+        renderHistory();
+        renderMobileHistory();
+        refreshQuotaBadge();  // 每次提问后重新同步剩余次数
+    }
+}
+
+  // ---------- 手机号登录 ----------
+  let phoneCodeTimer = null;
+  let phoneCodeCountdown = 0;
+
+  // 登录方式切换
+  document.querySelectorAll('.login-tab').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+      document.querySelectorAll('.login-tab').forEach(function(t) {
+        t.style.background = '#f0f5f0';
+        t.style.color = 'var(--text-secondary)';
+        t.classList.remove('active');
+      });
+      this.style.background = 'var(--primary)';
+      this.style.color = '#fff';
+      this.classList.add('active');
+      var tabName = this.getAttribute('data-tab');
+      document.getElementById('loginTabPassword').style.display = tabName === 'password' ? 'block' : 'none';
+      document.getElementById('loginTabPhone').style.display = tabName === 'phone' ? 'block' : 'none';
+      document.getElementById('loginError').style.display = 'none';
+      document.getElementById('phoneError').style.display = 'none';
+    });
+  });
+
+  async function handlePhoneSendCode() {
+    var phone = document.getElementById('phoneInput').value.trim();
+    if (!phone || !/^\d{7,15}$/.test(phone)) {
+      document.getElementById('phoneError').textContent = t('enter_valid_phone');
+      document.getElementById('phoneError').style.display = 'block';
+      return;
+    }
+    if (phoneCodeCountdown > 0) return;
+    try {
+      var resp = await fetch('/api/phone/send-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone: phone })
+      });
+      var data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || t('send_failed_2'));
+      document.getElementById('phoneError').textContent = t('code_sent');
+      document.getElementById('phoneError').style.display = 'block';
+      document.getElementById('phoneError').style.color = 'var(--primary)';
+      // 60秒倒计时
+      phoneCodeCountdown = 60;
+      var btn = document.getElementById('phoneSendCodeBtn');
+      btn.disabled = true;
+      clearInterval(phoneCodeTimer);
+      phoneCodeTimer = setInterval(function() {
+        phoneCodeCountdown--;
+        btn.textContent = phoneCodeCountdown + 's';
+        if (phoneCodeCountdown <= 0) {
+          clearInterval(phoneCodeTimer);
+          btn.textContent = t('resend');
+          btn.disabled = false;
+        }
+      }, 1000);
+    } catch (e) {
+      document.getElementById('phoneError').textContent = e.message || t('send_failed_2');
+      document.getElementById('phoneError').style.display = 'block';
+      document.getElementById('phoneError').style.color = '#ef4444';
+    }
+  }
+
+  async function handlePhoneLogin() {
+    var phone = document.getElementById('phoneInput').value.trim();
+    var code = document.getElementById('phoneCodeInput').value.trim();
+    var password = document.getElementById('phonePasswordInput').value.trim();
+    var agree = document.getElementById('agreeCheckbox').checked;
+    var errorEl = document.getElementById('phoneError');
+    if (!phone || !code) {
+      errorEl.textContent = t('fill_phone_code');
+      errorEl.style.display = 'block';
+      errorEl.style.color = '#ef4444';
+      return;
+    }
+    if (password && !agree) {
+      errorEl.textContent = t('agree_required');
+      errorEl.style.display = 'block';
+      errorEl.style.color = '#ef4444';
+      return;
+    }
+    try {
+      // 如果有密码则注册，否则直接验证码登录
+      var endpoint = password ? '/api/phone/register' : '/api/phone/login';
+      var body = { phone: phone, code: code };
+      if (password) { body.password = password; body.agree = agree; }
+      var resp = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      var data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || '操作失败');
+      localStorage.setItem(TOKEN_KEY, data.access_token);
+      if (data.refresh_token) localStorage.setItem(REFRESH_KEY, data.refresh_token);
+      if (data.username) localStorage.setItem('travel_username', data.username);
+      errorEl.style.display = 'none';
+      showApp();
+      loadSessions();
+      inputEl.focus();
+      // 初次登录（新注册）提示默认密码
+      if (data.default_password_hint) {
+        alert(t('default_pwd_hint'));
+      }
+      // 清除倒计时
+      clearInterval(phoneCodeTimer);
+      document.getElementById('phoneSendCodeBtn').disabled = false;
+      document.getElementById('phoneSendCodeBtn').textContent = t('get_code');
+    } catch (e) {
+      errorEl.textContent = e.message || t('operation_failed');
+      errorEl.style.display = 'block';
+      errorEl.style.color = '#ef4444';
+    }
+  }
+
+  // ---------- 绑定手机号（GitHub 试用额度解锁）----------
+  var bindPhoneCodeTimer = null;
+  var bindPhoneCodeCountdown = 0;
+
+  function openBindPhoneModal(tip) {
+    // tip：首次登录=试用说明；402=额度已用完（文案按场景区分，见 i18n）
+    document.getElementById('bindPhoneTip').textContent = tip || t('bind_phone_trial_tip');
+    document.getElementById('bindPhoneError').style.display = 'none';
+    document.getElementById('bindPhoneInput').value = '';
+    document.getElementById('bindPhoneCodeInput').value = '';
+    document.getElementById('bindPhoneOverlay').classList.add('show');
+    document.getElementById('bindPhoneInput').focus();
+  }
+  function closeBindPhoneModal() {
+    document.getElementById('bindPhoneOverlay').classList.remove('show');
+    clearInterval(bindPhoneCodeTimer);
+    bindPhoneCodeCountdown = 0;
+    document.getElementById('bindPhoneSendCodeBtn').disabled = false;
+    document.getElementById('bindPhoneSendCodeBtn').textContent = t('bind_phone_send_code');
+  }
+
+  async function bindPhoneSendCode() {
+    var phone = document.getElementById('bindPhoneInput').value.trim();
+    var errEl = document.getElementById('bindPhoneError');
+    if (!phone || !/^\d{7,15}$/.test(phone)) {
+      errEl.textContent = t('enter_valid_phone');
+      errEl.style.display = 'block';
+      errEl.style.color = '#ef4444';
+      return;
+    }
+    if (bindPhoneCodeCountdown > 0) return;
+    try {
+      var resp = await fetch('/api/phone/send-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone: phone })
+      });
+      var data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || t('send_failed_2'));
+      errEl.textContent = t('code_sent');
+      errEl.style.display = 'block';
+      errEl.style.color = 'var(--primary)';
+      bindPhoneCodeCountdown = 60;
+      var btn = document.getElementById('bindPhoneSendCodeBtn');
+      btn.disabled = true;
+      clearInterval(bindPhoneCodeTimer);
+      bindPhoneCodeTimer = setInterval(function() {
+        bindPhoneCodeCountdown--;
+        btn.textContent = bindPhoneCodeCountdown + 's';
+        if (bindPhoneCodeCountdown <= 0) {
+          clearInterval(bindPhoneCodeTimer);
+          btn.textContent = t('bind_phone_send_code');
+          btn.disabled = false;
+        }
+      }, 1000);
+    } catch (e) {
+      errEl.textContent = e.message || t('send_failed_2');
+      errEl.style.display = 'block';
+      errEl.style.color = '#ef4444';
+    }
+  }
+
+  async function bindPhoneSubmit() {
+    var phone = document.getElementById('bindPhoneInput').value.trim();
+    var code = document.getElementById('bindPhoneCodeInput').value.trim();
+    var errEl = document.getElementById('bindPhoneError');
+    if (!phone || !code) {
+      errEl.textContent = t('fill_phone_code');
+      errEl.style.display = 'block';
+      errEl.style.color = '#ef4444';
+      return;
+    }
+    try {
+      var resp = await apiFetch('/api/user/bind-phone', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone: phone, code: code })
+      });
+      var data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || t('operation_failed'));
+      closeBindPhoneModal();
+      showToast(t('bind_phone_success'));
+      refreshQuotaBadge();  // 已解除限制 → 隐藏剩余次数徽标
+    } catch (e) {
+      errEl.textContent = e.message || t('operation_failed');
+      errEl.style.display = 'block';
+      errEl.style.color = '#ef4444';
+    }
+  }
+
+  // ---------- 手机弹窗 ----------
+  function openMobileMenu() {
+    renderMobileHistory();
+    mobileOverlay.classList.add('show');
+  }
+  function closeMobileMenu() {
+    mobileOverlay.classList.remove('show');
+  }
+
+  // ---------- 浏览器定位 ----------
+  async function initGeolocation() {
+    // 清理历史"局域网"垃圾定位（私有IP定位旧值），视为未定位
+    if (localStorage.getItem('user_city') === '局域网') {
+      try { localStorage.removeItem('user_city'); localStorage.removeItem('user_city_ts'); } catch (e) {}
+    }
+    // 如果已经定位过了就不再重复请求
+    if (localStorage.getItem('user_city') && localStorage.getItem('user_city_ts')) {
+      const ts = parseInt(localStorage.getItem('user_city_ts'));
+      // 缓存1小时有效
+      if (Date.now() - ts < 3600000) return;
+    }
+    if (!navigator.geolocation) return;
+    // 使用 Permissions API 优先判断权限状态，避免已授权时重复弹窗
+    try {
+      if (navigator.permissions && navigator.permissions.query) {
+        const p = await navigator.permissions.query({ name: 'geolocation' });
+        if (p.state === 'granted') {
+          navigator.geolocation.getCurrentPosition(async (pos) => {
+            try {
+              const lat = pos.coords.latitude;
+              const lng = pos.coords.longitude;
+              const token = localStorage.getItem(TOKEN_KEY);
+              const resp = await fetch(`/api/map/regeo?lat=${lat}&lng=${lng}`, {
+                headers: token ? { 'Authorization': 'Bearer ' + token } : {}
+              });
+              if (resp.ok) {
+                const data = await resp.json();
+                if (data.city) {
+                  localStorage.setItem('user_city', data.city);
+                  localStorage.setItem('user_city_ts', Date.now().toString());
+                }
+              }
+            } catch (e) {
+              console.warn('定位转城市失败:', e);
+            }
+          }, () => {}, { timeout: 5000, enableHighAccuracy: false });
+          return;
+        }
+        if (p.state === 'denied') {
+          // 被拒绝则不再尝试
+          return;
+        }
+        // else 状态为 prompt，继续下面的行为（可能弹出授权框）
+      }
+    } catch (e) {
+      // Permissions API 不可用则降级到原有逻辑
+    }
+
+    navigator.geolocation.getCurrentPosition(async (pos) => {
+      try {
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        const token = localStorage.getItem(TOKEN_KEY);
+        const resp = await fetch(`/api/map/regeo?lat=${lat}&lng=${lng}`, {
+          headers: token ? { 'Authorization': 'Bearer ' + token } : {}
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          if (data.city) {
+            localStorage.setItem('user_city', data.city);
+            localStorage.setItem('user_city_ts', Date.now().toString());
+          }
+        }
+      } catch (e) {
+        console.warn('定位转城市失败:', e);
+      }
+    }, () => {
+      // 用户拒绝定位，静默处理
+    }, { timeout: 5000, enableHighAccuracy: false });
+  }
+
+  // ---------- 事件绑定 ----------
+  loginBtn.addEventListener('click', handleLogin);
+  loginPassword.addEventListener('keydown', (e) => { if (e.key === 'Enter') handleLogin(); });
+  loginUsername.addEventListener('keydown', (e) => { if (e.key === 'Enter') handleLogin(); });
+  document.getElementById('phoneSendCodeBtn').addEventListener('click', handlePhoneSendCode);
+  document.getElementById('phoneLoginBtn').addEventListener('click', handlePhoneLogin);
+  document.getElementById('phoneCodeInput').addEventListener('keydown', function(e) { if (e.key === 'Enter') handlePhoneLogin(); });
+  document.getElementById('phonePasswordInput').addEventListener('keydown', function(e) { if (e.key === 'Enter') handlePhoneLogin(); });
+  document.getElementById('phoneInput').addEventListener('keydown', function(e) { if (e.key === 'Enter') handlePhoneSendCode(); });
+  logoutBtn.addEventListener('click', logout);
+  modeToggleBtn.addEventListener('click', toggleMode);
+  sendBtn.addEventListener('click', sendMessage);
+  inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendMessage(); });
+
+  // 欢迎卡片预设问题点击
+  messagesEl.addEventListener('click', function(e) {
+    const btn = e.target.closest('#welcomePresets button');
+    if (btn) {
+      const q = btn.getAttribute('data-q');
+      if (q) { inputEl.value = q; sendMessage(); }
+    }
+  });
+  newChatBtn.addEventListener('click', createNewSession);
+  mobileMenuBtn.addEventListener('click', openMobileMenu);
+  mobileCloseBtn.addEventListener('click', closeMobileMenu);
+  mobileNewBtn.addEventListener('click', createNewSession);
+  mobileOverlay.addEventListener('click', (e) => {
+    if (e.target === mobileOverlay) closeMobileMenu();
+  });
+
+  // ---------- 清空所有历史 ----------
+  const clearAllBtn = document.getElementById('clearAllHistoryBtn');
+  if (clearAllBtn) {
+    clearAllBtn.addEventListener('click', function() {
+      if (sessions.length <= 1) { alert(t('keep_one_session')); return; }
+      if (!confirm(t('clear_all_history_confirm'))) return;
+      // 保留当前会话
+      const currentId = currentSessionId;
+      sessions = sessions.filter(s => s.id === currentId);
+      saveSessions();
+      renderHistory();
+      renderMobileHistory();
+      renderMessages();
+    });
+  }
+
+  // ---------- 页面关闭时保存 ----------
+  window.addEventListener('beforeunload', function() {
+    saveSessions();
+  });
+
+  // ============================================================
+  // 模拟支付系统
+  // ============================================================
+  let rechargeAmount = 100;
+  let rechargeChannel = 'simulated_alipay';
+  let rechargeOrderNo = '';
+  let rechargeTimer = null;
+  let rechargeIdempotentKey = '';   // 幂等键：一次充值流程全局唯一，重试复用防重复下单
+
+  // ---------- 生成全局唯一幂等键（Idempotent-Key）----------
+  function generateIdempotentKey() {
+    if (window.crypto && window.crypto.randomUUID) {
+      return window.crypto.randomUUID();
+    }
+    return 'idem-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+  }
+
+  // ---------- 获取钱包余额 ----------
+  async function refreshWallet() {
+    if (!localStorage.getItem(TOKEN_KEY)) return;
+    try {
+      const resp = await apiFetch('/api/payment/wallet');
+      if (resp.ok) {
+        const data = await resp.json();
+        const balanceEl = document.getElementById('walletBalance');
+        if (balanceEl) {
+          const bal = data.balance || 0;
+          balanceEl.textContent = '¥' + bal.toFixed(2);
+        }
+      }
+    } catch (e) {
+      // 忽略
+    }
+  }
+
+  // GitHub 试用剩余提问次数徽标（仅受限用户显示；绑定手机号后隐藏）
+  async function refreshQuotaBadge() {
+    var badge = document.getElementById('quotaBadge');
+    if (!badge) return;
+    if (!localStorage.getItem(TOKEN_KEY)) { badge.style.display = 'none'; return; }
+    try {
+      var resp = await apiFetch('/api/user/profile');
+      if (!resp.ok) { badge.style.display = 'none'; return; }
+      var data = await resp.json();
+      if (data.quota_limited && typeof data.remaining_questions === 'number' && data.remaining_questions >= 0) {
+        badge.textContent = t('quota_badge').replace('{n}', data.remaining_questions);
+        badge.style.display = 'inline-block';
+      } else {
+        badge.style.display = 'none';
+      }
+    } catch (e) {
+      badge.style.display = 'none';
+    }
+  }
+
+  // ---------- 打开充值弹窗 ----------
+  function openRechargeModal() {
+    // 重置到步骤1
+    document.getElementById('rechargeStep1').style.display = 'block';
+    document.getElementById('rechargeStep2').style.display = 'none';
+    document.getElementById('rechargeStep3').style.display = 'none';
+    document.getElementById('rechargeGoBtn').style.display = 'inline-block';
+    document.getElementById('rechargeCloseQrBtn').style.display = 'none';
+    document.getElementById('rechargeDoneBtn').style.display = 'none';
+    document.getElementById('rechargeBackBtn').style.display = 'none';
+    document.getElementById('rechargeCancelBtn').style.display = 'inline-block';
+    // 默认选中100元；每次打开充值弹窗生成新的幂等键（本次充值流程复用）
+    rechargeAmount = 100;
+    rechargeChannel = 'simulated_alipay';
+    rechargeIdempotentKey = generateIdempotentKey();
+    document.querySelectorAll('#amountGrid button').forEach(b => b.classList.remove('selected'));
+    document.querySelector('#amountGrid button[data-amount="100"]').classList.add('selected');
+    document.querySelectorAll('#channelList .channel-option').forEach(c => c.classList.remove('selected'));
+    document.querySelector('#channelList .channel-option[data-channel="simulated_alipay"]').classList.add('selected');
+    document.getElementById('rechargeOverlay').classList.add('show');
+  }
+
+  // ---------- 关闭弹窗 ----------
+  function closeRechargeModal() {
+    document.getElementById('rechargeOverlay').classList.remove('show');
+    if (rechargeTimer) { clearTimeout(rechargeTimer); rechargeTimer = null; }
+  }
+
+  // ---------- 生成伪二维码（用 Canvas 画个模拟二维码）----------
+  function drawPseudoQrCode(orderNo, amount) {
+    const canvas = document.getElementById('qrCanvas');
+    const qrBox = document.getElementById('qrBox');
+    const placeholder = qrBox.querySelector('.qr-placeholder');
+    if (placeholder) placeholder.style.display = 'none';
+    canvas.style.display = 'block';
+    const ctx = canvas.getContext('2d');
+    const size = 180;
+    canvas.width = size;
+    canvas.height = size;
+    
+    // 白色背景
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, size, size);
+    
+    // 画一个模拟的二维码图案（三个定位图案 + 随机点阵）
+    const drawPositionSquare = (x, y, s) => {
+      ctx.fillStyle = '#1a2e1a';
+      ctx.fillRect(x, y, s, s);
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(x + 4, y + 4, s - 8, s - 8);
+      ctx.fillStyle = '#1a2e1a';
+      ctx.fillRect(x + 8, y + 8, s - 16, s - 16);
+    };
+    
+    // 三个定位方块
+    drawPositionSquare(8, 8, 36);
+    drawPositionSquare(size - 44, 8, 36);
+    drawPositionSquare(8, size - 44, 36);
+    
+    // 随机数据点
+    for (let i = 0; i < 60; i++) {
+      const x = 8 + Math.floor(Math.random() * (size - 16));
+      const y = 8 + Math.floor(Math.random() * (size - 16));
+      // 避开定位区域
+      if (x < 52 && y < 52) continue;
+      if (x > size - 52 && y < 52) continue;
+      if (x < 52 && y > size - 52) continue;
+      ctx.fillStyle = Math.random() > 0.5 ? '#1a2e1a' : '#e0e0e0';
+      ctx.fillRect(x, y, 4, 4);
+    }
+    
+    // 中心文字
+    ctx.fillStyle = 'rgba(26,46,26,0.8)';
+    ctx.font = 'bold 11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(t('qr_demo_text'), size/2, size/2 - 9);
+    ctx.fillText(t('qr_no_scan'), size/2, size/2 + 11);
+  }
+
+  // ---------- 执行充值流程 ----------
+  async function executeRecharge() {
+    if (!localStorage.getItem(TOKEN_KEY)) { alert(t('please_login')); return; }
+    
+    document.getElementById('rechargeGoBtn').disabled = true;
+    document.getElementById('rechargeGoBtn').textContent = t('processing');
+    
+    try {
+      // 1. 创建充值订单（携带幂等键：同键重试不会重复下单）
+      const createResp = await apiFetch('/api/payment/recharge', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Idempotent-Key': rechargeIdempotentKey
+        },
+        body: JSON.stringify({
+          amount: rechargeAmount,
+          payment_method: rechargeChannel,
+          subject: t('wallet_recharge')
+        })
+      });
+      if (!createResp.ok) {
+        const err = await createResp.json();
+        throw new Error(err.detail || t('create_order_failed'));
+      }
+      const order = await createResp.json();
+      rechargeOrderNo = order.order_no;
+      
+      // 2. 切换到二维码步骤
+      document.getElementById('rechargeStep1').style.display = 'none';
+      document.getElementById('rechargeStep2').style.display = 'block';
+      document.getElementById('rechargeGoBtn').style.display = 'none';
+      document.getElementById('rechargeCloseQrBtn').style.display = 'inline-block';
+      document.getElementById('rechargeBackBtn').style.display = 'inline-block';
+      document.getElementById('rechargeCancelBtn').style.display = 'none';
+      
+      // 显示订单信息
+      document.getElementById('qrAmount').textContent = rechargeAmount.toFixed(2) + ' ' + t('yuan');
+      document.getElementById('qrOrderNo').textContent = t('order_no_prefix') + order.order_no;
+      
+      // 生成伪二维码
+      drawPseudoQrCode(order.order_no, rechargeAmount);
+      
+    } catch (e) {
+      alert(t('recharge_failed') + e.message);
+    } finally {
+      document.getElementById('rechargeGoBtn').disabled = false;
+      document.getElementById('rechargeGoBtn').textContent = t('go_recharge');
+    }
+  }
+
+  // ---------- 确认支付（关闭二维码后执行）----------
+  async function confirmPayment() {
+    if (!localStorage.getItem(TOKEN_KEY) || !rechargeOrderNo) return;
+    
+    document.getElementById('rechargeCloseQrBtn').disabled = true;
+    document.getElementById('rechargeCloseQrBtn').textContent = t('processing');
+    
+    try {
+      const resp = await apiFetch('/api/payment/' + rechargeOrderNo + '/pay', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Idempotent-Key': rechargeIdempotentKey
+        }
+      });
+      if (!resp.ok) {
+        const err = await resp.json();
+        throw new Error(err.detail || t('pay_failed'));
+      }
+      const result = await resp.json();
+      
+      // 3. 切换到成功步骤
+      document.getElementById('rechargeStep2').style.display = 'none';
+      document.getElementById('rechargeStep3').style.display = 'block';
+      document.getElementById('rechargeCloseQrBtn').style.display = 'none';
+      document.getElementById('rechargeBackBtn').style.display = 'none';
+      document.getElementById('rechargeDoneBtn').style.display = 'inline-block';
+      
+      // 填充成功信息
+      const channelNames = {
+        'simulated_alipay': t('channel_alipay'),
+        'simulated_wxpay': t('channel_wxpay'),
+        'balance': t('channel_balance')
+      };
+      document.getElementById('successOrderNo').textContent = result.order_no;
+      document.getElementById('successAmount').textContent = '¥' + rechargeAmount.toFixed(2);
+      document.getElementById('successMethod').textContent = channelNames[rechargeChannel] || rechargeChannel;
+      document.getElementById('successChannelNo').textContent = result.channel_order_no || '—';
+      document.getElementById('successTime').textContent = result.paid_at ? new Date(result.paid_at).toLocaleString() : new Date().toLocaleString();
+      document.getElementById('successBalance').textContent = '¥' + (result.current_balance || 0).toFixed(2);
+      
+      // 刷新钱包余额
+      refreshWallet();
+      
+    } catch (e) {
+      alert(t('pay_failed') + e.message);
+    } finally {
+      document.getElementById('rechargeCloseQrBtn').disabled = false;
+      document.getElementById('rechargeCloseQrBtn').textContent = t('close_pay');
+    }
+  }
+
+  // ---------- 打开交易流水弹窗 ----------
+  let txPage = 1;
+  let txFilter = '';
+  let txTotalPages = 1;
+
+  function openTxModal() {
+    txPage = 1;
+    txFilter = '';
+    document.getElementById('txOverlay').classList.add('show');
+    loadTxList();
+  }
+
+  function closeTxModal() {
+    document.getElementById('txOverlay').classList.remove('show');
+  }
+
+  async function loadTxList() {
+    if (!localStorage.getItem(TOKEN_KEY)) return;
+    
+    document.getElementById('txLoading').style.display = 'block';
+    document.getElementById('txList').innerHTML = '';
+    document.getElementById('txEmpty').style.display = 'none';
+    document.getElementById('txPagination').style.display = 'none';
+    
+    try {
+      let url = '/api/payment/transactions?page=' + txPage + '&page_size=20';
+      if (txFilter) url += '&tx_type=' + txFilter;
+      
+      const resp = await apiFetch(url);
+      if (!resp.ok) throw new Error(t('tx_load_failed'));
+      
+      const data = await resp.json();
+      document.getElementById('txLoading').style.display = 'none';
+      
+      if (!data.items || data.items.length === 0) {
+        document.getElementById('txEmpty').style.display = 'block';
+        return;
+      }
+      
+      txTotalPages = data.total_pages || 1;
+      
+      const list = document.getElementById('txList');
+      list.innerHTML = '';
+      
+      const typeNames = {
+        'recharge': t('tx_recharge'),
+        'consume': t('tx_consume'),
+        'refund': t('tx_refund'),
+        'fee': t('tx_fee'),
+        'transfer': t('tx_transfer')
+      };
+      const typeLabels = {
+        'recharge': t('tx_recharge'),
+        'consume': t('tx_consume'),
+        'refund': t('tx_refund'),
+        'fee': t('tx_fee'),
+        'transfer': t('tx_transfer')
+      };
+      
+      data.items.forEach(function(tx) {
+        const div = document.createElement('div');
+        div.className = 'tx-item';
+        
+        const amountClass = tx.tx_type === 'recharge' || tx.tx_type === 'refund' ? 'recharge' : 'consume';
+        const amountPrefix = tx.tx_type === 'recharge' || tx.tx_type === 'refund' ? '+' : '-';
+        
+        div.innerHTML = `
+          <span class="tx-icon">${typeLabels[tx.tx_type] || tx.tx_type}</span>
+          <div class="tx-info">
+            <div class="tx-type">${typeNames[tx.tx_type] || tx.tx_type}</div>
+            <div class="tx-time">${tx.remark || ''} · ${tx.created_at ? new Date(tx.created_at).toLocaleString() : ''}</div>
+          </div>
+          <div class="tx-amount ${amountClass}">${amountPrefix}¥${Math.abs(tx.amount).toFixed(2)}</div>
+        `;
+        list.appendChild(div);
+      });
+      
+      // 分页
+      const pageInfo = document.getElementById('txPageInfo');
+      pageInfo.textContent = txPage + '/' + txTotalPages;
+      document.getElementById('txPrevBtn').style.display = txPage > 1 ? 'inline-block' : 'none';
+      document.getElementById('txNextBtn').style.display = txPage < txTotalPages ? 'inline-block' : 'none';
+      document.getElementById('txPagination').style.display = 'block';
+      
+    } catch (e) {
+      document.getElementById('txLoading').style.display = 'none';
+      document.getElementById('txList').innerHTML = '<div style="text-align:center;padding:20px;color:#ef4444;">' + t('load_failed') + e.message + '</div>';
+    }
+  }
+
+  // ---------- 支付事件绑定 ----------
+  document.addEventListener('DOMContentLoaded', function() {
+    // 钱包按钮
+    document.getElementById('walletBtn').addEventListener('click', openRechargeModal);
+    
+    // 移动端：设置按钮（替代原充值/流水入口）
+    var mobileSettingsBtn = document.getElementById('mobileSettingsBtn');
+    if (mobileSettingsBtn) mobileSettingsBtn.addEventListener('click', function() { closeMobileMenu(); setTimeout(openSettings, 300); });
+    
+    // 充值弹窗内：交易流水入口（钱包统一入口）
+    var rechargeTxEntryBtn = document.getElementById('rechargeTxEntryBtn');
+    if (rechargeTxEntryBtn) rechargeTxEntryBtn.addEventListener('click', function() { closeRechargeModal(); setTimeout(openTxModal, 200); });
+    
+    // 充值金额选择
+    document.querySelectorAll('#amountGrid button').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        document.querySelectorAll('#amountGrid button').forEach(function(b) { b.classList.remove('selected'); });
+        this.classList.add('selected');
+        rechargeAmount = parseFloat(this.getAttribute('data-amount'));
+      });
+    });
+    
+    // 支付渠道选择
+    document.querySelectorAll('#channelList .channel-option').forEach(function(opt) {
+      opt.addEventListener('click', function() {
+        document.querySelectorAll('#channelList .channel-option').forEach(function(o) { o.classList.remove('selected'); });
+        this.classList.add('selected');
+        rechargeChannel = this.getAttribute('data-channel');
+      });
+    });
+    
+    // 充值弹窗按钮
+    document.getElementById('rechargeGoBtn').addEventListener('click', executeRecharge);
+    document.getElementById('rechargeCloseQrBtn').addEventListener('click', confirmPayment);
+    document.getElementById('rechargeDoneBtn').addEventListener('click', closeRechargeModal);
+    document.getElementById('rechargeCancelBtn').addEventListener('click', closeRechargeModal);
+    document.getElementById('rechargeCloseBtn').addEventListener('click', closeRechargeModal);
+    document.getElementById('rechargeBackBtn').addEventListener('click', function() {
+      // 返回到步骤1
+      document.getElementById('rechargeStep2').style.display = 'none';
+      document.getElementById('rechargeStep1').style.display = 'block';
+      document.getElementById('rechargeGoBtn').style.display = 'inline-block';
+      document.getElementById('rechargeCloseQrBtn').style.display = 'none';
+      document.getElementById('rechargeBackBtn').style.display = 'none';
+      document.getElementById('rechargeCancelBtn').style.display = 'inline-block';
+    });
+    
+    // 交易流水弹窗
+    document.getElementById('txCloseBtn').addEventListener('click', closeTxModal);
+    document.querySelectorAll('.tx-filter-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        document.querySelectorAll('.tx-filter-btn').forEach(function(b) {
+          b.style.background = 'var(--bg-body)';
+          b.style.color = 'var(--text-secondary)';
+        });
+        this.style.background = 'var(--primary)';
+        this.style.color = '#fff';
+        txFilter = this.getAttribute('data-filter') || '';
+        txPage = 1;
+        loadTxList();
+      });
+    });
+    document.getElementById('txPrevBtn').addEventListener('click', function() {
+      if (txPage > 1) { txPage--; loadTxList(); }
+    });
+    document.getElementById('txNextBtn').addEventListener('click', function() {
+      if (txPage < txTotalPages) { txPage++; loadTxList(); }
+    });
+    
+    // 关闭流水弹窗点击背景
+    document.getElementById('txOverlay').addEventListener('click', function(e) {
+      if (e.target === this) closeTxModal();
+    });
+    document.getElementById('rechargeOverlay').addEventListener('click', function(e) {
+      if (e.target === this) closeRechargeModal();
+    });
+
+    // 设置弹窗
+    var settingsBtn = document.getElementById('settingsBtn');
+    if (settingsBtn) settingsBtn.addEventListener('click', openSettings);
+    var settingsCloseBtn = document.getElementById('settingsCloseBtn');
+    if (settingsCloseBtn) settingsCloseBtn.addEventListener('click', closeSettings);
+    var settingsOverlay = document.getElementById('settingsOverlay');
+    if (settingsOverlay) settingsOverlay.addEventListener('click', function(e) {
+      if (e.target === this) closeSettings();
+    });
+    var pwdSaveBtn = document.getElementById('pwdSaveBtn');
+    if (pwdSaveBtn) pwdSaveBtn.addEventListener('click', savePassword);
+    document.getElementById('pwdNewInput').addEventListener('keydown', function(e) { if (e.key === 'Enter') savePassword(); });
+    document.getElementById('pwdConfirmInput').addEventListener('keydown', function(e) { if (e.key === 'Enter') savePassword(); });
+    var langZhBtn = document.getElementById('langZhBtn');
+    var langEnBtn = document.getElementById('langEnBtn');
+    if (langZhBtn) langZhBtn.addEventListener('click', function() { applyLang('zh'); });
+    if (langEnBtn) langEnBtn.addEventListener('click', function() { applyLang('en'); });
+    // 初始化语言
+    applyLang(currentLang);
+
+    // 评分弹窗
+    var ratingCloseBtn = document.getElementById('ratingCloseBtn');
+    if (ratingCloseBtn) ratingCloseBtn.addEventListener('click', closeRatingModal);
+    var ratingOverlay = document.getElementById('ratingOverlay');
+    if (ratingOverlay) ratingOverlay.addEventListener('click', function(e) {
+      if (e.target === this) closeRatingModal();
+    });
+
+    // 绑定手机号弹窗（GitHub 试用额度解锁）— 仅"绑定"或"暂不绑定"可关闭，无 ✕ 按钮/点背景关闭
+    var bindPhoneSendBtn = document.getElementById('bindPhoneSendCodeBtn');
+    if (bindPhoneSendBtn) bindPhoneSendBtn.addEventListener('click', bindPhoneSendCode);
+    var bindPhoneSubmitBtn = document.getElementById('bindPhoneSubmitBtn');
+    if (bindPhoneSubmitBtn) bindPhoneSubmitBtn.addEventListener('click', bindPhoneSubmit);
+    var bindPhoneSkipBtn = document.getElementById('bindPhoneSkipBtn');
+    if (bindPhoneSkipBtn) bindPhoneSkipBtn.addEventListener('click', closeBindPhoneModal);
+    // 剩余提问次数徽标：点击打开绑定引导
+    var quotaBadgeEl = document.getElementById('quotaBadge');
+    if (quotaBadgeEl) quotaBadgeEl.addEventListener('click', function() { openBindPhoneModal(t('bind_phone_trial_tip')); });
+    var bindPhoneInputEl = document.getElementById('bindPhoneInput');
+    var bindPhoneCodeEl = document.getElementById('bindPhoneCodeInput');
+    if (bindPhoneInputEl) bindPhoneInputEl.addEventListener('keydown', function(e) { if (e.key === 'Enter') bindPhoneSendCode(); });
+    if (bindPhoneCodeEl) bindPhoneCodeEl.addEventListener('keydown', function(e) { if (e.key === 'Enter') bindPhoneSubmit(); });
+    document.querySelectorAll('#ratingStars .rate-star').forEach(function(s) {
+      // 悬停预览
+      s.addEventListener('mouseenter', function() {
+        var star = parseInt(this.getAttribute('data-star'), 10);
+        document.querySelectorAll('#ratingStars .rate-star').forEach(function(x) {
+          var xs = parseInt(x.getAttribute('data-star'), 10);
+          x.style.color = xs <= star ? '#f5b301' : '#ddd';
+        });
+      });
+      // 点击提交评分
+      s.addEventListener('click', function() {
+        var star = parseInt(this.getAttribute('data-star'), 10);
+        document.querySelectorAll('#ratingStars .rate-star').forEach(function(x) {
+          var xs = parseInt(x.getAttribute('data-star'), 10);
+          x.style.color = xs <= star ? '#f5b301' : '#ddd';
+          if (xs <= star) x.classList.add('selected');
+        });
+        submitRating(star);
+      });
+    });
+  });
+
+  // 登录成功后刷新钱包
+  const origShowApp = showApp;
+  showApp = function() {
+    origShowApp.apply(this, arguments);
+    refreshWallet();
+    // 每30秒刷新余额
+    setInterval(refreshWallet, 30000);
+    // 异步获取用户名并保存（用于设置弹窗显示账号）
+    if (localStorage.getItem(TOKEN_KEY) && !localStorage.getItem('travel_username')) {
+      apiFetch('/api/user/profile').then(function(resp) {
+        if (resp.ok) return resp.json();
+        return null;
+      }).then(function(data) {
+        if (data && data.username) localStorage.setItem('travel_username', data.username);
+      }).catch(function() {});
+    }
+  };
+
+  // ---------- 页面初始化 ----------
+  (function init() {
+    const urlParams = new URLSearchParams(window.location.search);
+    const tokenFromUrl = urlParams.get('token');
+    const error = urlParams.get('error');
+
+    if (error) {
+      alert(t('login_failed_2') + error);
+    }
+
+    if (tokenFromUrl) {
+      localStorage.setItem(TOKEN_KEY, tokenFromUrl);
+      const refreshFromUrl = urlParams.get('refresh_token');
+      if (refreshFromUrl) localStorage.setItem(REFRESH_KEY, refreshFromUrl);
+      window.history.replaceState({}, document.title, window.location.pathname);
+      showApp();
+      loadSessions();
+      inputEl.focus();
+      // GitHub 首次登录且处于试用受限 → 即时弹绑定手机号引导（试用说明，非"已用完"）
+      if (urlParams.get('quota_limited') === '1') {
+        setTimeout(function() { openBindPhoneModal(t('bind_phone_trial_tip')); }, 400);
+      }
+      refreshQuotaBadge();
+      return;
+    }
+
+    const savedToken = localStorage.getItem(TOKEN_KEY);
+    if (savedToken) {
+      showApp();
+      updateModeUI();
+      loadSessions();
+      inputEl.focus();
+      refreshQuotaBadge();
+
+      // 静默续期：每次访问自动延长登录状态（无需手动登录）
+      refreshToken();
+
+      // 检测从地图页带回的自动 prompt
+      const autoPrompt = localStorage.getItem('travel_auto_prompt');
+      if (autoPrompt) {
+        // 地图是旅行功能：返回时强制切回旅行模式，避免行程 prompt 发到求职助手
+        if (currentMode !== 'travel') {
+          currentMode = 'travel';
+          updateModeUI();
+        }
+        localStorage.removeItem('travel_auto_prompt');
+        setTimeout(() => {
+          inputEl.value = autoPrompt;
+          sendMessage();
+        }, 500);
+      }
+
+      // 浏览器定位（获取用户城市）
+      initGeolocation();
+    } else {
+      showLogin();
+    }
+  })();
+
+  // ============================================================
+  // 主题切换系统
+  // ============================================================
+  (function initTheme() {
+    const saved = localStorage.getItem('travel_theme') || 'classic';
+    document.body.setAttribute('data-theme', saved);
+    // Apply active state to both PC and mobile theme buttons
+    document.querySelectorAll('.theme-btn-pc, .theme-btn-mb').forEach(function(btn) {
+      btn.classList.toggle('active', btn.getAttribute('data-theme') === saved);
+      btn.addEventListener('click', function() {
+        const theme = this.getAttribute('data-theme');
+        document.body.setAttribute('data-theme', theme);
+        localStorage.setItem('travel_theme', theme);
+        document.querySelectorAll('.theme-btn-pc, .theme-btn-mb').forEach(function(b) { b.classList.remove('active'); });
+        document.querySelectorAll('.theme-btn-pc, .theme-btn-mb').forEach(function(b) {
+          if (b.getAttribute('data-theme') === theme) b.classList.add('active');
+        });
+      });
+    });
+  })();
+
+})();
+</script>
+</body>
+</html>

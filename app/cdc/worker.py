@@ -49,13 +49,14 @@ class CdcWorker:
         ok = await redis.set(LOCK_KEY, token, nx=True, ex=LOCK_TTL)
         return token if ok is True else None
 
-    async def _renew_lock(self, redis, token: str):
-        """续期锁（Lua 校验 token：仅持有者能续，防误续他人锁，P1 #5）"""
+    async def _renew_lock(self, redis, token: str) -> bool:
+        """续期锁（Lua 校验 token：仅持有者能续，防误续他人锁，P1 #5）；返回是否仍持有（P1 #43）"""
         lua = (
             "if redis.call('get', KEYS[1]) == ARGV[1] then "
             "return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end"
         )
-        await redis.eval(lua, 1, LOCK_KEY, token, LOCK_TTL)
+        ok = await redis.eval(lua, 1, LOCK_KEY, token, LOCK_TTL)
+        return ok == 1
 
     async def _poll_once(self, pool) -> int:
         """拉取一批新事件并落盘，返回处理条数"""
@@ -144,7 +145,12 @@ class CdcWorker:
 
                     now = time.time()
                     if now - self._last_renew > LOCK_TTL / 2:
-                        await self._renew_lock(redis, self._lock_token)
+                        if not await self._renew_lock(redis, self._lock_token):
+                            # 锁已丢失（过期被其它实例接管）：立即停止消费退回竞选，防双写（P1 #43）
+                            logger.warning("CDC leader 锁续期失败（已被接管或过期），停止消费并重新竞选")
+                            self._lock_ok = False
+                            self._lock_token = None
+                            continue
                         self._last_renew = now
 
                     try:
@@ -176,5 +182,5 @@ class CdcWorker:
         try:
             await self.journal.save_checkpoint(self.last_id)
         except Exception as e:
-            logger.warning(f"⚠️ CDC checkpoint 保存失败: {e}")
+            logger.warning(f"CDC checkpoint 保存失败: {e}")
         self.journal.close()

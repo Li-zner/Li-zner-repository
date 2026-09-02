@@ -1,0 +1,16 @@
+route:
+  group_by: ['alertname']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  receiver: 'email-admin'
+
+receivers:
+- name: 'email-admin'
+  email_configs:
+  - to: '1270345165@qq.com'
+    from: '1270345165@qq.com'
+    smarthost: 'smtp.qq.com:587'
+    auth_username: '1270345165@qq.com'
+    auth_password: 'gvmtffkobvpyhaaf'
+    require_tls: true

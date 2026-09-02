@@ -36,7 +36,7 @@ if _HAS_PIL:
         from rapidocr_onnxruntime import RapidOCR
         _RAPID_ENGINE = RapidOCR()
         _HAS_RAPID = True
-        logger.info("✅ RapidOCR 引擎已就绪")
+        logger.info("RapidOCR 引擎已就绪")
     except Exception as e:
         logger.warning(f"RapidOCR 加载失败（将使用 Tesseract 降级）: {e}")
 
@@ -303,7 +303,7 @@ async def parse_document(filepath: str, filename: str) -> dict:
     返回: {"text": str, "format": str, "pages": int, "success": bool}
     """
     ext = os.path.splitext(filename)[1].lower()
-    logger.info(f"📄 解析文档: {filename} (ext={ext})")
+    logger.info(f"解析文档: {filename} (ext={ext})")
 
     if ext == '.pdf':
         text = await parse_pdf(filepath)

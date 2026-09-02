@@ -381,7 +381,7 @@ class AgentOrchestrator:
             opinions[agent_id] = result
             self.board.add_phase1_opinion(agent_id, result)
 
-        logger.info(f"🧠 Phase 1 完成: {len(opinions)} 个 Agent 发表意见")
+        logger.info(f"Phase 1 完成: {len(opinions)} 个 Agent 发表意见")
         return opinions
 
     async def run_phase2(self) -> Dict[str, dict]:
@@ -420,7 +420,7 @@ class AgentOrchestrator:
             reviews[agent_id] = result
             self.board.add_phase2_review(agent_id, result)
 
-        logger.info(f"🔄 Phase 2 完成: {len(reviews)} 个 Agent 交叉审阅")
+        logger.info(f"Phase 2 完成: {len(reviews)} 个 Agent 交叉审阅")
         return reviews
 
     async def run(self, enable_phase2: bool = False) -> str:
@@ -437,7 +437,7 @@ class AgentOrchestrator:
         if enable_phase2:
             await self.run_phase2()
         summary = self.board.get_discussion_summary()
-        logger.info(f"✅ 多 Agent 讨论完成，摘要长度={len(summary)}")
+        logger.info(f"多 Agent 讨论完成，摘要长度={len(summary)}")
         return summary
 
     def get_summary(self) -> str:

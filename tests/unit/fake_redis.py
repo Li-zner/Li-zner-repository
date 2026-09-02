@@ -20,6 +20,11 @@ class FakeRedis:
     async def get(self, key):
         return self._data.get(key)
 
+    async def setex(self, key, ttl, value):
+        # 离线模拟不实现 TTL 过期（单测不跨 TTL 断言），仅落地值
+        self._data[key] = value
+        return True
+
     async def delete(self, key):
         self._data.pop(key, None)
 
@@ -46,6 +51,19 @@ class FakeRedis:
                 self._data[curr_key] = curr + 1
                 return 1
             return 0
+        # ---- 并发槽位释放 Lua（原子递减下限归零，P0 #41）----
+        if "DECR" in script:
+            key = args[0]
+            v = int(self._data.get(key, 0))
+            if v <= 1:
+                self._data.pop(key, None)
+                return 0
+            self._data[key] = v - 1
+            return 1
+        # ---- CDC leader 锁续期 Lua（校验 token 后 expire）----
+        if "expire" in script:
+            key, token = args[0], args[1]
+            return 1 if self._data.get(key) == token else 0
         # ---- 分布式锁 Lua（条件删除）----
         key, token = args[0], args[1]
         if self._data.get(key) == token:

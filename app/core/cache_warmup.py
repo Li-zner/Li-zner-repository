@@ -54,15 +54,15 @@ async def warmup_semantic_cache():
     启动预热：将高频查询写入语义缓存。
     有标准答案的直接写入；需要工具查询的标记待首次命中后自动填充。
     """
-    logger.info("🔥 开始预热语义缓存...")
+    logger.info("开始预热语义缓存...")
 
     # 先写入有标准答案的
     for query, answer in _HOT_ANSWERS.items():
         try:
             await SemanticCache.set(query, answer)
-            logger.info(f"  ✅ 预热缓存: {query[:30]}")
+            logger.info(f"  预热缓存: {query[:30]}")
         except Exception as e:
-            logger.warning(f"  ⚠️ 预热失败: {query[:30]} - {e}")
+            logger.warning(f"  预热失败: {query[:30]} - {e}")
 
     # 其余查询标记为"待预热"——首次命中后自动替换为真实结果
     for query, _ in _HOT_QUERIES:
@@ -73,10 +73,10 @@ async def warmup_semantic_cache():
             cached = await SemanticCache.get(query)
             if cached is None:
                 # 写入占位标记，首次访问时会被真实结果覆盖
-                placeholder = f"🔮 正在为您查询「{query}」的最新信息，请稍候..."
+                placeholder = f"正在为您查询「{query}」的最新信息，请稍候..."
                 await SemanticCache.set(query, placeholder)
-                logger.info(f"  📝 标记预热: {query[:30]}")
+                logger.info(f"  标记预热: {query[:30]}")
         except Exception as e:
-            logger.warning(f"  ⚠️ 标记失败: {query[:30]} - {e}")
+            logger.warning(f"  标记失败: {query[:30]} - {e}")
 
-    logger.info(f"✅ 语义缓存预热完成，共处理 {len(_HOT_ANSWERS) + len(_HOT_QUERIES)} 条")
+    logger.info(f"语义缓存预热完成，共处理 {len(_HOT_ANSWERS) + len(_HOT_QUERIES)} 条")

@@ -379,7 +379,7 @@ async def handle_simple_task(
             {"role": "assistant", "content": final_answer}
         )
         asyncio.create_task(SemanticCache.set(user_query, final_answer, cache_ctx=cache_ctx))
-        logger.info(f"✅ 简单任务完成: task_id={task_id}, agent={agent_name}")
+        logger.info(f"简单任务完成: task_id={task_id}, agent={agent_name}")
 
     except Exception as e:
         logger.error(f"简单任务异常: {e}", exc_info=True)
@@ -475,7 +475,7 @@ def _build_simple_prompt(query: str, agent_name: str, tool_result: dict,
     # 注入工具结果
     system += (
         f"\n\n你使用工具 [{agent_name}] 查询到了以下结果。\n\n"
-        f"## 🚨 核心规则（必须遵守）\n"
+        f"## 核心规则（必须遵守）\n"
         f"1. **禁止编造**：只能基于工具返回的数据回答，不能编造任何具体数据（价格、距离、气温、评分等）\n"
         f"2. **先推荐再追问**：如果用户是求推荐，第一句就直接给推荐方案，不要反问\n"
         f"3. **数据不足时**：明确告诉用户哪些信息是工具提供的，哪些是估算的\n\n"

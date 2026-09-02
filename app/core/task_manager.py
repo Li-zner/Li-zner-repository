@@ -160,8 +160,12 @@ async def _persist_idempotent(key: str, task_id: str):
         pass
 
 
+# 占位值：表示同键请求正在创建任务（TTL 10s 自愈，创建方崩溃后自动过期）
+_CREATING = "__creating__"
+
+
 async def try_idempotent(session_id: str, msg: str) -> Optional[str]:
-    """幂等检查：返回已有 task_id 或 None（Redis 读，异常时返回 None 容错）"""
+    """幂等检查：返回已有 task_id 或 None（保留供旧模块/单测使用；新代码用 claim_idempotency）"""
     key = _idempotent_key(session_id, msg)
     try:
         r = await _redis()
@@ -173,6 +177,52 @@ async def try_idempotent(session_id: str, msg: str) -> Optional[str]:
         if task and task["status"] in ("pending", "generating"):
             return task_id
     return None
+
+
+async def claim_idempotency(session_id: str, msg: str, wait_s: float = 1.0) -> Optional[str]:
+    """原子占位幂等键（SET NX，P1 #42 修复原 GET→创建→SETEX 检查后行动竞态）
+
+    返回：None=占位成功（调用方继续创建任务）；其余=可复用的 task_id。
+    旧实现两次请求都通过 GET 检查 → 各自建任务；现在首个请求原子占位，
+    后续请求等待读取真实 task_id 复用。等待超时（创建方可能崩溃）按未占位
+    处理退化为原并发语义，TTL 自动清理；Redis 异常同样返回 None（尽力而为）。
+    """
+    key = f"{_IDEMPOTENT_PREFIX}{_idempotent_key(session_id, msg)}"
+    try:
+        r = await _redis()
+        claimed = await r.set(key, _CREATING, nx=True, ex=10)
+        if claimed:
+            return None
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            v = await r.get(key)
+            v = v.decode() if isinstance(v, bytes) else v
+            if v and v != _CREATING:
+                task = await get_task(v)
+                if task and task["status"] in ("pending", "generating"):
+                    return v
+                return None  # 旧任务已完结：放行走新建（save_idempotent 会覆盖映射）
+            await asyncio.sleep(0.05)
+        return None  # 创建方超时未写入：按未占位处理（TTL 自愈）
+    except Exception:
+        return None
+
+
+# 释放占位（条件删除）：仅当仍是 __creating__ 才删，防止误删他人已写入的 task_id
+_RELEASE_CLAIM_LUA = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('del', KEYS[1]) else return 0 end"
+)
+
+
+async def release_idempotency_claim(session_id: str, msg: str):
+    """释放未成功创建任务的幂等占位（槽位满了/任务创建失败时恢复可重试）"""
+    key = f"{_IDEMPOTENT_PREFIX}{_idempotent_key(session_id, msg)}"
+    try:
+        r = await _redis()
+        await r.eval(_RELEASE_CLAIM_LUA, 1, key, _CREATING)
+    except Exception:
+        pass  # 释放失败仅影响短暂等待（TTL 自愈），不影响主流程
 
 
 def save_idempotent(session_id: str, msg: str, task_id: str):

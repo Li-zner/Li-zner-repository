@@ -206,11 +206,11 @@ async def get_channels() -> list:
     # DB 无渠道配置时回退默认（记录日志便于排查，P2 #39 防静默降级掩盖异常）
     logger.warning("payment_channels 表无数据，回退到硬编码默认渠道")
     return [
-        {"channel_code": "balance", "channel_name": "余额支付", "icon": "💰",
+        {"channel_code": "balance", "channel_name": "余额支付", "icon": "",
          "is_active": True, "fee_rate": 0, "min_amount": 0.01, "max_amount": 999999, "sort_order": 0},
-        {"channel_code": "simulated_alipay", "channel_name": "模拟支付宝", "icon": "💳",
+        {"channel_code": "simulated_alipay", "channel_name": "模拟支付宝", "icon": "",
          "is_active": True, "fee_rate": 0, "min_amount": 0.01, "max_amount": 999999, "sort_order": 1},
-        {"channel_code": "simulated_wxpay", "channel_name": "模拟微信支付", "icon": "📱",
+        {"channel_code": "simulated_wxpay", "channel_name": "模拟微信支付", "icon": "",
          "is_active": True, "fee_rate": 0, "min_amount": 0.01, "max_amount": 999999, "sort_order": 2},
     ]
 

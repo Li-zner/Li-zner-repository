@@ -34,7 +34,7 @@ async def delete_conversation(
                 username, conversation_id
             )
             deleted_count = result.split()[-1]  # "DELETE X" → "X"
-            logger.info(f"🗑️ 删除对话消息: user={username}, conv={conversation_id}, deleted={deleted_count}")
+            logger.info(f"删除对话消息: user={username}, conv={conversation_id}, deleted={deleted_count}")
 
             # 2. 清除画像（Bug #4 修复）：画像可能由多个对话共同生成，
             # 删单个对话不能连带清空。仅当用户已无任何对话（画像成孤儿）才清理。
@@ -47,7 +47,7 @@ async def delete_conversation(
                     "DELETE FROM user_profiles WHERE user_id = $1",
                     username
                 )
-                logger.info(f"🗑️ 已清除用户画像（用户已无对话）: user={username}")
+                logger.info(f"已清除用户画像（用户已无对话）: user={username}")
             else:
                 logger.info(f"保留用户画像（用户仍有其他对话）: user={username}")
     except Exception as e:
@@ -58,7 +58,7 @@ async def delete_conversation(
     try:
         r = await get_redis()
         await r.delete(f"conv:{conversation_id}")
-        logger.info(f"🗑️ 已清除 Redis 缓存: conv:{conversation_id}")
+        logger.info(f"已清除 Redis 缓存: conv:{conversation_id}")
     except Exception as e:
         logger.warning(f"Redis 缓存清除失败（不影响主流程）: {e}")
 

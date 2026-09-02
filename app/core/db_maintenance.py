@@ -33,7 +33,7 @@ async def compress_old_conversations():
     """
     pool = await get_pool()
     cutoff = datetime.now() - timedelta(days=COMPRESS_AFTER_DAYS)
-    logger.info(f"🗜️ 开始压缩 {cutoff.date()} 之前的对话记忆...")
+    logger.info(f"开始压缩 {cutoff.date()} 之前的对话记忆...")
 
     async with pool.acquire() as conn:
         # 获取需要压缩的对话列表（分组统计）
@@ -47,7 +47,7 @@ async def compress_old_conversations():
         """, cutoff)
 
         if not rows:
-            logger.info("✅ 没有需要压缩的对话记忆")
+            logger.info("没有需要压缩的对话记忆")
             return
 
         total_compressed = 0
@@ -88,18 +88,20 @@ async def compress_old_conversations():
                 "full_text": "\n".join([f"{m['role']}: {m['content']}" for m in msg_rows])
             }, ensure_ascii=False)
 
-            # 删除原始详细记录
-            await conn.execute("""
-                DELETE FROM conversation_memories
-                WHERE user_id=$1 AND conversation_id=$2 AND created_at < $3
-            """, row["user_id"], row["conversation_id"], cutoff)
+            # 原子压缩：DELETE 与 INSERT 必须同事务（P0 #44），中断时回滚防对话数据丢失
+            async with conn.transaction():
+                # 删除原始详细记录
+                await conn.execute("""
+                    DELETE FROM conversation_memories
+                    WHERE user_id=$1 AND conversation_id=$2 AND created_at < $3
+                """, row["user_id"], row["conversation_id"], cutoff)
 
-            # 插入压缩后的摘要记录
-            await conn.execute("""
-                INSERT INTO conversation_memories
-                (user_id, conversation_id, role, content, created_at)
-                VALUES ($1, $2, 'system', $3, $4)
-            """, row["user_id"], row["conversation_id"], compressed_content, row["last_msg"])
+                # 插入压缩后的摘要记录
+                await conn.execute("""
+                    INSERT INTO conversation_memories
+                    (user_id, conversation_id, role, content, created_at)
+                    VALUES ($1, $2, 'system', $3, $4)
+                """, row["user_id"], row["conversation_id"], compressed_content, row["last_msg"])
 
             total_compressed += msg_count
 
@@ -107,7 +109,7 @@ async def compress_old_conversations():
             if total_compressed % (BATCH_SIZE * 5) == 0:
                 await asyncio.sleep(0.1)
 
-        logger.info(f"✅ 对话压缩完成，共压缩 {total_compressed} 条消息，{len(rows)} 个对话")
+        logger.info(f"对话压缩完成，共压缩 {total_compressed} 条消息，{len(rows)} 个对话")
 
 
 async def clean_expired_profiles():
@@ -123,7 +125,7 @@ async def clean_expired_profiles():
             WHERE updated_at < $1
         """, cutoff)
         deleted = result.split()[-1] if result else "0"
-        logger.info(f"🧹 清理过期用户画像: {deleted} 条")
+        logger.info(f"清理过期用户画像: {deleted} 条")
 
 
 async def clean_stale_cache():
@@ -139,7 +141,7 @@ async def clean_stale_cache():
             WHERE created_at < $1 AND hit_count < 2
         """, cutoff)
         deleted = result.split()[-1] if result else "0"
-        logger.info(f"🧹 清理低频语义缓存: {deleted} 条")
+        logger.info(f"清理低频语义缓存: {deleted} 条")
 
 
 async def ensure_indexes():
@@ -166,12 +168,12 @@ async def ensure_indexes():
             CREATE INDEX IF NOT EXISTS idx_semantic_cache_created
             ON semantic_cache (created_at)
         """)
-        logger.info("🗄️ 数据库索引已确保")
+        logger.info("数据库索引已确保")
 
 
 async def run_maintenance():
     """执行全部维护任务"""
-    logger.info("🔄 开始数据库维护...")
+    logger.info("开始数据库维护...")
     try:
         await ensure_indexes()
         await compress_old_conversations()
@@ -184,14 +186,14 @@ async def run_maintenance():
             await recover_stale_processing(age_seconds=300)
         except Exception as e:
             logger.warning(f"支付订单恢复跳过（不影响其他维护）: {e}")
-        logger.info("✅ 数据库维护完成")
+        logger.info("数据库维护完成")
     except Exception as e:
-        logger.error(f"❌ 数据库维护失败: {e}", exc_info=True)
+        logger.error(f"数据库维护失败: {e}", exc_info=True)
 
 
 async def maintenance_loop(interval_hours: int = 24):
     """定时维护循环"""
     while True:
         await run_maintenance()
-        logger.info(f"⏰ 下次维护在 {interval_hours} 小时后")
+        logger.info(f"下次维护在 {interval_hours} 小时后")
         await asyncio.sleep(interval_hours * 3600)

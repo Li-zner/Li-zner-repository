@@ -1,0 +1,115 @@
+# ============================================================
+# agent_gateway .gitignore
+# 原则：密钥、数据、备份、本地产物一律不进版本库
+# ============================================================
+
+# ---------- 密钥与配置（绝不提交） ----------
+.env
+.env.*
+!.env.example
+!.env.lite.example
+*.env
+etc/
+login*.json
+*.pem
+*.key
+*.p12
+*.jks
+secrets*.json
+*_secret*.json
+*_credentials*.json
+
+# ---------- 数据库备份与数据 ----------
+backups/
+*.sql
+*.sql.gz
+*.dump
+*.dmp
+# CDC 建表参考脚本需要入库（例外）
+!scripts/cdc_setup.sql
+*.tar.gz
+*.tgz
+*.db
+*.sqlite
+*.sqlite3
+backup.log
+*.log
+tempo_data/
+uploads/
+agent_gateway.tar.gz
+
+# ---------- CDC 变更日志（落盘 SSD） ----------
+cdc_journal/
+
+# ---------- Python ----------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------- 命令/系统产物 ----------
+start
+nul
+-d
+-H
+exporter.log
+*.exe
+*.bin
+
+# ---------- 前端构建产物 ----------
+node_modules/
+dist/
+*.min.js.map
+
+# ---------- IDE / 编辑器 ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+.wiki/.obsidian/
+
+# ---------- Office 临时文件 ----------
+~$*.docx
+~$*.doc
+~$*.xlsx
+~$*.pptx
+
+# ---------- 根目录一次性调试脚本（不入库，展示目录保持干净） ----------
+/test_bugs.py
+/test_cc001_fix.py
+/test_comprehensive.py
+/test_cross_domain.py
+/test_fast.py
+/test_fastpath.py
+/test_final.py
+/test_fresh.py
+/test_memory.py
+/test_route_fix.py
+/test_routes.py
+/test_routing.py
+/test_stream.py
+/debug_routes.py
+/test_upload.txt
+/start
+
+# ---------- 安全：含密钥的知识文件（需人工脱敏后解除忽略） ----------
+.wiki/20-AI-Memory/陷阱与模糊点.md
+
+
+
+# 简历（仅 AI后端开发 版入库展示，其余本地保留；由 scripts/gen_resume.py 本地生成）
+/黎忠南简历*.docx
+!/黎忠南简历-AI后端开发.docx
+
+# 本地权限/个人配置（含 ssh 允许，不入库）
+.claude/settings.local.json

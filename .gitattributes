@@ -1,0 +1,10 @@
+# Shell 脚本必须保持 LF 换行（CRLF 会导致 bash 报错）
+*.sh text eol=lf
+*.bash text eol=lf
+
+# nginx.conf 被 autoscale.sh 的 sed 动态维护，必须保持 LF（CRLF 不影响解析但干扰 sed）
+nginx.conf text eol=lf
+deploy/nginx.conf.lite text eol=lf
+
+# 其余文本文件按 Git 默认规则处理
+* text=auto

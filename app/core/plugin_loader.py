@@ -66,7 +66,7 @@ class PluginLoader:
                 manifest["_path"] = str(folder)
 
                 if not manifest.get("enabled", True):
-                    logger.info(f"🔌 插件已禁用: {manifest['name']}")
+                    logger.info(f"插件已禁用: {manifest['name']}")
                     continue
 
                 # 尝试加载 handler
@@ -82,8 +82,8 @@ class PluginLoader:
 
                 plugin = ToolPlugin(manifest, handler)
                 self._plugins[plugin.name] = plugin
-                status = "✅" if handler else "⚠️ (无handler)"
-                logger.info(f"🔌 加载插件: {plugin.name} - {plugin.description} {status}")
+                status = "" if handler else "(无handler)"
+                logger.info(f"加载插件: {plugin.name} - {plugin.description} {status}")
 
             except Exception as e:
                 logger.warning(f"加载插件 {folder.name} 失败: {e}")

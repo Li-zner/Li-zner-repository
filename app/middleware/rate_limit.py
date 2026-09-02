@@ -130,19 +130,24 @@ async def check_concurrent(username: str, role: str = "user") -> bool:
         return True
 
 
+# 释放：原子递减并下限归零。原 GET→DECR 两步在并发释放时会把计数打成负数（P0 #41）；
+# 脚本复用 可复用代码/分布式限流器+lua.py 的社区标准实现（v<=1 直接 DEL，杜绝零值残留）
+_CONCURRENT_RELEASE_LUA = """
+local v = tonumber(redis.call('GET', KEYS[1]) or '0')
+if v <= 1 then
+    redis.call('DEL', KEYS[1])
+    return 0
+end
+redis.call('DECR', KEYS[1])
+return 1
+"""
+
+
 async def release_concurrent(username: str):
-    """释放一个并发槽位（尽力而为，绝不向外抛异常，P2 #35）"""
+    """释放一个并发槽位（Lua 原子递减下限归零，杜绝 GET→DECR 并发竞态，P0 #41；尽力而为不抛异常 P2 #35）"""
     try:
         r = await get_redis()
-        key = f"concurrent:{username}"
-        current = await r.get(key)
-        cur = int(current) if current else 0
-        if cur > 0:
-            await r.decr(key)
-        elif cur <= 0:
-            # 零/负数强制重置，防计数永久残留（P2 #33）
-            logger.warning(f"并发计数异常（{cur}），重置为 0: {username}")
-            await r.set(key, 0, ex=30)
+        await r.eval(_CONCURRENT_RELEASE_LUA, 1, f"concurrent:{username}")
     except Exception:
         pass  # 释放失败仅影响并发统计，不覆盖业务异常
 

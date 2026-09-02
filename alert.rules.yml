@@ -1,0 +1,131 @@
+groups:
+  - name: gateway_alerts
+    interval: 30s
+    rules:
+      # ---------- 可用性与错误 ----------
+      # 1. 限流触发告警（1分钟内超过10次429）
+      - alert: RateLimitTriggered
+        expr: increase(gateway_requests_total{status="429"}[1m]) > 1
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "网关限流频繁触发"
+          description: "过去1分钟触发了 {{ $value }} 次限流，请检查是否遭受攻击或限流阈值过低。"
+
+      # 2. 接口错误率过高（5分钟内错误率 > 5%）—— SLO: 错误率 < 1%
+      - alert: HighErrorRate
+        expr: (sum(rate(gateway_requests_total{status=~"5.."}[5m])) / sum(rate(gateway_requests_total[5m]))) > 0.05
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "网关错误率过高"
+          description: "过去5分钟错误率超过5%（SLO 目标 <1%），请立即排查后端服务。"
+
+      # 3. 流量骤降（30分钟内请求量下降超过90%——疑似服务不可用/被阻断）
+      - alert: TrafficDropped
+        expr: |
+          sum(rate(gateway_requests_total[5m]))
+          / on() (sum(rate(gateway_requests_total[30m])) + 1) < 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "网关流量骤降"
+          description: "近5分钟请求量仅为30分钟均值的10%以下，疑似网关或入口故障。"
+
+      # 4. 慢请求：p95 响应耗时 > 10s（SLO: p95 < 5s）
+      - alert: P95LatencyHigh
+        expr: histogram_quantile(0.95, sum(rate(gateway_request_duration_seconds_bucket[5m])) by (le)) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 响应耗时过高"
+          description: "过去5分钟 p95 响应耗时超过 10s（SLO 目标 <5s），检查 LLM 或数据库延迟。"
+
+      # ---------- 成本与缓存 ----------
+      # 5. LLM token 消耗突增（30分钟消耗超过日均 3 倍——防 API Key 泄露/滥用）
+      - alert: LLMTokenSpike
+        expr: |
+          sum(increase(llm_tokens_total{type="input"}[30m]))
+          > (sum(increase(llm_tokens_total{type="input"}[1d])) / 48) * 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM token 消耗突增"
+          description: "近30分钟输入 token 消耗超过日均水平的3倍，检查是否 API Key 泄露或遭滥用。"
+
+      # 6. 缓存命中率过低（5分钟命中率 < 10%——缓存可能失效/被清）
+      - alert: CacheHitRateLow
+        expr: |
+          (sum(rate(semantic_cache_hits_total[5m])))
+          / (sum(rate(semantic_cache_hits_total[5m])) + sum(rate(semantic_cache_misses_total[5m])) + 1) < 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "语义缓存命中率过低"
+          description: "过去5分钟缓存命中率低于10%，检查是否缓存被清或阈值异常。"
+
+      # ---------- 支付与下游 ----------
+      # 7. 支付订单失败率过高（5分钟失败率 > 20%）
+      - alert: PaymentFailureHigh
+        expr: |
+          (sum(rate(payment_orders_total{status="failed"}[5m])))
+          / (sum(rate(payment_orders_total[5m])) + 1) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "支付失败率过高"
+          description: "过去5分钟支付失败率超过20%，检查支付渠道配置。"
+
+      # 8. 下游故障（LLM 调用错误率 > 30%）
+      - alert: LLMErrorRateHigh
+        expr: |
+          (sum(rate(llm_requests_total{status="error"}[5m])))
+          / (sum(rate(llm_requests_total[5m])) + 1) > 0.3
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LLM 调用错误率过高"
+          description: "过去5分钟 DeepSeek 调用错误率超过30%，检查 API Key 或模型服务状态。"
+
+      # ---------- 基础设施 ----------
+      # 9. 实例不健康（Docker HEALTHCHECK 由 docker 重启兜底，此处监控 nginx 侧）
+      - alert: GatewayInstanceDown
+        expr: |
+          (sum(rate(gateway_requests_total[2m])) == 0)
+          and on() (up{job="gateway"} == 0)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "网关实例疑似宕机"
+          description: "Prometheus 探针检测到网关实例不可达超过10分钟。"
+
+      # ---------- 异常聚合（自建，2026-08-11）----------
+      # 10. 未处理异常突增（5 分钟 > 5 次；可查 /api/admin/errors）
+      - alert: ExceptionRateHigh
+        expr: increase(app_exceptions_total[5m]) > 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "未处理异常突增"
+          description: "过去5分钟未处理异常 {{ $value }} 次，请查 /api/admin/errors 或 Redis errors:recent。"
+
+      # ---------- 慢查询（2026-08-11，指标来自 app 后台观测 pg_stat_statements）----------
+      # 11. 存在慢查询（mean_exec_time > 1s）持续 10 分钟
+      - alert: SlowQueryHigh
+        expr: app_slow_queries_total > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "数据库慢查询"
+          description: "存在 mean_exec_time>1s 的慢查询（当前 {{ $value }} 条），可查 pg_stat_statements 或运行 scripts/slow_query_monitor.py。"

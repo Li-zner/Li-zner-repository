@@ -85,7 +85,7 @@ async def rate_message(payload: RateMessageRequest, current_user: dict = Depends
             username, session_id, user_message, assistant_message
         )
         if existing is not None:
-            logger.info(f"⭐ 重复评分拦截: username={username}, 已评={existing}")
+            logger.info(f"重复评分拦截: username={username}, 已评={existing}")
             return {"message": "已评分，感谢你的评价！", "rating": existing, "already_rated": True}
         from asyncpg.exceptions import UniqueViolationError
         try:
@@ -103,9 +103,9 @@ async def rate_message(payload: RateMessageRequest, current_user: dict = Depends
                 "ORDER BY created_at DESC LIMIT 1",
                 username, session_id, user_message, assistant_message
             )
-            logger.info(f"⭐ 并发重复评分拦截: username={username}, 已评={existing}")
+            logger.info(f"并发重复评分拦截: username={username}, 已评={existing}")
             return {"message": "已评分，感谢你的评价！", "rating": existing, "already_rated": True}
-    logger.info(f"⭐ 消息评分: username={username}, rating={rating}")
+    logger.info(f"消息评分: username={username}, rating={rating}")
     return {"message": "感谢你的评价！", "rating": rating}
 
 

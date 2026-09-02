@@ -88,10 +88,20 @@ class MemoryManager:
         await self._trim_and_compress(redis)
 
     async def save_messages(self, user_msg: Dict, assistant_msg: Dict):
-        """双写：Redis（热，按条数保留） + PG（冷，全量落库）"""
+        """双写：Redis（热，按条数保留） + PG（冷，全量落库）  去重用户消息"""
         redis = await get_redis()
-        # 先写用户消息，再写助手消息，保持顺序
-        await redis.rpush(self._history_key, json.dumps(user_msg))
+        # 去重：流式开始时可能已 save_user_message；若末条已是同一用户消息则跳过，
+        # 避免完整对话历史里用户消息重复出现、污染 LLM 上下文（P1 修复）。
+        last = None
+        try:
+            last_raw = await redis.lindex(self._history_key, -1)
+            if last_raw is not None:
+                last = json.loads(last_raw)
+        except Exception:
+            pass
+        # 先写用户消息（除非已存在），再写助手消息，保持顺序
+        if last != user_msg:
+            await redis.rpush(self._history_key, json.dumps(user_msg))
         await redis.rpush(self._history_key, json.dumps(assistant_msg))
         await redis.expire(self._history_key, HISTORY_TTL)
         await self._trim_and_compress(redis)

@@ -106,10 +106,10 @@ def _law_mapping_check(query):
         from .law_mapping import check_query as _check_law
         _match = _check_law(query)
         if _match:
-            logger.info(f"⚖️ 法律映射表命中 #{_match['id']}: {_match['scenario']} → {_match['law']}")
+            logger.info(f"法律映射表命中 #{_match['id']}: {_match['scenario']} → {_match['law']}")
             return {
                 "results": [{
-                    "heading": "⚠️ 该问题不属于民法典调整范围",
+                    "heading": "该问题不属于民法典调整范围",
                     "content": _match["message"],
                     "similarity": 1.0,
                     "is_law_mapping": True,
@@ -209,7 +209,7 @@ async def search_knowledge(query: str, top_k: int = 5, permissions: list | None 
     # ===== 口语→术语映射：优先使用映射后的查询进行检索 =====
     _search_query = _map_colloquial_to_legal(query)
     if _search_query != query:
-        logger.info(f"🔄 搜索前置口语映射: {query[:30]}... → {_search_query[:60]}...")
+        logger.info(f"搜索前置口语映射: {query[:30]}... → {_search_query[:60]}...")
 
     recall_limit = max(top_k * 4, 20)
     pool = await get_pool()
@@ -226,7 +226,7 @@ async def search_knowledge(query: str, top_k: int = 5, permissions: list | None 
                     candidates = await _recall_pg_trgm(conn, _mapped_query, recall_limit, permissions)
                     await _keyword_fill(conn, _mapped_query, recall_limit, candidates, permissions)
                     if candidates:
-                        logger.info(f"✅ 口语映射后找到 {len(candidates)} 条结果")
+                        logger.info(f"口语映射后找到 {len(candidates)} 条结果")
             except Exception as _map_err:
                 logger.warning(f"口语映射检索失败: {_map_err}")
 
@@ -374,7 +374,7 @@ async def web_search(query: str, max_results: int = 5):
                             "href": topic.get("FirstURL", ""),
                         })
 
-        logger.info(f"🌐 联网搜索完成: query={query[:30]}, results={len(results)}")
+        logger.info(f"联网搜索完成: query={query[:30]}, results={len(results)}")
         return {"results": results, "total": len(results)}
 
     except ImportError:
@@ -519,5 +519,5 @@ async def search_project_knowledge(query: str, top_k: int = 5):
                         break
 
     results = sorted(results, key=lambda x: x["similarity"], reverse=True)[:top_k]
-    logger.info(f"📚 项目知识库检索: query={query[:30]}, method={method}, results={len(results)}")
+    logger.info(f"项目知识库检索: query={query[:30]}, method={method}, results={len(results)}")
     return {"results": results, "method": method}

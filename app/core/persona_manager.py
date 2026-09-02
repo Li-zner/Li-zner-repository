@@ -64,7 +64,7 @@ class PersonaManager:
                 persona = Persona(
                     persona_id=data["id"],
                     name=data["name"],
-                    icon=data.get("icon", "🤖"),
+                    icon=data.get("icon", ""),
                     system_prompt=data["prompt"],
                     model=data.get("model", ""),
                     tools_enabled=data.get("tools", []),
@@ -72,7 +72,7 @@ class PersonaManager:
                     show_reasoning=data.get("show_reasoning", True),  # P2 #24：默认展示思考
                 )
                 self._personas[persona.id] = persona
-                logger.info(f"🧑 加载人格: {persona.icon} {persona.name} (id={persona.id})")
+                logger.info(f"加载人格: {persona.icon} {persona.name} (id={persona.id})")
             except Exception as e:
                 logger.warning(f"加载人格 {pid} 失败: {e}")
 
@@ -84,7 +84,7 @@ class PersonaManager:
             self._personas["unified"] = Persona(
                 persona_id="unified",
                 name="统一助手",
-                icon="🤖",
+                icon="",
                 system_prompt="你是AI助手，请直接、准确地回答用户的问题。今天是{today}。",
             )
             self._current = "unified"
@@ -102,7 +102,7 @@ class PersonaManager:
         """切换人格"""
         if persona_id in self._personas:
             self._current = persona_id
-            logger.info(f"🔄 切换到人格: {self.current.icon} {self.current.name}")
+            logger.info(f"切换到人格: {self.current.icon} {self.current.name}")
             return True
         logger.warning(f"人格不存在: {persona_id}")
         return False

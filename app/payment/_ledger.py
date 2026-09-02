@@ -111,7 +111,7 @@ async def ensure_wallet_exists(user_id: str) -> dict:
             "INSERT INTO user_wallets (user_id, balance, status) VALUES ($1, $2, 'active')",
             user_id, DEFAULT_WALLET_BALANCE,
         )
-        logger.info(f"💰 创建新钱包: user_id={user_id}, balance={DEFAULT_WALLET_BALANCE}")
+        logger.info(f"创建新钱包: user_id={user_id}, balance={DEFAULT_WALLET_BALANCE}")
         return {
             "user_id": user_id,
             "balance": DEFAULT_WALLET_BALANCE,

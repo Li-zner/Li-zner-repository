@@ -53,19 +53,22 @@ class BindPhoneRequest(BaseModel):
 
 # ---------- 验证码防爆破（P0 #6：防短信轰炸 / 暴力枚举）----------
 async def _check_sms_rate(phone: str):
-    """发送频率限制：同一手机号 1 分钟 1 次、1 小时 5 次"""
+    """发送频率限制：同一手机号 1 分钟 1 次、1 小时 5 次（原子，防并发绕过）"""
     r = await get_redis()
     min_key = f"phone_sms_min:{phone}"
     hour_key = f"phone_sms_hour:{phone}"
-    if await r.get(min_key):
-        raise HTTPException(429, "发送太频繁，请 1 分钟后再试")
-    if int(await r.get(hour_key) or 0) >= SMS_SEND_HOUR_LIMIT:
+    # 小时计数：原子 INCR（并发各取唯一值），首次置 TTL；超阈值回滚并拒绝
+    hour = await r.incr(hour_key)
+    if hour == 1:
+        await r.expire(hour_key, 3600)
+    if hour > SMS_SEND_HOUR_LIMIT:
+        await r.decr(hour_key)
         raise HTTPException(429, "短信发送次数已达上限，请稍后再试")
-    await r.setex(min_key, SMS_SEND_MIN_INTERVAL, "1")
-    pipe = r.pipeline()
-    pipe.incr(hour_key)
-    pipe.expire(hour_key, 3600)
-    await pipe.execute()
+    # 分钟冷却：SETNX 原子占位（原 GET→SETNX 两步并发可双双放行 → 短信轰炸，P1 修复）
+    ok_min = await r.set(min_key, "1", nx=True, ex=SMS_SEND_MIN_INTERVAL)
+    if not ok_min:
+        await r.decr(hour_key)   # 回滚小时计数，避免无效占位累计
+        raise HTTPException(429, "发送太频繁，请 1 分钟后再试")
 
 
 async def _record_sms_attempt(phone: str, success: bool):
@@ -114,12 +117,12 @@ async def send_phone_code(payload: PhoneSendCodeRequest):
     from ..core.sms import send_sms
     sent = await send_sms(phone, code)
     if sent:
-        logger.info(f"📱 验证码已发送: phone={phone}")
+        logger.info(f"验证码已发送: phone={phone}")
         return {"message": "验证码已发送", "phone": phone}
     else:
         # 短信发送失败 → 仅在日志记录发送失败，不泄露验证码
-        logger.warning(f"⚠️ 短信发送失败，降级到演示模式: phone={phone}")
-        logger.info(f"📱 [演示] 验证码已发送至演示日志（不返回客户端）")
+        logger.warning(f"短信发送失败，降级到演示模式: phone={phone}")
+        logger.info(f"[演示] 验证码已发送至演示日志（不返回客户端）")
         return {"message": "验证码已发送（演示模式）", "phone": phone}
 
 
@@ -173,7 +176,7 @@ async def phone_register(payload: PhoneRegisterRequest):
     # 审计：注册成功（含租户）
     from ..core.audit import audit
     await audit(username, "register", {"phone": phone, "tenant_id": tenant["id"]})
-    logger.info(f"📱 手机号注册成功: phone={phone}, username={username}, display_name={display_name or '(未设置)'}")
+    logger.info(f"手机号注册成功: phone={phone}, username={username}, display_name={display_name or '(未设置)'}")
     return {"access_token": pair["access_token"], "refresh_token": pair["refresh_token"], "token_type": "bearer", "username": username, "display_name": display_name or "", "is_new": True, "default_password_hint": password == "123456789"}
 
 
@@ -242,7 +245,7 @@ async def bind_phone(payload: BindPhoneRequest, current_user: dict = Depends(get
     # 验证码已由 _verify_phone_code 校验并删除
     from ..core.audit import audit
     await audit(username, "phone_bind", {"phone": phone})
-    logger.info(f"📱 手机号绑定成功: username={username}, phone={phone}")
+    logger.info(f"手机号绑定成功: username={username}, phone={phone}")
     return {"message": "手机号绑定成功，已解除限制", "quota_limited": False}
 
 

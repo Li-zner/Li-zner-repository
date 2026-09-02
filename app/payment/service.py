@@ -368,7 +368,7 @@ async def deduct_token_cost(
     lock_key = f"wallet:{user_id}"
     lock_token = await _acquire_lock(lock_key)
     if not lock_token:
-        logger.warning(f"⏳ 钱包繁忙，本次扣费跳过: user={user_id}")
+        logger.warning(f"钱包繁忙，本次扣费跳过: user={user_id}")
         return {"deducted": False, "amount": 0, "reason": "wallet busy"}
 
     try:
@@ -397,7 +397,7 @@ async def deduct_token_cost(
             # 余额不足时按剩余余额扣（模拟模式不拦截）
             if before_balance < cost_amount and before_balance > 0:
                 actual_deduct = before_balance
-                logger.info(f"💰 余额不足，按剩余余额扣费: user={user_id}, "
+                logger.info(f"余额不足，按剩余余额扣费: user={user_id}, "
                             f"应扣={cost_amount}, 实扣={actual_deduct}")
 
             # 写入扣费订单 + 更新余额 + 记录流水（同一事务：version conflict 或流水失败
@@ -478,7 +478,7 @@ def _validate_refund_amount(order: dict, amount: Optional[Decimal]) -> Decimal:
 
 def _refund_result(order_no: str, refund_order_no: str, refund_amount: Decimal, now) -> dict:
     """组装退款结果（含成功日志）"""
-    logger.info(f"↩️ 退款成功: 原订单={order_no}, 退款单={refund_order_no}, amount={refund_amount}")
+    logger.info(f"退款成功: 原订单={order_no}, 退款单={refund_order_no}, amount={refund_amount}")
     return {
         "order_no": order_no,
         "refund_order_no": refund_order_no,

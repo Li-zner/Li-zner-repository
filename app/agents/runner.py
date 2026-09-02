@@ -59,7 +59,7 @@ _INTERNAL_PATTERNS = [
     r'## 综合回答规则', r'## 情绪感知.*?旅游推荐映射',
     r'### 情绪.*?旅游风格映射', r'### 情绪推荐规则',
     r'## 禁止拒绝规则', r'## 多 Agent 协作', r'## 输出格式',
-    r'## 🚨 核心规则', r'请参考这些专业意见来回答',
+    r'## 核心规则', r'请参考这些专业意见来回答',
     r'禁止在回答中提及', r'### 你的任务', r'## 用户问题',
     r'各位专家的初步分析意见', r'只输出JSON', r'【约束】',
     r'## 定位与位置处理', r'## 多领域支持规则',
@@ -194,7 +194,7 @@ async def _build_task_messages(mm, user_query: str, user_location: str,
     try:
         if intent and intent.get("agents"):
             tools = get_tools_for_intent(intent["agents"])
-            logger.info(f"🔧 使用匹配工具: {len(tools)}个, agents={intent['agents']}")
+            logger.info(f"使用匹配工具: {len(tools)}个, agents={intent['agents']}")
         else:
             tools = []
     except Exception:
@@ -255,12 +255,12 @@ async def run_agent_task(
         intent = None
         try:
             intent = await classify_intent(user_query, use_llm=False)
-            logger.info(f"🔀 意图分类: agents={intent['agents']}, simple={intent['is_simple']}, method={intent.get('method','?')}")
+            logger.info(f"意图分类: agents={intent['agents']}, simple={intent['is_simple']}, method={intent.get('method','?')}")
 
             if intent["is_simple"] and intent["agents"]:
                 # 简单任务 → 直接调用单个 Agent，不走四 Agent 圆桌
                 agent_name = intent["agents"][0]
-                logger.info(f"⚡ 路由为简单任务: agent={agent_name}, task_id={task_id}")
+                logger.info(f"路由为简单任务: agent={agent_name}, task_id={task_id}")
                 await handle_simple_task(
                     task_id=task_id,
                     username=username,
@@ -275,10 +275,10 @@ async def run_agent_task(
                 return
             elif not intent["agents"]:
                 # 未匹配到任何工具 → 走纯 LLM 回答（不加工具调用）
-                logger.info(f"💬 未匹配工具领域，走纯 LLM 回答: task_id={task_id}")
+                logger.info(f"未匹配工具领域，走纯 LLM 回答: task_id={task_id}")
                 # 继续往下走，主循环会处理纯文本回答
             else:
-                logger.info(f"🧠 路由为复杂任务: agents={intent['agents']}, task_id={task_id}")
+                logger.info(f"路由为复杂任务: agents={intent['agents']}, task_id={task_id}")
         except Exception as route_err:
             logger.warning(f"意图路由异常（降级为复杂任务）: {route_err}")
 
@@ -477,7 +477,7 @@ async def run_agent_task(
                 asyncio.create_task(_safe_cache_set(user_query, final_answer, cache_ctx=_cache_ctx))
 
                 await update_status(task_id, "completed", final_answer)
-                logger.info(f"✅ 任务完成: task_id={task_id}")
+                logger.info(f"任务完成: task_id={task_id}")
                 cleanup_event(task_id)
                 return
 
@@ -505,7 +505,7 @@ async def _finish_cancelled(task_id: str, partial: str):
     """标记任务为已取消，保存草稿"""
     await update_status(task_id, "cancelled", partial)
     cleanup_event(task_id)
-    logger.info(f"⏹ 任务已取消: task_id={task_id}")
+    logger.info(f"任务已取消: task_id={task_id}")
 
 
 async def _fallback_chain(user_query: str, username: str):

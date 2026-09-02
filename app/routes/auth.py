@@ -108,5 +108,5 @@ async def change_password(payload: ChangePasswordRequest, current_user: dict = D
             "UPDATE users SET hashed_password=$1 WHERE username=$2",
             new_hashed, username
         )
-    logger.info(f"🔑 密码已修改: username={username}")
+    logger.info(f"密码已修改: username={username}")
     return {"message": "密码修改成功"}

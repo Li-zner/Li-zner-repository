@@ -1,0 +1,1444 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <!-- 绕过阿里云 DataV GeoJSON 的 Referer 防盗链 -->
+  <meta name="referrer" content="no-referrer" />
+  <title>中国城市速览</title>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: #eaf3ea;
+      overflow: hidden;
+      height: 100vh;
+    }
+    #map-container {
+      width: 100vw;
+      height: 100vh;
+      background: #f0f7f0;
+    }
+    .toolbar {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      right: 20px;
+      display: flex;
+      justify-content: space-between;
+      z-index: 50;
+      pointer-events: none;
+    }
+    .toolbar > * {
+      pointer-events: auto;
+    }
+    .back-btn,
+    .history-btn {
+      background: rgba(255, 255, 255, 0.9);
+      border: none;
+      border-radius: 30px;
+      padding: 10px 20px;
+      font-size: 14px;
+      cursor: pointer;
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+      transition: 0.2s;
+      backdrop-filter: blur(4px);
+    }
+    .back-btn:hover,
+    .history-btn:hover {
+      background: #fff;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+    }
+    .right-tools {
+      display: flex;
+      gap: 12px;
+    }
+
+    .bubble {
+      position: absolute;
+      background: rgba(255, 255, 255, 0.96);
+      border-radius: 20px;
+      padding: 24px 28px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15);
+      max-width: 400px;
+      width: 90%;
+      display: none;
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.4);
+      z-index: 100;
+      pointer-events: auto;
+      transition: opacity 0.2s;
+      max-height: 80vh;
+      overflow-y: auto;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+    }
+    .bubble .city-name {
+      font-size: 24px;
+      font-weight: 700;
+      color: #1a2e1a;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .bubble .city-name .fav-star {
+      cursor: pointer;
+      font-size: 22px;
+      transition: 0.2s;
+    }
+    .bubble .city-name .fav-star:hover {
+      transform: scale(1.2);
+    }
+    .bubble .weather {
+      font-size: 15px;
+      color: #3d5a3d;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px dashed #d0e0d0;
+    }
+    .bubble .section {
+      margin: 10px 0;
+      font-size: 14px;
+      line-height: 1.6;
+      color: #2d4a2d;
+    }
+    .bubble .section strong {
+      color: #1a4a1a;
+      display: block;
+      font-size: 15px;
+      margin-bottom: 4px;
+    }
+    .bubble .section .items {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .bubble .section .items span {
+      background: #edf5ed;
+      padding: 4px 14px;
+      border-radius: 20px;
+      font-size: 13px;
+      color: #1a3a1a;
+    }
+    .bubble .actions {
+      display: flex;
+      gap: 12px;
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px solid #e0eee0;
+      justify-content: center;
+    }
+    .bubble .actions button {
+      background: var(--primary, #2d8a4e);
+      border: none;
+      color: #fff;
+      padding: 8px 20px;
+      border-radius: 30px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: 0.2s;
+      font-weight: 500;
+    }
+    .bubble .actions button:hover {
+      background: #1b6b3a;
+      transform: scale(0.97);
+    }
+    .bubble .actions button.secondary {
+      background: #e8f0e8;
+      color: #2d4a2d;
+    }
+    .bubble .actions button.secondary:hover {
+      background: #d0e0d0;
+    }
+    .bubble .close-hint {
+      text-align: center;
+      font-size: 12px;
+      color: #aaa;
+      margin-top: 12px;
+      border-top: 1px solid #eee;
+      padding-top: 10px;
+    }
+    .loading {
+      text-align: center;
+      color: #888;
+      padding: 20px 0;
+    }
+
+    .history-panel {
+      position: fixed;
+      right: 0;
+      top: 0;
+      width: 320px;
+      height: 100vh;
+      background: rgba(255, 255, 255, 0.97);
+      box-shadow: -4px 0 20px rgba(0, 0, 0, 0.05);
+      transform: translateX(100%);
+      transition: transform 0.3s ease;
+      z-index: 200;
+      padding: 24px 20px;
+      overflow-y: auto;
+      backdrop-filter: blur(8px);
+    }
+    .history-panel.open {
+      transform: translateX(0);
+    }
+    .history-panel .panel-title {
+      font-size: 18px;
+      font-weight: 700;
+      color: #1a2e1a;
+      margin-bottom: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .history-panel .panel-title button {
+      background: none;
+      border: none;
+      font-size: 24px;
+      cursor: pointer;
+      color: #888;
+    }
+    .history-panel .history-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 0;
+      border-bottom: 1px solid #f0f5f0;
+      font-size: 14px;
+      color: #2d4a2d;
+    }
+    .history-panel .history-item .fav-icon {
+      cursor: pointer;
+      font-size: 18px;
+      transition: 0.2s;
+    }
+    .history-panel .history-item .fav-icon:hover {
+      transform: scale(1.2);
+    }
+    .history-empty {
+      color: #aaa;
+      text-align: center;
+      margin-top: 40px;
+      font-size: 14px;
+    }
+    .overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.2);
+      z-index: 150;
+      display: none;
+    }
+    .overlay.show {
+      display: block;
+    }
+
+    /* ---------- 缩放控件 ---------- */
+    .zoom-controls {
+      position: absolute;
+      right: 16px;
+      bottom: 80px;
+      z-index: 50;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      pointer-events: none;
+    }
+    .zoom-controls > * {
+      pointer-events: auto;
+    }
+    .zoom-btn {
+      width: 44px;
+      height: 44px;
+      background: rgba(255,255,255,0.92);
+      backdrop-filter: blur(6px);
+      border: 1px solid var(--border-color, #c8dcc8);
+      border-radius: 50%;
+      font-size: 22px;
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #3d5a3d;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+      transition: 0.15s;
+      user-select: none;
+    }
+    .zoom-btn:active { transform: scale(0.92); background: #e8f3e8; }
+    .zoom-slider-container {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(255,255,255,0.88);
+      backdrop-filter: blur(6px);
+      border: 1px solid var(--border-color, #c8dcc8);
+      border-radius: 30px;
+      padding: 6px 14px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+      margin-top: 2px;
+    }
+    .zoom-slider {
+      width: 120px;
+      height: 4px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: #d0e0d0;
+      border-radius: 4px;
+      outline: none;
+      cursor: pointer;
+    }
+    .zoom-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #2d8a4e;
+      cursor: pointer;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+    }
+    .zoom-slider::-moz-range-thumb {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #2d8a4e;
+      cursor: pointer;
+      border: none;
+    }
+    .zoom-label {
+      font-size: 12px;
+      color: #3d5a3d;
+      min-width: 32px;
+      text-align: center;
+      font-weight: 600;
+    }
+
+    @media (max-width: 600px) {
+      .bubble {
+        width: 95%;
+        padding: 18px 16px;
+        max-width: 95%;
+      }
+      .history-panel {
+        width: 100%;
+      }
+    }
+
+    /* ---------- 移动端菜单 ---------- */
+    .hamburger-btn {
+      display: none;
+      background: rgba(255,255,255,0.92);
+      border: 1px solid #c8dcc8;
+      border-radius: 30px;
+      padding: 8px 14px;
+      font-size: 18px;
+      cursor: pointer;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+      backdrop-filter: blur(4px);
+      transition: 0.2s;
+    }
+    .hamburger-btn:active { background: #e8f3e8; }
+
+    .mobile-dropdown {
+      display: none;
+      position: fixed;
+      top: 70px;
+      right: 16px;
+      z-index: 55;
+      background: rgba(255,255,255,0.97);
+      backdrop-filter: blur(12px);
+      border: 1px solid #d0e0d0;
+      border-radius: 16px;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.12);
+      overflow: hidden;
+      min-width: 160px;
+    }
+    .mobile-dropdown.show { display: block; }
+    .mobile-dropdown button {
+      display: block;
+      width: 100%;
+      padding: 14px 20px;
+      border: none;
+      background: none;
+      font-size: 15px;
+      color: #2d4a2d;
+      text-align: left;
+      cursor: pointer;
+      transition: 0.15s;
+      border-bottom: 1px solid #f0f5f0;
+    }
+    .mobile-dropdown button:last-child { border-bottom: none; }
+    .mobile-dropdown button:hover { background: #f0f8f0; }
+
+    @media (max-width: 768px) {
+      .desktop-only { display: none !important; }
+      .hamburger-btn { display: inline-block; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 地图容器 -->
+  <div id="map-container"></div>
+
+  <!-- 顶部工具栏 -->
+  <div class="toolbar">
+    <button class="back-btn" onclick="window.location.href='/'">← 返回聊天</button>
+    <div style="font-size:16px;font-weight:700;color:#2d4a2d;pointer-events:none;text-shadow:0 1px 4px rgba(255,255,255,0.8);" id="mapTitle">中华人民共和国</div>
+    <div class="right-tools">
+      <button class="history-btn desktop-only" onclick="randomCity()">🎲 随机</button>
+      <button class="history-btn desktop-only" onclick="toggleHistory()">📋 历史</button>
+      <button class="history-btn desktop-only" onclick="refreshLocation()">📍 刷新位置</button>
+      <button class="hamburger-btn" id="hamburgerBtn" onclick="event.stopPropagation(); toggleMobileMenu();" title="更多">☰</button>
+    </div>
+  </div>
+
+  <!-- 移动端下拉菜单 -->
+  <div class="mobile-dropdown" id="mobileDropdown">
+    <button onclick="randomCity(); closeMobileMenu();">🎲 随机城市</button>
+    <button onclick="toggleHistory(); closeMobileMenu();">📋 浏览历史</button>
+    <button onclick="refreshLocation(); closeMobileMenu();">📍 刷新位置</button>
+  </div>
+
+  <!-- 缩放控件 -->
+  <div class="zoom-controls">
+    <button class="zoom-btn" id="zoomInBtn" title="放大">＋</button>
+    <div class="zoom-slider-container">
+      <span class="zoom-label" id="zoomPercent">100%</span>
+      <input type="range" class="zoom-slider" id="zoomSlider" min="50" max="300" value="100" />
+    </div>
+    <button class="zoom-btn" id="zoomOutBtn" title="缩小">−</button>
+    <button class="zoom-btn" id="jumpDestBtn" title="跳转至目的地" style="display:none;margin-top:4px;background:rgba(244,67,54,0.9);color:#fff;" onclick="jumpToDestination()">📍</button>
+  </div>
+
+  <!-- 气泡 -->
+  <div class="bubble" id="bubble">
+    <div class="city-name">
+      <span id="cityName">广州</span>
+      <span class="fav-star" id="favStar" onclick="toggleFavorite()">☆</span>
+    </div>
+    <div class="weather" id="weatherInfo">晴 26℃ · 东南风 3级</div>
+    <div class="section">
+      <strong>美食推荐</strong>
+      <div class="items" id="foodsList"><span>加载中…</span></div>
+    </div>
+    <div class="section">
+      <strong>景点推荐</strong>
+      <div class="items" id="spotsList"><span>加载中…</span></div>
+    </div>
+    <div class="actions">
+      <button onclick="goToCity()">去这里</button>
+      <button onclick="refreshRecommendations()">换一批</button>
+      <button class="secondary" onclick="closeBubble()">关闭</button>
+    </div>
+  </div>
+
+  <!-- 历史面板 -->
+  <div class="overlay" id="overlay" onclick="toggleHistory()"></div>
+  <div class="history-panel" id="historyPanel">
+    <div class="panel-title">
+      <span>浏览历史</span>
+      <button onclick="toggleHistory()">✕</button>
+    </div>
+    <div id="historyList"></div>
+  </div>
+
+  <script>
+    // ============================================================
+    // 配置区
+    // ============================================================
+    const CONFIG = {
+      PROVINCE_URL: 'https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json',
+      // 城市级 GeoJSON: https://geo.datav.aliyun.com/areas_v3/bound/{adcode}_full.json
+    };
+
+    // ============================================================
+    // 状态管理
+    // ============================================================
+    let currentCity = null;
+    let currentWeather = '';
+    let currentFoods = [];
+    let currentSpots = [];
+    let chart = null;
+    let isHistoryOpen = false;
+    let currentLevel = 'province';   // 'province' | 'city'
+    let currentProvinceAdcode = null; // 当前下钻的省份 adcode
+    let provinceGeo = null;           // 缓存的省级 GeoJSON
+    // 用户位置信息
+    let userLocation = null; // { province, city, lat, lng }
+
+    const STORAGE_KEYS = {
+      HISTORY: 'map_history',
+      FAVORITES: 'map_favorites',
+      LOCATION: 'map_user_location'
+    };
+
+    // 蓝色小人 SVG
+    var PERSON_SVG = 'path://M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z';
+
+    // ============================================================
+    // 存储工具
+    // ============================================================
+    function getHistory() {
+      try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.HISTORY)) || []; } catch { return []; }
+    }
+    function saveHistory(history) {
+      localStorage.setItem(STORAGE_KEYS.HISTORY, JSON.stringify(history));
+    }
+    function getFavorites() {
+      try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.FAVORITES)) || []; } catch { return []; }
+    }
+    function saveFavorites(favs) {
+      localStorage.setItem(STORAGE_KEYS.FAVORITES, JSON.stringify(favs));
+    }
+
+    function addToHistory(city) {
+      let history = getHistory();
+      history = history.filter(item => item !== city);
+      history.unshift(city);
+      if (history.length > 30) history.pop();
+      saveHistory(history);
+      renderHistory();
+    }
+
+    function isFavorite(city) {
+      return getFavorites().includes(city);
+    }
+
+    function toggleFavorite() {
+      if (!currentCity) return;
+      let favs = getFavorites();
+      if (favs.includes(currentCity)) {
+        favs = favs.filter(c => c !== currentCity);
+      } else {
+        favs.push(currentCity);
+      }
+      saveFavorites(favs);
+      updateStar();
+      renderHistory();
+    }
+
+    function updateStar() {
+      const star = document.getElementById('favStar');
+      if (currentCity && isFavorite(currentCity)) {
+        star.textContent = '★';
+        star.style.color = '#f5a623';
+      } else {
+        star.textContent = '☆';
+        star.style.color = '#aaa';
+      }
+    }
+
+    // 显示用名称：去掉"市/省"后缀（保留自治州全称，如"海西蒙古族藏族自治州"）
+    function displayName(name) {
+      return (name || '').replace(/(市|省)$/, '');
+    }
+
+    // ============================================================
+    // API 调用（通过后端代理）
+    // ============================================================
+    async function getWeather(city, adcode) {
+      // 高德天气支持 adcode，比名称更可靠
+      const q = adcode || city;
+      const res = await fetch(`/api/map/weather?city=${encodeURIComponent(q)}`, { signal: AbortSignal.timeout(15000) });
+      if (!res.ok) throw new Error(`天气服务返回 ${res.status}`);
+      const data = await res.json();
+      if (data.status === '1' && data.lives && data.lives.length) {
+        const l = data.lives[0];
+        return `${l.weather} ${l.temperature}℃ · ${l.winddirection}风 ${l.windpower}级`;
+      }
+      throw new Error('天气获取失败');
+    }
+
+    async function getRecommendations(city) {
+      const res = await fetch(`/api/map/recommend?city=${encodeURIComponent(city)}`, { method: 'POST', signal: AbortSignal.timeout(15000) });
+      if (!res.ok) throw new Error(`推荐服务返回 ${res.status}`);
+      const data = await res.json();
+      if (!data || (!data.foods && !data.spots)) throw new Error('推荐数据格式错误');
+      return { foods: data.foods || [], spots: data.spots || [] };
+    }
+
+    // ============================================================
+    // 气泡渲染
+    // ============================================================
+    function renderBubble(city, weather, foods, spots) {
+      document.getElementById('cityName').textContent = city;
+      document.getElementById('weatherInfo').textContent = weather;
+      const foodsEl = document.getElementById('foodsList');
+      foodsEl.innerHTML = foods.map(f => `<span>${f}</span>`).join('');
+      const spotsEl = document.getElementById('spotsList');
+      spotsEl.innerHTML = spots.map(s => `<span>${s}</span>`).join('');
+      updateStar();
+      document.getElementById('bubble').style.display = 'block';
+    }
+
+    function closeBubble() {
+      document.getElementById('bubble').style.display = 'none';
+      currentCity = null;
+    }
+
+    async function refreshRecommendations() {
+      if (!currentCity) return;
+      try {
+        const { foods, spots } = await getRecommendations(currentCity);
+        currentFoods = foods;
+        currentSpots = spots;
+        renderBubble(currentCity, currentWeather, currentFoods, currentSpots);
+      } catch (e) {
+        alert('推荐刷新失败，请重试');
+      }
+    }
+
+    async function showCityInfo(city, adcode) {
+      if (!city) return;
+      currentCity = city;
+      const bubble = document.getElementById('bubble');
+      bubble.style.display = 'block';
+      document.getElementById('cityName').textContent = city;
+      document.getElementById('weatherInfo').textContent = '⏳ 加载中...';
+      document.getElementById('foodsList').innerHTML = '<span>加载中…</span>';
+      document.getElementById('spotsList').innerHTML = '<span>加载中…</span>';
+
+      // 天气与推荐并行加载，互不阻塞；单项失败不影响另一项
+      const [weatherRes, recRes] = await Promise.allSettled([
+        getWeather(city, adcode),
+        getRecommendations(city)
+      ]);
+
+      if (weatherRes.status === 'fulfilled') {
+        currentWeather = weatherRes.value;
+        document.getElementById('weatherInfo').textContent = weatherRes.value;
+      } else {
+        currentWeather = '';
+        document.getElementById('weatherInfo').textContent = '暂无数据';
+        console.error('天气获取失败:', weatherRes.reason);
+      }
+
+      if (recRes.status === 'fulfilled') {
+        currentFoods = recRes.value.foods;
+        currentSpots = recRes.value.spots;
+        const foodsEl = document.getElementById('foodsList');
+        foodsEl.innerHTML = (currentFoods && currentFoods.length) ? currentFoods.map(f => `<span>${f}</span>`).join('') : '<span>暂无推荐</span>';
+        const spotsEl = document.getElementById('spotsList');
+        spotsEl.innerHTML = (currentSpots && currentSpots.length) ? currentSpots.map(s => `<span>${s}</span>`).join('') : '<span>暂无推荐</span>';
+      } else {
+        currentFoods = [];
+        currentSpots = [];
+        document.getElementById('foodsList').innerHTML = '<span>暂无推荐</span>';
+        document.getElementById('spotsList').innerHTML = '<span>暂无推荐</span>';
+        console.error('推荐获取失败:', recRes.reason);
+      }
+
+      updateStar();
+      bubble.style.display = 'block';
+      addToHistory(city);
+    }
+
+    // ============================================================
+    // 「去这里」— 获取位置后跳转到 Agent 聊天
+    // ============================================================
+    function goToCity() {
+      const city = currentCity;
+      if (!city) return;
+
+      (async () => {
+        let userCity = '';
+        let pos = null;
+
+        // 优先使用已缓存的位置，避免重复弹窗
+        if (userLocation && userLocation.city) {
+          userCity = userLocation.city;
+          pos = { coords: { latitude: userLocation.lat, longitude: userLocation.lng } };
+        } else if (navigator.geolocation) {
+          try {
+            if (navigator.permissions && navigator.permissions.query) {
+              const perm = await navigator.permissions.query({ name: 'geolocation' });
+              if (perm.state === 'denied') {
+                // 用户已明确拒绝，不再尝试
+                pos = null;
+              } else if (perm.state === 'granted') {
+                // 已授权，直接获取位置且不再弹确认框
+                pos = await new Promise(function(resolve) {
+                  navigator.geolocation.getCurrentPosition(function(p) { resolve(p); }, function() { resolve(null); }, { timeout: 5000, enableHighAccuracy: false });
+                });
+              } else {
+                // prompt 状态：保留原有确认提示
+                if (confirm('📍 需要获取您的位置以便为您规划更准确的出发地信息。点击“确定”后，浏览器将弹出定位授权请求。')) {
+                  pos = await new Promise(function(resolve) {
+                    navigator.geolocation.getCurrentPosition(function(p) { resolve(p); }, function() { resolve(null); }, { timeout: 5000, enableHighAccuracy: false });
+                  });
+                }
+              }
+            } else {
+              // 不支持 Permissions API 时回退为旧逻辑
+              if (confirm('📍 需要获取您的位置以便为您规划更准确的出发地信息。点击“确定”后，浏览器将弹出定位授权请求。')) {
+                pos = await new Promise(function(resolve) {
+                  navigator.geolocation.getCurrentPosition(function(p) { resolve(p); }, function() { resolve(null); }, { timeout: 5000, enableHighAccuracy: false });
+                });
+              }
+            }
+
+            if (pos) {
+              const res = await fetch(`/api/map/regeo?lat=${pos.coords.latitude}&lng=${pos.coords.longitude}`);
+              if (res.ok) {
+                const data = await res.json();
+                userCity = data.city || '';
+                userLocation = { lat: pos.coords.latitude, lng: pos.coords.longitude, city: userCity, province: data.province || userCity };
+                localStorage.setItem(STORAGE_KEYS.LOCATION, JSON.stringify(userLocation));
+              }
+            }
+          } catch (e) {
+            console.warn('获取位置失败:', e);
+            pos = null;
+          }
+        }
+
+        // IP 定位兜底：geolocation 拿不到城市时（国内 Chrome 走 Google 定位常被墙），
+        // 用请求 IP 经 /api/map/iploc 拿城市做出发地
+        if (!userCity) {
+          try {
+            const ipr = await fetch('/api/map/iploc');
+            if (ipr.ok) {
+              const ipd = await ipr.json();
+              // 私有 IP 定位常返回"局域网"占位，非真实城市，丢弃（后端已对私有IP返回空，这里双保险）
+              userCity = (ipd.city && ipd.city !== '局域网') ? ipd.city : '';
+              if (userCity && (!userLocation || !userLocation.city)) {
+                userLocation = { lat: null, lng: null, city: userCity, province: ipd.province || userCity };
+              }
+            }
+          } catch (e) { console.warn('IP 定位兜底失败:', e); }
+        }
+
+        var promptText;
+        var isEn = (localStorage.getItem('travel_lang') || 'zh') === 'en';
+        if (userCity && userCity !== city) {
+          promptText = isEn
+            ? `I'm traveling from ${userCity} to ${city}. Please plan my trip including transportation, attractions, food and accommodation.`
+            : `我从${userCity}出发，想去${city}旅游，请帮我规划行程，包括交通方式、景点推荐、美食推荐和住宿建议。`;
+        } else {
+          promptText = isEn
+            ? `I want to travel to ${city}. Please ask for my departure city first, then plan my trip including transportation, attractions, food and accommodation.`
+            : `我想去${city}旅游，请先问我的出发地，然后帮我规划行程，包括交通方式、景点推荐、美食推荐和住宿建议。`;
+        }
+
+        localStorage.setItem('travel_auto_prompt', promptText);
+        var routeInfo = { from: userCity, to: city, timestamp: Date.now() };
+        if (pos) { routeInfo.fromLat = pos.coords.latitude; routeInfo.fromLng = pos.coords.longitude; }
+        localStorage.setItem('pending_route', JSON.stringify(routeInfo));
+        // 返回时切回旅行模式
+        localStorage.setItem('travel_current_mode', 'travel');
+        window.location.href = '/';
+      })().catch(function(err) {
+        console.error('goToCity 异常:', err);
+        var isEn = (localStorage.getItem('travel_lang') || 'zh') === 'en';
+        localStorage.setItem('travel_auto_prompt', isEn ? ('I want to travel to ' + city + '. Please plan my trip.') : ('我想去' + city + '旅游，请帮我规划行程。'));
+        localStorage.setItem('travel_current_mode', 'travel');
+        window.location.href = '/';
+      });
+    }
+
+    // ============================================================
+    // IP 近似定位兜底（双重防护第二层）：浏览器 geolocation 不可用
+    // （国内 Chrome/QQ 等走 Google 定位常被墙）时，用请求 IP 定位城市。
+    // ============================================================
+    function ipLocateFallback() {
+      return fetch('/api/map/iploc')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          // 丢弃"局域网"占位（私有IP定位无真实城市），双保险
+          if (d.city && d.city !== '局域网') {
+            userLocation = { lat: null, lng: null, city: d.city, province: d.province || d.city };
+            try { localStorage.setItem(STORAGE_KEYS.LOCATION, JSON.stringify(userLocation)); } catch (e) {}
+            try { localStorage.setItem('user_city', d.city); localStorage.setItem('user_city_ts', Date.now().toString()); } catch (e) {}
+            setTimeout(updateUserMarker, 300);
+            return userLocation;
+          }
+          return null;
+        })
+        .catch(function() { return null; });
+    }
+
+    // ============================================================
+    // 获取用户位置（统一入口）
+    // ============================================================
+    async function requestUserLocation(showPrompt) {
+      var saved = localStorage.getItem(STORAGE_KEYS.LOCATION);
+      if (saved) {
+        try {
+          userLocation = JSON.parse(saved);
+          // 清理历史"局域网"垃圾定位（私有IP定位旧值），视为未定位
+          if (userLocation && userLocation.city === '局域网') {
+            userLocation = null;
+            try { localStorage.removeItem(STORAGE_KEYS.LOCATION); } catch (e) {}
+            try { localStorage.removeItem('user_city'); localStorage.removeItem('user_city_ts'); } catch (e) {}
+          }
+          if (userLocation) {
+            setTimeout(updateUserMarker, 300);
+            return Promise.resolve(userLocation);
+          }
+        } catch(e) {
+          console.warn('解析缓存位置失败:', e);
+        }
+      }
+
+      if (!navigator.geolocation) {
+        // 无 geolocation 支持时才走 IP 定位兜底；否则总是尝试浏览器定位
+        // （用户已授权或愿意授权时，应直接用真实定位，不能被 showPrompt 挡住——见需求：授权后不再手输）
+        return ipLocateFallback();
+      }
+
+      // 优先通过 Permissions API 判断，避免重复弹窗
+      try {
+        if (navigator.permissions && navigator.permissions.query) {
+          const p = await navigator.permissions.query({ name: 'geolocation' });
+          if (p.state === 'denied') {
+            return Promise.resolve(null);
+          }
+          // 如果已授权，直接获取定位但不再弹确认（仅在 map 页面）
+          if (p.state === 'granted') {
+            return new Promise(function(resolve) {
+              navigator.geolocation.getCurrentPosition(function(pos) {
+                var lat = pos.coords.latitude;
+                var lng = pos.coords.longitude;
+                fetch('/api/map/regeo?lat=' + lat + '&lng=' + lng)
+                  .then(function(r) { return r.json(); })
+                  .then(function(data) {
+                    if (data.city) {
+                      userLocation = { lat: lat, lng: lng, city: data.city, province: data.province || data.city };
+                      localStorage.setItem(STORAGE_KEYS.LOCATION, JSON.stringify(userLocation));
+                      updateUserMarker();
+                      localStorage.setItem('user_city', data.city);
+                      localStorage.setItem('user_city_ts', Date.now().toString());
+                    }
+                    resolve(userLocation);
+                  })
+                  .catch(function() { ipLocateFallback().then(resolve); });
+              }, function() { ipLocateFallback().then(resolve); }, { timeout: 8000, enableHighAccuracy: false });
+            });
+          }
+        }
+      } catch (e) {
+        // 忽略 Permissions API 错误，继续正常流程
+      }
+
+      return new Promise(function(resolve) {
+        navigator.geolocation.getCurrentPosition(
+          function(pos) {
+            var lat = pos.coords.latitude;
+            var lng = pos.coords.longitude;
+            fetch('/api/map/regeo?lat=' + lat + '&lng=' + lng)
+              .then(function(r) { return r.json(); })
+              .then(function(data) {
+                if (data.city) {
+                  userLocation = { lat: lat, lng: lng, city: data.city, province: data.province || data.city };
+                  localStorage.setItem(STORAGE_KEYS.LOCATION, JSON.stringify(userLocation));
+                  updateUserMarker();
+                  localStorage.setItem('user_city', data.city);
+                  localStorage.setItem('user_city_ts', Date.now().toString());
+                }
+                resolve(userLocation);
+              })
+              .catch(function() { resolve(null); });
+          },
+          function(err) {
+            // 拒绝权限（code=1）：提示用户开启；失败/超时：回退 IP 定位兜底
+            if (err.code === 1 && showPrompt) {
+              alert('📍 开启位置权限\n\n为了在地图上显示你的位置、推荐附近城市信息，请允许浏览器获取你的地理位置。\n\n请在浏览器地址栏左侧的🔒或ℹ️图标中，将「位置」权限改为「允许」，然后刷新页面。');
+            }
+            ipLocateFallback().then(resolve);
+          },
+          { timeout: 8000, enableHighAccuracy: false }
+        );
+      });
+    }
+
+    // ============================================================
+    // 蓝色用户位置标记
+    // ============================================================
+    function updateUserMarker() {
+      if (!chart || !userLocation) {
+        // 图表或位置未就绪，稍后重试（最多重试 20 次 = 10 秒）
+        if (userLocation || !chart) {
+          setTimeout(updateUserMarker, 500);
+        }
+        return;
+      }
+      // 用精确坐标或省中心
+      var coords = null;
+      if (userLocation.lng && userLocation.lat) {
+        coords = [userLocation.lng, userLocation.lat];
+      } else if (provinceGeo && userLocation.province) {
+        var name = userLocation.province.replace(/[省市自治区特别行政区]+$/g, '');
+        var f = provinceGeo.features.find(function(f) { return f.properties.name.includes(name); });
+        if (f) { var c = f.properties.centroid || f.properties.center; if (c) coords = c; }
+      }
+      if (!coords) { setTimeout(updateUserMarker, 500); return; }
+
+      // 保留已有的 series（省份名称），只更新用户标记
+      var existing = chart.getOption().series || [];
+      var filtered = existing.filter(function(s) { return s.name !== 'userMarker' && s.name !== 'destinationMarker'; });
+      filtered.push({
+        type: 'scatter', coordinateSystem: 'geo', name: 'userMarker',
+        data: [{ name: '我的位置', value: coords }],
+        symbol: PERSON_SVG, symbolSize: 28,
+        itemStyle: { color: '#2196F3', shadowBlur: 6, shadowColor: 'rgba(33,150,243,0.5)' },
+        label: { show: true, formatter: function() { return (userLocation && userLocation.city) ? userLocation.city + '·你' : '📍 你'; }, color: '#1565C0', fontSize: 11, fontWeight: 'bold', position: 'right' },
+        tooltip: { show: true, formatter: '我的位置: ' + (userLocation.city || userLocation.province) },
+        z: 10
+      });
+      chart.setOption({ series: filtered });
+    }
+
+    function removeUserMarker() {
+      if (!chart) return;
+      var existing = chart.getOption().series || [];
+      var filtered = existing.filter(function(s) { return s.name !== 'userMarker' && s.name !== 'destinationMarker'; });
+      chart.setOption({ series: filtered });
+    }
+
+    // ============================================================
+    // 从聊天返回后：加载目的地红色地标
+    // ============================================================
+    function loadRouteFromStorage() {
+      var stored = localStorage.getItem('pending_route');
+      if (!stored) return;
+      try {
+        var info = JSON.parse(stored);
+        localStorage.removeItem('pending_route');
+        if (Date.now() - info.timestamp > 86400000) return;
+        if (!info.to) return;
+
+        // 调用 amap-route 获取目的地坐标
+        fetch('/api/map/amap-route', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ departure: info.from || info.to, destination: info.to })
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          placeDestinationMarker(data, info);
+        })
+        .catch(function() {});
+      } catch(e) {}
+    }
+
+// 红色目的地地标
+var _lastDestCoord = null;
+
+function placeDestinationMarker(data, info) {
+  if (!chart) return;
+  var destCoord = null;
+  if (data && data.destination_location) {
+    var parts = data.destination_location.split(',').map(Number);
+    if (parts.length === 2) destCoord = [parts[0], parts[1]];
+  }
+  if (!destCoord) { setTimeout(function() { placeDestinationMarker(data, info); }, 1000); return; }
+
+  _lastDestCoord = destCoord;
+  // 显示跳转目的地按钮
+  var jumpBtn = document.getElementById('jumpDestBtn');
+  if (jumpBtn) jumpBtn.style.display = 'block';
+
+  var existing = chart.getOption().series || [];
+  var filtered = existing.filter(function(s) { return s.name !== 'destinationMarker' && s.name !== 'userMarker'; });
+  filtered.push({
+    type: 'scatter', coordinateSystem: 'geo', name: 'destinationMarker',
+    data: [{ name: '目的地', value: destCoord }],
+    symbol: 'pin', symbolSize: 36,
+    itemStyle: { color: '#F44336' },
+    label: { show: true, formatter: '📍 目的地', color: '#D32F2F', fontSize: 13, fontWeight: 'bold', position: 'top' },
+    tooltip: { show: true, formatter: '目的地: ' + (info ? info.to : '') },
+    z: 10
+  });
+  chart.setOption({ series: filtered });
+}
+
+// 跳转至目的地（缩放+居中）
+function jumpToDestination() {
+  if (!chart || !_lastDestCoord) return;
+  chart.setOption({
+    geo: { center: _lastDestCoord, zoom: 1.5 }
+  });
+  // 同步缩放滑块
+  var pct = Math.round(1.5 * 100);
+  document.getElementById('zoomPercent').textContent = pct + '%';
+  document.getElementById('zoomSlider').value = pct;
+}
+
+    // ============================================================
+    // 刷新位置：重新定位 + 跳转到所在省
+    // ============================================================
+    function refreshLocation() {
+      // 清除缓存
+      localStorage.removeItem(STORAGE_KEYS.LOCATION);
+      localStorage.removeItem('pending_route');
+      userLocation = null;
+      _lastDestCoord = null;
+      document.getElementById('jumpDestBtn').style.display = 'none';
+      removeUserMarker();
+      // 回到全国视图并等待加载完成
+      loadProvinceMap();
+      // 加载完成后重新定位并跳转到省
+      var waitForMap = setInterval(function() {
+        if (provinceGeo && provinceGeo.features) {
+          clearInterval(waitForMap);
+          requestUserLocation(true).then(function(loc) {
+            if (!loc) { ipLocateFallback(); }  // geolocation 失败 → IP 定位兜底显示位置
+            if (loc && loc.city && loc.province) {
+              var pName = loc.province.replace(/[省市自治区特别行政区]+$/g, '');
+              var feature = provinceGeo.features.find(function(f) { return f.properties.name.includes(pName); });
+              if (feature) {
+                var adcode = feature.id || feature.properties.adcode;
+                if (adcode) drillToCity(adcode, loc.province);
+              }
+            }
+          });
+        }
+      }, 200);
+    }
+
+    // ============================================================
+    // 随机城市 — 真随机选取一个市并跳转
+    // ============================================================
+    var CITY_LIST = [
+      // 直辖市直接列出
+      { city: '北京', adcode: 110000 }, { city: '天津', adcode: 120000 },
+      { city: '上海', adcode: 310000 }, { city: '重庆', adcode: 500000 },
+      // 各省代表性城市（adcode 为省份 code，下钻后自动选城市）
+      { city: '广州', adcode: 440000 }, { city: '深圳', adcode: 440000 },
+      { city: '珠海', adcode: 440000 }, { city: '东莞', adcode: 440000 },
+      { city: '佛山', adcode: 440000 }, { city: '杭州', adcode: 330000 },
+      { city: '宁波', adcode: 330000 }, { city: '温州', adcode: 330000 },
+      { city: '南京', adcode: 320000 }, { city: '苏州', adcode: 320000 },
+      { city: '无锡', adcode: 320000 }, { city: '成都', adcode: 510000 },
+      { city: '绵阳', adcode: 510000 }, { city: '武汉', adcode: 420000 },
+      { city: '长沙', adcode: 430000 }, { city: '郑州', adcode: 410000 },
+      { city: '洛阳', adcode: 410000 }, { city: '西安', adcode: 610000 },
+      { city: '济南', adcode: 370000 }, { city: '青岛', adcode: 370000 },
+      { city: '沈阳', adcode: 210000 }, { city: '大连', adcode: 210000 },
+      { city: '哈尔滨', adcode: 230000 }, { city: '长春', adcode: 220000 },
+      { city: '厦门', adcode: 350000 }, { city: '福州', adcode: 350000 },
+      { city: '合肥', adcode: 340000 }, { city: '南昌', adcode: 360000 },
+      { city: '昆明', adcode: 530000 }, { city: '贵阳', adcode: 520000 },
+      { city: '南宁', adcode: 450000 }, { city: '桂林', adcode: 450000 },
+      { city: '海口', adcode: 460000 }, { city: '三亚', adcode: 460000 },
+      { city: '兰州', adcode: 620000 }, { city: '西宁', adcode: 630000 },
+      { city: '银川', adcode: 640000 }, { city: '乌鲁木齐', adcode: 650000 },
+      { city: '拉萨', adcode: 540000 }, { city: '呼和浩特', adcode: 150000 },
+      { city: '太原', adcode: 140000 }, { city: '石家庄', adcode: 130000 },
+      { city: '香港', adcode: 810000 }, { city: '澳门', adcode: 820000 },
+      { city: '台北', adcode: 710000 }
+    ];
+
+    function randomCity() {
+      var pick = CITY_LIST[Math.floor(Math.random() * CITY_LIST.length)];
+      var city = pick.city;
+      var adcode = pick.adcode;
+
+      // 直辖市/特别行政区 → 直接显示
+      var MUNI = [110000, 120000, 310000, 500000, 810000, 820000, 710000];
+      if (MUNI.indexOf(adcode) !== -1) {
+        showCityInfo(city);
+        return;
+      }
+
+      // 非直辖市 → 下钻到省，然后显示城市
+      drillToCity(adcode, null, city);
+    }
+
+    // ============================================================
+    // 历史面板
+    // ============================================================
+    function toggleHistory() {
+      const panel = document.getElementById('historyPanel');
+      const overlay = document.getElementById('overlay');
+      isHistoryOpen = !isHistoryOpen;
+      panel.classList.toggle('open', isHistoryOpen);
+      overlay.classList.toggle('show', isHistoryOpen);
+      if (isHistoryOpen) renderHistory();
+    }
+
+    function renderHistory() {
+      const history = getHistory();
+      const favs = getFavorites();
+      const container = document.getElementById('historyList');
+      if (history.length === 0 && favs.length === 0) {
+        container.innerHTML = '<div class="history-empty">暂无浏览记录</div>';
+        return;
+      }
+      let html = '';
+      if (favs.length) {
+        html += `<div style="font-weight:600;color:#2d4a2d;margin:8px 0 4px;">⭐ 收藏</div>`;
+        favs.forEach(city => {
+          html += `<div class="history-item"><span>⭐ ${city}</span><span class="fav-icon" onclick="removeFavorite('${city}')">✕</span></div>`;
+        });
+      }
+      html += `<div style="font-weight:600;color:#2d4a2d;margin:8px 0 4px;">📖 最近浏览</div>`;
+      history.forEach(city => {
+        const isFav = favs.includes(city);
+        html += `<div class="history-item">
+          <span>${isFav ? '⭐ ' : ''}${city}</span>
+          <span>
+            <span class="fav-icon" onclick="toggleFavoriteFromHistory('${city}')">${isFav ? '★' : '☆'}</span>
+            <span class="fav-icon" onclick="removeFromHistory('${city}')">✕</span>
+          </span>
+        </div>`;
+      });
+      container.innerHTML = html;
+    }
+
+    function toggleFavoriteFromHistory(city) {
+      let favs = getFavorites();
+      if (favs.includes(city)) {
+        favs = favs.filter(c => c !== city);
+      } else {
+        favs.push(city);
+      }
+      saveFavorites(favs);
+      renderHistory();
+      if (currentCity === city) updateStar();
+    }
+
+    function removeFavorite(city) {
+      let favs = getFavorites().filter(c => c !== city);
+      saveFavorites(favs);
+      renderHistory();
+      if (currentCity === city) updateStar();
+    }
+
+    function removeFromHistory(city) {
+      let history = getHistory().filter(c => c !== city);
+      saveHistory(history);
+      renderHistory();
+    }
+
+    // ============================================================
+    // 计算 GeoJSON 各区域中心点（用于 scatter 固定标签）
+    // ============================================================
+    function computeCenters(features) {
+      return features.map(function(f) {
+        var name = f.properties.name;
+        // 优先使用 GeoJSON 自带的 centroid（几何质心），更准确
+        var centroid = f.properties.centroid;
+        if (centroid && centroid.length === 2) {
+          return { name: name, value: centroid };
+        }
+        // 降级使用 center（行政中心坐标）
+        var center = f.properties.center;
+        if (center && center.length === 2) {
+          return { name: name, value: center };
+        }
+        // 兜底：中国中心
+        return { name: name, value: [105, 35] };
+      });
+    }
+
+    // ============================================================
+    // 初始化地图（省级）
+    // ============================================================
+    function loadProvinceMap() {
+      currentLevel = 'province';
+      currentProvinceAdcode = null;
+      fetch(CONFIG.PROVINCE_URL, { signal: AbortSignal.timeout(10000) })
+        .then(res => res.json())
+        .then(data => {
+          provinceGeo = data;
+          console.log('省级地图数据加载成功，特征数：', data.features.length);
+          echarts.registerMap('china', data);
+
+          // 计算各区域中心，用于不随缩放改变的固定标签
+          var centers = computeCenters(data.features);
+          document.getElementById('mapTitle').textContent = '中华人民共和国';
+
+          var dom = document.getElementById('map-container');
+          if (!chart) chart = echarts.init(dom);
+          chart.setOption({
+            geo: {
+              map: 'china',
+              roam: true,
+              label: { show: false },  // 关闭 geo 自带标签（会随缩放而变）
+              itemStyle: { borderColor: '#b0c8b0', borderWidth: 1 },
+              emphasis: { label: { show: false } }
+            },
+            series: [{
+              type: 'scatter',
+              coordinateSystem: 'geo',
+              data: centers,
+              symbolSize: 0,           // 隐藏散点本身
+              label: {
+                show: true,
+                color: '#2d4a2d',
+                fontSize: 11,
+                fontFamily: '-apple-system, "PingFang SC", "Microsoft YaHei", sans-serif',
+                formatter: function(p) { return p.name || ''; }
+              },
+              tooltip: { show: false },
+              silent: true,   // 不拦截点击事件，让 geo 层接收
+              z: 2
+            }]
+          });
+
+          // 监听滚轮/手势缩放时同步滑块百分比
+          chart.on('georoam', function() {
+            var opt = chart.getOption();
+            var zoom = (opt.geo && opt.geo[0] && opt.geo[0].zoom) || 1;
+            var p = Math.round(zoom * 100);
+            document.getElementById('zoomPercent').textContent = p + '%';
+            document.getElementById('zoomSlider').value = p;
+          });
+
+          chart.off('click');
+          chart.on('click', function(params) {
+            // 点击空白区域关闭气泡
+            if (!params.name || params.componentType !== 'geo') {
+              closeBubble();
+              return;
+            }
+            // 直辖市/特别行政区 → 直接显示信息（DataV 用"北京市""香港特别行政区"等全称）
+            const MUNICIPALITY_KEYWORDS = ['北京', '天津', '上海', '重庆', '香港', '澳门'];
+            const isMunicipality = MUNICIPALITY_KEYWORDS.some(kw => params.name.startsWith(kw));
+            if (isMunicipality) {
+              const feature = data.features.find(f => f.properties.name === params.name);
+              const adcode = feature ? (feature.id || feature.properties.adcode) : null;
+              showCityInfo(displayName(params.name), adcode);
+              return;
+            }
+            // 查找省份的 adcode
+            const feature = data.features.find(f => f.properties.name === params.name);
+            if (feature) {
+              const adcode = feature.id || feature.properties.adcode;
+              if (adcode) {
+                drillToCity(adcode, params.name);
+              }
+            }
+          });
+
+          dom.addEventListener('click', function(e) {
+            if (e.target === dom) closeBubble();
+          });
+
+          window.addEventListener('resize', () => chart && chart.resize());
+        })
+        .catch(err => {
+          console.error('地图加载失败:', err);
+          document.getElementById('map-container').innerHTML = '<div style="text-align:center;padding-top:40vh;color:#888;">地图数据加载失败，请检查网络</div>';
+        });
+    }
+
+    function drillToCity(provinceAdcode, provinceName, targetCity) {
+      // 关闭已有气泡，避免残留
+      closeBubble();
+      var cityUrl = 'https://geo.datav.aliyun.com/areas_v3/bound/' + provinceAdcode + '_full.json';
+      // 尝试直接加载，失败时降级
+      fetch(cityUrl, { signal: AbortSignal.timeout(8000) })
+        .then(function(res) {
+          if (!res.ok) throw new Error('城市数据不存在');
+          return res.json();
+        })
+        .then(function(data) {
+          currentLevel = 'city';
+          currentProvinceAdcode = provinceAdcode;
+          // 如果没传 provinceName，从 GeoJSON 的第一个 feature 推断
+          if (!provinceName) {
+            provinceName = data.features[0] ? data.features[0].properties.name : ('省' + provinceAdcode);
+          }
+          console.log('下钻到 ' + provinceName + '，城市数：' + data.features.length);
+          document.getElementById('mapTitle').textContent = provinceName;
+
+          echarts.registerMap(provinceName, data);
+          var centers = computeCenters(data.features);
+
+          // 计算省中心点和初始缩放
+          var provinceCenter = null;
+          var initZoom = 1.2;
+          // 从 GeoJSON 中找第一个 feature 的中心作为省份中心
+          if (data.features && data.features[0]) {
+            var firstCenter = data.features[0].properties.centroid || data.features[0].properties.center;
+            if (firstCenter && firstCenter.length === 2) {
+              provinceCenter = firstCenter;
+            }
+            // 大城市/小省份放大比例更高
+            var featureCount = data.features.length;
+            if (featureCount <= 5) initZoom = 2.0;
+            else if (featureCount <= 10) initZoom = 1.6;
+            else if (featureCount <= 20) initZoom = 1.3;
+            else initZoom = 1.1;
+          }
+
+          chart.setOption({
+            geo: {
+              map: provinceName,
+              roam: true,
+              zoom: initZoom,
+              center: provinceCenter || undefined,
+              label: { show: false },
+              itemStyle: { borderColor: '#b0c8b0', borderWidth: 1 },
+              emphasis: { label: { show: false } }
+            },
+            series: [{
+              type: 'scatter',
+              coordinateSystem: 'geo',
+              data: centers,
+              symbolSize: 0,
+              label: {
+                show: true,
+                color: '#2d4a2d',
+                fontSize: 11,
+                fontFamily: '-apple-system, "PingFang SC", "Microsoft YaHei", sans-serif'
+              },
+              tooltip: { show: false },
+              silent: true,   // 不拦截点击事件，让 geo 层接收
+              z: 2
+            }]
+          });
+
+          // 监听滚轮/手势缩放时同步滑块百分比
+          chart.on('georoam', function() {
+            var opt = chart.getOption();
+            var zoom = (opt.geo && opt.geo[0] && opt.geo[0].zoom) || 1;
+            var p = Math.round(zoom * 100);
+            document.getElementById('zoomPercent').textContent = p + '%';
+            document.getElementById('zoomSlider').value = p;
+          });
+
+          chart.off('click');
+          chart.on('click', function(params) {
+            // 点击空白区域关闭气泡
+            if (!params.name || params.componentType !== 'geo') {
+              closeBubble();
+              return;
+            }
+            // 从 GeoJSON feature 提取 adcode（高德天气用 adcode 最可靠，避免自治州名称截断问题）
+            const feature = (data.features || []).find(function(f) { return f.properties.name === params.name; });
+            const adcode = feature ? (feature.id || feature.properties.adcode) : null;
+            showCityInfo(displayName(params.name), adcode);
+          });
+
+          // 随机城市跳转：自动选中目标城市
+          if (targetCity) {
+            setTimeout(function() {
+              showCityInfo(targetCity);
+            }, 300);
+          }
+
+          // 更新工具栏：显示返回按钮
+          updateToolbar(provinceName);
+
+          // 同步缩放滑块
+          var pct = Math.round(initZoom * 100);
+          document.getElementById('zoomPercent').textContent = pct + '%';
+          document.getElementById('zoomSlider').value = pct;
+        })
+        .catch(err => {
+          console.error('城市地图加载失败:', err);
+          // 降级：直接使用省份名查询
+          showCityInfo(provinceName);
+        });
+    }
+
+    function updateToolbar(provinceName) {
+      const rightTools = document.querySelector('.right-tools');
+      // 移除旧的返回按钮
+      const oldBack = document.getElementById('cityBackBtn');
+      if (oldBack) oldBack.remove();
+
+      const backBtn = document.createElement('button');
+      backBtn.id = 'cityBackBtn';
+      backBtn.className = 'history-btn';
+      backBtn.innerHTML = '← 返回全国';
+      backBtn.onclick = function() {
+        loadProvinceMap();
+        this.remove();
+      };
+      rightTools.prepend(backBtn);
+    }
+
+    // ============================================================
+    // 移动端菜单
+    // ============================================================
+    function toggleMobileMenu() {
+      var menu = document.getElementById('mobileDropdown');
+      menu.classList.toggle('show');
+      if (menu.classList.contains('show')) {
+        setTimeout(function() {
+          document.addEventListener('click', closeMobileMenuHandler);
+        }, 10);
+      }
+    }
+
+    function closeMobileMenu() {
+      var menu = document.getElementById('mobileDropdown');
+      if (menu) menu.classList.remove('show');
+      document.removeEventListener('click', closeMobileMenuHandler);
+    }
+
+    function closeMobileMenuHandler(e) {
+      var menu = document.getElementById('mobileDropdown');
+      var btn = document.getElementById('hamburgerBtn');
+      if (menu && btn && !menu.contains(e.target) && !btn.contains(e.target)) {
+        closeMobileMenu();
+      }
+    }
+
+    // ============================================================
+    // 缩放控件
+    // ============================================================
+    function initZoomControls() {
+      const slider = document.getElementById('zoomSlider');
+      const pct = document.getElementById('zoomPercent');
+      if (!slider || !pct) return;
+
+      function setZoom(val) {
+        if (!chart) return;
+        var v = parseInt(val);
+        chart.setOption({
+          geo: { zoom: v / 100 }
+        });
+        pct.textContent = v + '%';
+        slider.value = v;
+      }
+
+      document.getElementById('zoomInBtn').addEventListener('click', function() {
+        setZoom(Math.min(300, parseInt(slider.value) + 20));
+      });
+      document.getElementById('zoomOutBtn').addEventListener('click', function() {
+        setZoom(Math.max(50, parseInt(slider.value) - 20));
+      });
+      slider.addEventListener('input', function() {
+        setZoom(this.value);
+      });
+
+    }
+
+    // 点击空白关闭气泡（全局，但避免干扰）
+    document.addEventListener('click', function(e) {
+      const bubble = document.getElementById('bubble');
+      if (bubble.style.display === 'block' && !bubble.contains(e.target) && !e.target.closest('.history-panel') && !e.target.closest('.toolbar')) {
+        // 如果点击的是地图容器，由上面的事件处理，这里不重复关闭
+        if (!e.target.closest('#map-container')) {
+          closeBubble();
+        }
+      }
+    });
+
+    // 启动地图
+    loadProvinceMap();
+    initZoomControls();
+    // 加载已缓存位置，不自动弹出授权请求
+    requestUserLocation(false).then(function(loc) {
+      if (loc) {
+        setTimeout(updateUserMarker, 500);
+      }
+    });
+    // 检查是否有从聊天返回的路线
+    setTimeout(loadRouteFromStorage, 2000);
+  </script>
+</body>
+</html>

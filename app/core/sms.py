@@ -62,13 +62,13 @@ async def send_sms(phone: str, code: str, ttl_minutes: int = 5) -> bool:
     """
     if not ALIBABA_CLOUD_ACCESS_KEY_ID or not ALIBABA_CLOUD_ACCESS_KEY_SECRET:
         # ----- 无阿里云配置 → 演示模式仅打印日志 -----
-        logger.info(f"📱 [演示模式] 验证码 {code} 已发送至 {phone}")
-        logger.info(f"📱 需配置 ALIBABA_CLOUD_ACCESS_KEY_ID/SECRET 以启用真实短信")
+        logger.info(f"[演示模式] 验证码 {code} 已发送至 {phone}")
+        logger.info(f"需配置 ALIBABA_CLOUD_ACCESS_KEY_ID/SECRET 以启用真实短信")
         try:
             import subprocess
             subprocess.Popen(
                 ["powershell", "-Command",
-                 f'Write-Host "📱 验证码: {code} (发送至 {phone})" -ForegroundColor Green'],
+                 f'Write-Host "验证码: {code} (发送至 {phone})" -ForegroundColor Green'],
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
         except Exception:
@@ -107,21 +107,21 @@ async def send_sms(phone: str, code: str, ttl_minutes: int = 5) -> bool:
             result = resp.json()
 
             if result.get("Code") == "OK":
-                logger.info(f"✅ 短信发送成功: phone={phone}, bizId={result.get('BizId', '')}")
+                logger.info(f"短信发送成功: phone={phone}, bizId={result.get('BizId', '')}")
                 return True
             else:
-                logger.error(f"❌ 短信发送失败: phone={phone}, Code={result.get('Code')}, Message={result.get('Message')}")
+                logger.error(f"短信发送失败: phone={phone}, Code={result.get('Code')}, Message={result.get('Message')}")
                 logger.error(f"   建议检查: 1) AccessKey 权限 2) SMS_TEMPLATE_CODE 3) 短信签名审核状态")
                 return False
 
     except Exception as e:
-        logger.error(f"❌ 短信发送异常: {e}")
+        logger.error(f"短信发送异常: {e}")
         return False
 
 
 async def send_admin_notification(message: str) -> bool:
     """向管理员发送通知短信"""
     if ADMIN_PHONE:
-        logger.info(f"📱 [管理员通知] {ADMIN_PHONE}: {message}")
+        logger.info(f"[管理员通知] {ADMIN_PHONE}: {message}")
         return True
     return False

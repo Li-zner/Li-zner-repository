@@ -135,7 +135,7 @@ def check_query(query: str, threshold: float = 0.3) -> Optional[dict]:
         }
         或 None（无匹配）
     """
-    # ⚠️ 如果问题明确提到了「民法典」或具体法条编号，跳过映射表
+    # 如果问题明确提到了「民法典」或具体法条编号，跳过映射表
     #    避免将明确的民法典问题误归入其他法律
     import re
     if "民法典" in query or re.search(r'第[0-9零一二三四五六七八九十百千]+条', query):

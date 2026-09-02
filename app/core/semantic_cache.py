@@ -115,7 +115,7 @@ class SemanticCache:
                     "WHERE query_hash = $1 AND cache_ctx = $2",
                     query_hash, cache_ctx,
                 )
-                logger.info(f"✅ 精确缓存命中: {query[:30]}...")
+                logger.info(f"精确缓存命中: {query[:30]}...")
                 semantic_cache_hits_total.inc()
                 # 回填 L0（随机过期防雪崩）
                 _hot_cache.set(l0_key, row["response"], ttl=_hot_ttl())
@@ -143,14 +143,14 @@ class SemanticCache:
                     query_hash,
                     row["id"],
                 )
-                logger.info(f"✅ 语义缓存命中 (相似度 {row['sim']:.2f}): {query[:30]}...")
+                logger.info(f"语义缓存命中 (相似度 {row['sim']:.2f}): {query[:30]}...")
                 semantic_cache_hits_total.inc()
                 # 回填 L0 + L1
                 _hot_cache.set(l0_key, row["response"], ttl=_hot_ttl())
                 return row["response"]
 
             # 未命中
-            logger.info(f"❌ 缓存未命中: {query[:30]}...")
+            logger.info(f"缓存未命中: {query[:30]}...")
             semantic_cache_misses_total.inc()
             return None
 
@@ -166,12 +166,12 @@ class SemanticCache:
         - 支持自定义 ttl（穿透占位用短 TTL）
         """
         if response is None or not str(response).strip():
-            logger.info(f"⛔ 缓存写入跳过（空响应）: {query[:30]}...")
+            logger.info(f"缓存写入跳过（空响应）: {query[:30]}...")
             return
         # 防止把兜底/错误回复写入缓存
         from ..core.config import DEEPSEEK_FALLBACK_MESSAGE
         if str(response).strip() == DEEPSEEK_FALLBACK_MESSAGE:
-            logger.info(f"⛔ 缓存写入跳过（兜底回复）: {query[:30]}...")
+            logger.info(f"缓存写入跳过（兜底回复）: {query[:30]}...")
             return
 
         # 先写入 L0（随机过期防雪崩）
@@ -193,7 +193,7 @@ class SemanticCache:
                 response,
                 cache_ctx,
             )
-            logger.info(f"💾 缓存写入: {query[:30]}...")
+            logger.info(f"缓存写入: {query[:30]}...")
 
     @staticmethod
     async def set_empty(query: str, cache_ctx: str = "", ttl: int = 30):
@@ -201,24 +201,12 @@ class SemanticCache:
 
         同一 query 在短时间内重复出现时，通过重建锁 + 该标记避免反复打底层。
         ttl 短（默认 30s），不污染长期缓存。
+        仅写 L0 热缓存（带 TTL）而非 PG：PG 行的 __EMPTY__ 无过期机制，
+        get 也不按时间过滤，会把占位钉死成“该 query 永久繁忙”（P1 修复）。
+        跨实例互斥已由 Redis 重建锁承担，L0 短 TTL 足够缓解穿透。
         """
-        pool = await get_pool()
-        query_hash = hashlib.sha256(query.encode()).hexdigest()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO semantic_cache (query_hash, query_text, response, cache_ctx)
-                VALUES ($1, $2, '__EMPTY__', $3)
-                ON CONFLICT (query_hash, cache_ctx) DO UPDATE
-                SET response = '__EMPTY__', hit_count = 0
-                """,
-                query_hash,
-                query,
-                cache_ctx,
-            )
-        # 同时占位 L0（短 TTL，避免穿透）
         _hot_cache.set(_cache_l0_key(query, cache_ctx), "__EMPTY__", ttl=ttl)
-        logger.info(f"🛡️ 穿透占位写入: {query[:30]}... (ttl={ttl}s)")
+        logger.info(f"穿透占位写入: {query[:30]}... (ttl={ttl}s)")
 
     @staticmethod
     async def is_empty(response) -> bool:

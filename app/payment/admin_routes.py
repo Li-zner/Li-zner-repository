@@ -4,7 +4,6 @@
 提供支付统计、全量订单管理、对账、渠道管理等功能。
 仅 admin 角色可访问。
 """
-from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
@@ -80,13 +79,16 @@ async def api_admin_update_channel(
         raise HTTPException(status_code=403, detail="仅管理员可访问")
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
+        result = await conn.execute(
             "UPDATE payment_channels SET fee_rate = $1, is_active = $2, "
             "min_amount = $3, max_amount = $4, updated_at = CURRENT_TIMESTAMP "
             "WHERE channel_code = $5",
             req.fee_rate, req.is_active, req.min_amount, req.max_amount,
             req.channel_code,
         )
+    # P2 修复：渠道不存在时 UPDATE 零行，如实报 404 而非误报"已更新"
+    if result == "UPDATE 0":
+        raise HTTPException(status_code=404, detail=f"渠道不存在: {req.channel_code}")
     return {"message": "渠道配置已更新"}
 
 
@@ -133,13 +135,14 @@ async def api_admin_reconcile(current_user: dict = Depends(get_current_user)):
     _end = _start + timedelta(days=1)
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # 统计今日订单
+        # 统计今日订单（P2 口径修复：success 含部分退款单；金额排除退款单，退款单独行统计）
         row = await conn.fetchrow(
             "SELECT COUNT(*) as total_orders, "
-            "COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) as success_orders, "
+            "COALESCE(SUM(CASE WHEN status IN ('success', 'partial_refunded') THEN 1 ELSE 0 END), 0) as success_orders, "
             "COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) as failed_orders, "
-            "COALESCE(SUM(amount), 0) as total_amount, "
-            "COALESCE(SUM(CASE WHEN status = 'success' THEN amount ELSE 0 END), 0) as success_amount "
+            "COALESCE(SUM(CASE WHEN order_type != 'refund' THEN amount ELSE 0 END), 0) as total_amount, "
+            "COALESCE(SUM(CASE WHEN status IN ('success', 'partial_refunded') AND order_type != 'refund' "
+            "THEN amount ELSE 0 END), 0) as success_amount "
             "FROM payment_orders WHERE created_at >= $1 AND created_at < $2",
             _start, _end,
         )

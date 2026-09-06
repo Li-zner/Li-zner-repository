@@ -74,7 +74,7 @@ class MemoryManager:
             rows = await conn.fetch(
                 "SELECT role, content FROM conversation_memories "
                 "WHERE user_id = $1 AND conversation_id = $2 "
-                "ORDER BY created_at DESC LIMIT $3 OFFSET $4",
+                "ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4",
                 self.user_id, self.conv_id, limit, offset
             )
             return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
@@ -97,8 +97,8 @@ class MemoryManager:
             last_raw = await redis.lindex(self._history_key, -1)
             if last_raw is not None:
                 last = json.loads(last_raw)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"去重检查读取末条消息失败: {e}")
         # 先写用户消息（除非已存在），再写助手消息，保持顺序
         if last != user_msg:
             await redis.rpush(self._history_key, json.dumps(user_msg))
@@ -109,15 +109,23 @@ class MemoryManager:
         asyncio.create_task(self._save_to_pg(user_msg, assistant_msg))
 
     # ---------- 条数限制 + 滚动压缩摘要 ----------
+    # 原子裁剪：LLEN/LRANGE/LTRIM 三步合一。拆开执行时并发 append 会挤动下标，
+    # 一条消息可能既被 LTRIM 裁掉又没进 overflow 列表（热缓存丢消息，P2 修复）
+    _TRIM_LUA = """
+local llen = redis.call('LLEN', KEYS[1])
+local keep = tonumber(ARGV[1])
+if llen <= keep then return nil end
+local overflow = redis.call('LRANGE', KEYS[1], 0, llen - keep - 1)
+redis.call('LTRIM', KEYS[1], -keep, -1)
+return overflow
+"""
+
     async def _trim_and_compress(self, redis):
         """保留最近 HISTORY_LIMIT 条；溢出的旧消息异步压缩为滚动摘要"""
         try:
-            llen = await redis.llen(self._history_key)
-            if llen <= HISTORY_LIMIT:
-                return
-            overflow = await redis.lrange(self._history_key, 0, llen - HISTORY_LIMIT - 1)
-            await redis.ltrim(self._history_key, -HISTORY_LIMIT, -1)
-            asyncio.create_task(self._compress_overflow(overflow))
+            overflow = await redis.eval(self._TRIM_LUA, 1, self._history_key, HISTORY_LIMIT)
+            if overflow:
+                asyncio.create_task(self._compress_overflow(overflow))
         except Exception as e:
             logger.warning(f"对话历史条数裁剪失败: {e}")
 
@@ -160,42 +168,37 @@ class MemoryManager:
                 logger.warning(f"PG 写入失败（不影响主流程）: {e}")
 
     # ---------- L3：用户画像更新 ----------
-    async def save_user_location(self, city: str):
-        """保存用户定位到画像（异步，不阻塞）"""
-        import asyncio
-        # 验证城市名称合法性：仅含中文、字母、空格，长度2-20
-        import re
-        if not city or not re.match(r'^[\u4e00-\u9fa5a-zA-Z\s]{2,20}$', city.strip()):
-            logger.warning(f"保存定位跳过：无效的城市名称 '{city}'")
-            return
-        city = city.strip()
-        asyncio.create_task(self._save_location_to_pg(city))
-
-    async def _save_location_to_pg(self, city: str):
-        async with _PG_WRITE_SEMAPHORE:
-            try:
-                pool = await get_pool()
-                async with pool.acquire() as conn:
-                    new_profile = {"recent_cities": [city], "last_location": city}
-                    await conn.execute(
-                        "INSERT INTO user_profiles (user_id, profile) VALUES ($1, $2) "
-                        "ON CONFLICT (user_id) DO UPDATE "
-                        "SET profile = user_profiles.profile || $2, updated_at = NOW()",
-                        self.user_id, json.dumps(new_profile)
-                    )
-            except Exception as e:
-                logger.warning(f"保存定位到画像失败: {e}")
+    # （save_user_location 已随"出发地"手动输入功能一并移除；画像城市仍由
+    # _update_profile_async 从对话文本自然提取）
 
     async def _update_profile_async(self, conn, user_content: str, assistant_content: str):
         import re
         new_profile = {}
         # 只匹配以 市/州/省/区 结尾的地名（至少2字），避免把"今天""你好"等词误认为城市
         cities = re.findall(r'([\u4e00-\u9fa5]{2,4}(?:市|州|省|区|自治区))', user_content)
+        # 过滤带动词前缀的误匹配（"我从广州"被"州"后缀误抓——广州/苏州/杭州本身含州）
+        cities = [c for c in cities if not re.match(r'^(我从|我在|我想|我们|想去|去了|回到|飞到|来到)', c)]
         if cities:
             new_profile["recent_cities"] = cities
         budget_match = re.search(r'(\d+)[-~](\d+)?元', user_content)
         if budget_match:
             new_profile["budget"] = budget_match.group(0)
+        # 出行人数（"我们4个人/一家3口/2大1小"）
+        people_match = re.search(r'(\d+)\s*个?人|一家\s*(\d+)\s*口|(\d+)大\s*(\d+)小', user_content)
+        if people_match:
+            new_profile["travelers"] = next(g for g in people_match.groups() if g)
+        # 规划天数（"玩3天/5天行程"）
+        days_match = re.search(r'(\d+)\s*天', user_content)
+        if days_match:
+            new_profile["days"] = days_match.group(0)
+        # 目的地（"去X旅游/去X玩"——地图「去这里」prompt 场景）
+        dest_match = re.search(r'去([一-龥]{2,8}?)(?:旅游|玩|旅行)', user_content)
+        if dest_match:
+            new_profile["destination"] = dest_match.group(1)
+        # 出发地（"我从X出发/我从X到"——地图 prompt 场景；"我"字排除误匹配）
+        origin_match = re.search(r'我(?:们)?从([一-龥]{2,8}?)(?:出发|到|去)', user_content)
+        if origin_match:
+            new_profile["origin"] = origin_match.group(1)
         if new_profile:
             await conn.execute(
                 "INSERT INTO user_profiles (user_id, profile) VALUES ($1, $2) "
@@ -213,10 +216,11 @@ class MemoryManager:
                 self.user_id
             )
             if row and row["profile"]:
-                # 跳过过期画像（90天未更新）
-                from datetime import datetime, timedelta
+                # 跳过过期画像（90天未更新；DB 列为无时区 TIMESTAMP/UTC，本地 now() 会随时区漂移）
+                from datetime import datetime, timedelta, timezone
                 updated = row["updated_at"]
-                if updated and (datetime.now() - updated) > timedelta(days=90):
+                utc_naive_now = datetime.now(timezone.utc).replace(tzinfo=None)
+                if updated and (utc_naive_now - updated) > timedelta(days=90):
                     # 原子条件删除（P1 #44）：带过期条件，避免"读-删"两步竞态与重复清理
                     await conn.execute(
                         "DELETE FROM user_profiles WHERE user_id = $1 "
@@ -235,8 +239,14 @@ class MemoryManager:
                         parts.append(f"最近城市: {', '.join(profile_data['recent_cities'])}")
                     if profile_data.get("budget"):
                         parts.append(f"预算: {profile_data['budget']}")
-                    if profile_data.get("last_location"):
-                        parts.append(f"定位: {profile_data['last_location']}")
+                    if profile_data.get("origin"):
+                        parts.append(f"出发地: {profile_data['origin']}")
+                    if profile_data.get("destination"):
+                        parts.append(f"目的地: {profile_data['destination']}")
+                    if profile_data.get("travelers"):
+                        parts.append(f"人数: {profile_data['travelers']}人")
+                    if profile_data.get("days"):
+                        parts.append(f"行程: {profile_data['days']}")
                     if parts:
                         return f"【用户画像】{' | '.join(parts)}"
                     return f"【用户画像】{json.dumps(profile_data, ensure_ascii=False)}"

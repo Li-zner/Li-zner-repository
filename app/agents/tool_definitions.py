@@ -148,17 +148,3 @@ TRAVEL_TOOLS = [TOOL_WEATHER, TOOL_HOTEL, TOOL_ROUTE, TOOL_FOOD]
 CIVIL_CODE_TOOLS = [TOOL_SEARCH_KNOWLEDGE]
 
 FULL_TOOLS = ALL_TOOLS  # 所有工具（用于复杂任务/推荐模式）
-
-
-# ============================================================
-# 工具名称 → 处理函数的映射
-# ============================================================
-TOOL_HANDLER_MAP = {
-    "query_weather": "fetch_weather_async",
-    "query_hotel": "call_sub_agent",
-    "query_route": "call_sub_agent",
-    "query_food": "call_sub_agent",
-    "search_knowledge": "search_knowledge",
-    "web_search": "web_search",
-    "search_project_knowledge": "search_project_knowledge",
-}

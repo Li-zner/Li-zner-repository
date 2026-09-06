@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from ..core.db import get_pool
 from ..core.redis import get_redis
 from ..middleware.auth import get_current_user
+from .journal import parse_jsonb, format_ts
 
 router = APIRouter(prefix="/api/cdc", tags=["cdc"])
 
@@ -38,9 +39,9 @@ def _fmt(r):
         "table": r["table_name"],
         "op": r["op_type"],
         "pk": r["pk_value"],
-        "before": r["row_before"],
-        "after": r["row_after"],
-        "ts": (r["created_at"].isoformat() + "Z") if r["created_at"] else None,  # P2 #15：UTC 标记
+        "before": parse_jsonb(r["row_before"]),
+        "after": parse_jsonb(r["row_after"]),
+        "ts": format_ts(r["created_at"]),
     }
 
 
@@ -67,6 +68,7 @@ async def journal_info(user=Depends(get_current_user)):
     """落盘日志文件与 checkpoint 信息（仅 admin，P1 #11）"""
     _require_admin(user)
     j = _get_journal()
+    j.refresh_checkpoint()  # 重读 worker 最新 checkpoint，避免首次创建后 last_id 冻结（P1）
     return {
         "dir": j.journal_dir,
         "files": j.list_files(),
@@ -79,6 +81,7 @@ async def cdc_status(user=Depends(get_current_user)):
     """worker 处理进度（last_id 来自 checkpoint；仅 admin，P1 #11）"""
     _require_admin(user)
     j = _get_journal()
+    j.refresh_checkpoint()  # 重读 worker 最新 checkpoint，避免 last_id 冻结（P1）
     redis = await get_redis()
     leader = bool(await redis.exists("cdc:leader"))
     return {

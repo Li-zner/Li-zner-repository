@@ -7,6 +7,7 @@ DFA 敏感词过滤器
 import os
 import re
 from ..core.logging import setup_logging
+from ..core.metrics import safety_filter_timeout_total
 
 logger = setup_logging()
 
@@ -92,7 +93,9 @@ class SafetyFilter:
             node.is_end = True
 
     # ── 安全白名单上下文 ──
-    # 当文本包含这些安全上下文时，跳过敏感词检查（避免法律/旅游查询被误伤）
+    # 命中词所在句包含这些上下文时豁免该处命中（避免法律/旅游讲解被误伤）。
+    # 注意：豁免范围是"同一句"，不是全文——全文一票豁免可被输出中任意一个
+    # 白名单词绕过整个过滤器（P1 修复）。
     _SAFE_CONTEXTS = [
         "民法典", "法律咨询", "法律条款", "法条", "离婚冷静期",
         "危险徒步", "危险路线", "安全吗", "注意安全",
@@ -110,7 +113,7 @@ class SafetyFilter:
         """检查文本是否在安全上下文中（如法律咨询、旅游推荐）
 
         注（C4）：保持子串匹配——中文无空格词边界，正则 \b 不可靠；
-        白名单上下文误判的代价是跳过敏感检查，当前风险可控。
+        白名单上下文误判的代价是跳过该句敏感检查，当前风险可控。
         """
         if not text:
             return False
@@ -120,26 +123,53 @@ class SafetyFilter:
                 return True
         return False
 
+    # 句末标点/换行（切句；豁免范围 = 命中词所在句）
+    _SENTENCE_END_RE = re.compile(r"[。！？!?…\n\r；;]+")
+
+    def _split_sentences(self, text: str) -> list:
+        """按句末标点切句并保留字符偏移，返回 [(start, end, 句文本), ...]"""
+        spans = []
+        pos = 0
+        for m in self._SENTENCE_END_RE.finditer(text):
+            if m.start() > pos:
+                spans.append((pos, m.end(), text[pos:m.end()]))
+            pos = m.end()
+        if pos < len(text):
+            spans.append((pos, len(text), text[pos:]))
+        return spans
+
+    def _sentence_at(self, text: str, pos: int) -> str:
+        """返回 pos 所在句的文本"""
+        for start, end, sent in self._split_sentences(text):
+            if start <= pos < end:
+                return sent
+        return text
+
     def contains_sensitive(self, text: str, timeout_ms: int = 500) -> bool:
         """
-        检查文本是否包含敏感词（带超时保护 + 安全上下文白名单）
-        timeout_ms: 最大扫描毫秒数，超时视为安全
+        检查文本是否包含敏感词（带超时保护）
+        白名单豁免收窄到"命中词所在句"：整句含白名单词（如民法典法律讲解）才豁免，
+        不再因全文任意位置出现白名单词而放行全部内容（P1 修复绕过）
         """
         if not text:
-            return False
-        # 先检查安全上下文白名单
-        if self._in_safe_context(text):
             return False
         # 大文本只扫描前 5000 字符，避免 O(n²) 卡死事件循环（P1 #58）
         text = text[:5000]
         import time
         start = time.perf_counter()
+        sentences = self._split_sentences(text)
+        si = 0
         n = len(text)
         for i in range(n):
             # 超时保护：防止大文本卡死事件循环
             if timeout_ms > 0 and (time.perf_counter() - start) * 1000 > timeout_ms:
+                # fail-open 放行（防卡死初衷），但必须可观测——对抗性文本可逼近超时绕过过滤（P2 修复）
+                safety_filter_timeout_total.inc()
                 logger.warning(f"DFA 扫描超时({timeout_ms}ms)，跳过安全检查")
                 return False
+            # 外层 i 单调递增，句指针随之推进
+            while si + 1 < len(sentences) and i >= sentences[si][1]:
+                si += 1
             node = self._root
             for j in range(i, n):
                 char = text[j]
@@ -147,6 +177,9 @@ class SafetyFilter:
                     break
                 node = node.children[char]
                 if node.is_end:
+                    # 同句豁免：命中词所在句含白名单词 → 该处命中不触发，继续扫后续
+                    if self._in_safe_context(sentences[si][2]):
+                        break
                     self._last_triggered = text[i:j+1]
                     return True
         return False
@@ -169,7 +202,8 @@ class SafetyFilter:
 
     def find_first(self, text: str) -> tuple:
         """
-        找到第一个敏感词
+        找到第一个敏感词（不含白名单同句豁免，仅供 check_stream 内部使用——
+        对外检查请用 contains_sensitive / check_stream，两者才带豁免语义）
         返回: (敏感词, 起始位置, 结束位置) 或 None
         """
         if not text:
@@ -186,41 +220,30 @@ class SafetyFilter:
                     return (text[i:j+1], i, j+1)
         return None
 
-    def filter_text(self, text: str, mask_char: str = "*") -> str:
-        """将文本中的敏感词替换为掩码字符"""
-        if not text:
-            return text
-        result = list(text)
-        for i in range(len(text)):
-            node = self._root
-            for j in range(i, len(text)):
-                char = text[j]
-                if char not in node.children:
-                    break
-                node = node.children[char]
-                if node.is_end:
-                    for k in range(i, j + 1):
-                        result[k] = mask_char
-        return "".join(result)
-
     def check_stream(self, chunk: str) -> dict:
         """
-        检查流式输出块是否触发敏感词
+        检查流式输出块是否触发敏感词（同句豁免，与 contains_sensitive 规则一致）
         返回: {"safe": True/False, "chunk": 处理后的chunk, "triggered_word": "敏感词"}
         """
         if not chunk:
             return {"safe": True, "chunk": chunk, "triggered_word": None}
-
-        result = self.find_first(chunk)
-        if result:
+        offset = 0
+        while True:
+            result = self.find_first(chunk[offset:])
+            if not result:
+                return {"safe": True, "chunk": chunk, "triggered_word": None}
             word, start, end = result
+            abs_start, abs_end = offset + start, offset + end
+            # 同句豁免：命中词所在句含白名单词 → 跳过该命中继续向后找
+            if self._in_safe_context(self._sentence_at(chunk, abs_start)):
+                offset = abs_end
+                continue
             logger.warning(f"DFA 过滤器触发: 敏感词='{word}'")
             return {
                 "safe": False,
-                "chunk": chunk[:start],
+                "chunk": chunk[:abs_start],
                 "triggered_word": word
             }
-        return {"safe": True, "chunk": chunk, "triggered_word": None}
 
     @property
     def safe_message(self) -> str:
@@ -238,3 +261,23 @@ def get_filter() -> SafetyFilter:
     if _filter is None:
         _filter = SafetyFilter()
     return _filter
+
+
+# ============================================================
+# 用户可见错误文案卫生：剥离 URL / Key 形状等基础设施指纹
+# ============================================================
+_URL_RE = re.compile(r"https?://\S+")
+# 不能用 \b——中文汉字在 Python re 里算 \w，"是sk-xxx" 会因无词边界漏检
+_KEY_RE = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{8,}")
+
+
+def sanitize_error_text(text: str, fallback: str = "服务暂时不可用，请稍后再试") -> str:
+    """异常/工具错误文案 → 用户可见文案：剥 URL（可能带 key 参数）与 sk- Key 形状
+
+    httpx 异常 str 会带完整请求 URL（高德 key 就在 URL 参数里），任务状态轮询与
+    tool_result 事件都会透传到前端，所有面向用户的错误出口统一过此函数。
+    """
+    if not text:
+        return fallback
+    cleaned = _KEY_RE.sub("", _URL_RE.sub("", str(text))).strip(" ：:，,-。")
+    return cleaned or fallback

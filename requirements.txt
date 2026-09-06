@@ -1,0 +1,31 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+prometheus-client==0.21.1
+prometheus-fastapi-instrumentator==7.1.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==3.2.2
+pydantic==2.10.4
+pydantic-settings==2.6.1
+alembic==1.18.5
+python-multipart==0.0.20
+pyyaml
+opentelemetry-api==1.27.0
+opentelemetry-sdk==1.27.0
+opentelemetry-instrumentation-fastapi==0.48b0
+circuitbreaker==2.0.0
+redis==5.2.0
+asyncpg
+authlib
+itsdangerous
+uvloop==0.21.0
+orjson
+opentelemetry-exporter-otlp-proto-http==1.27.0
+python-docx==1.1.2
+openpyxl==3.1.5
+PyMuPDF
+pytesseract
+# sentence-transformers 在 Dockerfile 中单独安装（CPU-only torch）
+# web_search 主路径依赖（DDGS 同步客户端，代码中包 asyncio.to_thread）
+duckduckgo-search>=6.0.0

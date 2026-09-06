@@ -7,7 +7,7 @@
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from ..core.db import get_pool
 from ..core.logging import setup_logging
@@ -20,7 +20,14 @@ logger = setup_logging()
 COMPRESS_AFTER_DAYS = 30       # 对话记忆 30 天后压缩
 PROFILE_EXPIRE_DAYS = 90        # 用户画像 90 天未更新则清理
 CACHE_CLEAN_DAYS = 60           # 语义缓存 60 天未命中则清理
+CACHE_HARD_MAX_DAYS = 180       # 语义缓存硬过期：命中再高超过 180 天也清理（防热门条目永生）
 BATCH_SIZE = 500                # 每批处理条数
+
+
+def _utc_naive_now() -> datetime:
+    """UTC 当前时间（naive）。所有时间列均为无时区 TIMESTAMP 且 DB 会话为 UTC，
+    用本地 now() 会在容器时区被改写时产生漂移，统一取 UTC 后去 tzinfo。"""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 async def compress_old_conversations():
@@ -32,16 +39,19 @@ async def compress_old_conversations():
     4. 插入压缩后的记录
     """
     pool = await get_pool()
-    cutoff = datetime.now() - timedelta(days=COMPRESS_AFTER_DAYS)
+    cutoff = _utc_naive_now() - timedelta(days=COMPRESS_AFTER_DAYS)
     logger.info(f"开始压缩 {cutoff.date()} 之前的对话记忆...")
 
     async with pool.acquire() as conn:
         # 获取需要压缩的对话列表（分组统计）
+        # P1 修复：排除已压缩的摘要记录（role='system'）——否则摘要记录（created_at
+        # 用 last_msg 旧时间，恒 < cutoff）下一轮被再次选中，msg_count=1 走单条删除
+        # 分支把摘要本身删掉，30 天前的对话历史两个维护周期后永久丢失
         rows = await conn.fetch("""
             SELECT user_id, conversation_id, COUNT(*) as msg_count,
                    MIN(created_at) as first_msg, MAX(created_at) as last_msg
             FROM conversation_memories
-            WHERE created_at < $1
+            WHERE created_at < $1 AND role != 'system'
             GROUP BY user_id, conversation_id
             ORDER BY MIN(created_at)
         """, cutoff)
@@ -53,57 +63,16 @@ async def compress_old_conversations():
         total_compressed = 0
         for row in rows:
             if row["msg_count"] < 2:
-                # 只有一条消息的直接删除
+                # 只有一条消息的直接删除（同样排除摘要记录，双保险）
                 await conn.execute("""
                     DELETE FROM conversation_memories
                     WHERE user_id=$1 AND conversation_id=$2 AND created_at < $3
+                      AND role != 'system'
                 """, row["user_id"], row["conversation_id"], cutoff)
                 total_compressed += row["msg_count"]
                 continue
 
-            # 获取该对话的所有消息内容
-            msg_rows = await conn.fetch("""
-                SELECT role, content, created_at
-                FROM conversation_memories
-                WHERE user_id=$1 AND conversation_id=$2 AND created_at < $3
-                ORDER BY created_at ASC
-            """, row["user_id"], row["conversation_id"], cutoff)
-
-            # 生成摘要
-            msg_count = len(msg_rows)
-            first_time = msg_rows[0]["created_at"].strftime("%Y-%m-%d %H:%M")
-            last_time = msg_rows[-1]["created_at"].strftime("%Y-%m-%d %H:%M")
-
-            # 提取用户主要关注点
-            user_messages = [m["content"][:200] for m in msg_rows if m["role"] == "user"]
-            user_summary = "；".join(user_messages[:5])
-            if len(user_messages) > 5:
-                user_summary += f"……（共{len(user_messages)}条用户消息）"
-
-            compressed_content = json.dumps({
-                "type": "compressed",
-                "original_count": msg_count,
-                "period": f"{first_time} ~ {last_time}",
-                "summary": f"用户在该对话中主要关注：{user_summary}",
-                "full_text": "\n".join([f"{m['role']}: {m['content']}" for m in msg_rows])
-            }, ensure_ascii=False)
-
-            # 原子压缩：DELETE 与 INSERT 必须同事务（P0 #44），中断时回滚防对话数据丢失
-            async with conn.transaction():
-                # 删除原始详细记录
-                await conn.execute("""
-                    DELETE FROM conversation_memories
-                    WHERE user_id=$1 AND conversation_id=$2 AND created_at < $3
-                """, row["user_id"], row["conversation_id"], cutoff)
-
-                # 插入压缩后的摘要记录
-                await conn.execute("""
-                    INSERT INTO conversation_memories
-                    (user_id, conversation_id, role, content, created_at)
-                    VALUES ($1, $2, 'system', $3, $4)
-                """, row["user_id"], row["conversation_id"], compressed_content, row["last_msg"])
-
-            total_compressed += msg_count
+            total_compressed += await _compress_one_conversation(conn, row, cutoff)
 
             # 每批暂停一下，避免长时间锁表
             if total_compressed % (BATCH_SIZE * 5) == 0:
@@ -112,13 +81,67 @@ async def compress_old_conversations():
         logger.info(f"对话压缩完成，共压缩 {total_compressed} 条消息，{len(rows)} 个对话")
 
 
+async def _compress_one_conversation(conn, row, cutoff) -> int:
+    """压缩单个对话：取消息 -> 生成摘要 JSON -> 同事务 DELETE 原始记录 + INSERT 摘要。
+
+    返回本次压缩的消息条数。原子性见 P0 #44（中断回滚防对话数据丢失）。
+    """
+    # 获取该对话的所有消息内容（id 决胜：同一事务写入的消息 created_at 相同，缺 id 会乱序）
+    # 排除摘要记录：混合对话（旧消息已压缩 + 又有新消息跨过 cutoff）不把旧摘要当原始消息重复压缩
+    msg_rows = await conn.fetch("""
+        SELECT role, content, created_at
+        FROM conversation_memories
+        WHERE user_id=$1 AND conversation_id=$2 AND created_at < $3 AND role != 'system'
+        ORDER BY created_at ASC, id ASC
+    """, row["user_id"], row["conversation_id"], cutoff)
+
+    msg_count = len(msg_rows)
+    first_time = msg_rows[0]["created_at"].strftime("%Y-%m-%d %H:%M")
+    last_time = msg_rows[-1]["created_at"].strftime("%Y-%m-%d %H:%M")
+
+    # 提取用户主要关注点
+    user_messages = [m["content"][:200] for m in msg_rows if m["role"] == "user"]
+    user_summary = "；".join(user_messages[:5])
+    if len(user_messages) > 5:
+        user_summary += f"……（共{len(user_messages)}条用户消息）"
+
+    compressed_content = json.dumps({
+        "type": "compressed",
+        "original_count": msg_count,
+        "period": f"{first_time} ~ {last_time}",
+        "summary": f"用户在该对话中主要关注：{user_summary}",
+        "full_text": "\n".join([f"{m['role']}: {m['content']}" for m in msg_rows])
+    }, ensure_ascii=False)
+
+    # 原子压缩：DELETE 与 INSERT 必须同事务（P0 #44），中断时回滚防对话数据丢失
+    async with conn.transaction():
+        # 删除原始详细记录
+        # DELETE 必须与 SELECT 同口径排除 role='system'（2026-09-05 修复）：
+        # 否则混合对话（已有旧摘要 + 新消息又跨过 cutoff）会把旧摘要一并删除，
+        # 而新摘要只含新消息——旧摘要的 full_text 原文永久丢失（与 67-71 行单条分支保持一致）。
+        await conn.execute("""
+            DELETE FROM conversation_memories
+            WHERE user_id=$1 AND conversation_id=$2 AND created_at < $3
+              AND role != 'system'
+        """, row["user_id"], row["conversation_id"], cutoff)
+
+        # 插入压缩后的摘要记录
+        await conn.execute("""
+            INSERT INTO conversation_memories
+            (user_id, conversation_id, role, content, created_at)
+            VALUES ($1, $2, 'system', $3, $4)
+        """, row["user_id"], row["conversation_id"], compressed_content, row["last_msg"])
+
+    return msg_count
+
+
 async def clean_expired_profiles():
     """
     清理过期用户画像：
     - 删除 90 天未更新的画像
     """
     pool = await get_pool()
-    cutoff = datetime.now() - timedelta(days=PROFILE_EXPIRE_DAYS)
+    cutoff = _utc_naive_now() - timedelta(days=PROFILE_EXPIRE_DAYS)
     async with pool.acquire() as conn:
         result = await conn.execute("""
             DELETE FROM user_profiles
@@ -134,48 +157,21 @@ async def clean_stale_cache():
     - 删除 60 天未命中且创建超过 7 天的缓存
     """
     pool = await get_pool()
-    cutoff = datetime.now() - timedelta(days=CACHE_CLEAN_DAYS)
+    cutoff = _utc_naive_now() - timedelta(days=CACHE_CLEAN_DAYS)
     async with pool.acquire() as conn:
+        hard_cutoff = _utc_naive_now() - timedelta(days=CACHE_HARD_MAX_DAYS)
         result = await conn.execute("""
             DELETE FROM semantic_cache
-            WHERE created_at < $1 AND hit_count < 2
-        """, cutoff)
+            WHERE (created_at < $1 AND hit_count < 2) OR created_at < $2
+        """, cutoff, hard_cutoff)
         deleted = result.split()[-1] if result else "0"
-        logger.info(f"清理低频语义缓存: {deleted} 条")
-
-
-async def ensure_indexes():
-    """确保数据库索引存在"""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        # conversation_memories 时间索引（用于压缩查询）
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_conv_memories_created
-            ON conversation_memories (created_at)
-        """)
-        # user_profiles 更新时间索引（用于过期清理）
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_user_profiles_updated
-            ON user_profiles (updated_at)
-        """)
-        # conversation_memories 复合索引（用于分组压缩）
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_conv_memories_compress
-            ON conversation_memories (user_id, conversation_id, created_at)
-        """)
-        # semantic_cache 时间索引
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_semantic_cache_created
-            ON semantic_cache (created_at)
-        """)
-        logger.info("数据库索引已确保")
+        logger.info(f"清理低频语义缓存: {deleted} 条（硬过期阈值 {CACHE_HARD_MAX_DAYS} 天）")
 
 
 async def run_maintenance():
     """执行全部维护任务"""
     logger.info("开始数据库维护...")
     try:
-        await ensure_indexes()
         await compress_old_conversations()
         await clean_expired_profiles()
         await clean_stale_cache()
@@ -186,6 +182,15 @@ async def run_maintenance():
             await recover_stale_processing(age_seconds=300)
         except Exception as e:
             logger.warning(f"支付订单恢复跳过（不影响其他维护）: {e}")
+        # 2026-09-05：补偿结算"钱包繁忙转待结算"的扣费单（见 payment/deferred.py），
+        # 独立 try/except 同上。
+        try:
+            from ..payment.deferred import settle_pending_deductions
+            settled = await settle_pending_deductions()
+            if settled:
+                logger.info(f"待结算扣费单已补偿结算: {settled} 张")
+        except Exception as e:
+            logger.warning(f"待结算扣费补偿跳过（不影响其他维护）: {e}")
         logger.info("数据库维护完成")
     except Exception as e:
         logger.error(f"数据库维护失败: {e}", exc_info=True)

@@ -62,7 +62,6 @@ _WHITELIST = {
     ],
     "法条引用": [
         "民法典第", "第一千零", "第一千一百", "第一千二百", "第一千三百",
-        "第", "条",
     ],
 }
 
@@ -84,8 +83,10 @@ _FORCED_CIVIL_KEYWORDS = [
     "名誉权", "隐私权", "肖像权", "姓名权", "声音权", "人格尊严",
     "个人信息", "诽谤", "造谣", "起绰号", "侮辱",
     # ── 总则编行为能力必答词（优先级高于未成年人保护法）──
-    "打赏", "充值", "未成年人", "小孩", "限制民事行为能力",
-    "无民事行为能力", "监护人", "儿童",
+    # "未成年人"单独出现过宽（如"未成年人保护法如何规定"不属于民法典），
+    # 仅当涉及其实际民事行为（打赏/充值）时才强制放行（P1）。
+    "未成年人打赏", "未成年人充值", "小孩打赏", "小孩充值", "打赏", "充值",
+    "限制民事行为能力", "无民事行为能力", "监护人", "儿童",
     # ── 合同编必答词（优先级高于其他专项法）──
     "利息", "高利贷", "借钱利息", "贷款利率", "借款利率",
     "民间借贷", "砍头息", "利滚利", "复利",
@@ -116,6 +117,15 @@ _BLACKLIST = [
         ],
         "gray_zone": False,  # 纯消费问题，无民事交叉
         "message": "您的问题属于《消费者权益保护法》或《食品安全法》调整的范畴，不属于《中华人民共和国民法典》的调整范围，请咨询消费者权益保护机构或专业律师。",
+    },
+    # ── 未成年人保护（P1 修复：仅移出强制白名单不够，"未成年人"仍在普通白名单会照常放行，
+    #    点名该法的问题须在黑名单显式拒答；民事行为类问题由强制白名单"打赏/充值/监护人"等兜底放行）──
+    {
+        "domain": "未成年人保护法",
+        "trigger_keywords": [
+            "未成年人保护法", "未成年人网络保护条例",
+        ],
+        "message": "您的问题属于《未成年人保护法》调整的范畴，不属于《中华人民共和国民法典》的调整范围，请咨询未成年人保护机构或专业律师。",
     },
     # ── 劳动法 ──
     {
@@ -306,10 +316,12 @@ _COLLOQUIAL_MAP = {
 
 # ============================================================
 # 4. 民法典法条编号正则（检测是否引用了民法典）
+#    前缀必须出现：裸"第X条"不足以判定民事（"劳动合同法第39条"曾借此绕过黑名单拒答，
+#    2026-09-06 收窄）；无前缀的真民法典问题走白名单/默认放行，结果不变
 # ============================================================
 _CIVIL_CODE_ARTICLE_PATTERN = re.compile(
-    r'(民法典|民法通则|民法总则)?'
-    r'第[一二三四五六七八九十百千0-9]+[条编款]'
+    r'(民法典|民法通则|民法总则)\s*'
+    r'第[一二三四五六七八九十百千零0-9]+[条编款]'
 )
 
 # 白名单关键词正则（组合成一个大正则加速）
@@ -340,96 +352,87 @@ class RoutingResult:
         self.match_type = match_type  # "whitelist" | "blacklist" | "article_ref"
 
 
-def route_query(query: str) -> RoutingResult:
+def _pass_result(match_type: str, domain: str = "", mapped_query: str = "",
+                 has_mapping: bool = False) -> RoutingResult:
+    """构造放行结果：有口语映射时带回 mapped_query，供检索侧使用（统一 5 处重复回填逻辑）"""
+    r = RoutingResult(action="pass", match_type=match_type, domain=domain)
+    if has_mapping:
+        r.mapped_query = mapped_query
+    return r
+
+
+def _blacklist_result(query: str, mapped_query: str = "",
+                      has_mapping: bool = False) -> Optional[RoutingResult]:
+    """黑名单裁决（route_query Step 3/5 复用）：命中返回结果，未命中返回 None。
+
+    灰色地带条目（gray_zone=True）放行给 LLM 做混合回答；纯排除条目拒答。
     """
-    前置路由裁决：用户输入 → 裁决结果
-    
-    流程：
-    1. 检查是否明确引用民法典法条 → pass
-    2. 检查强制白名单（人格权编/总则编必答词，优先级最高）→ pass
-    3. 检查黑名单 → 
-       a. 灰色地带条目（gray_zone=True）→ pass（放行给LLM做混合回答）
-       b. 纯排除条目 → reject
-    4. 检查白名单 → pass
-    5. 口语映射后重试
-    6. 默认 pass
-    """
-    if not query:
-        return RoutingResult(action="pass")
-    
-    # Step 0: 口语→术语映射（优先进行，使 mapped_query 在所有路径中可用；全部替换，P2 #39）
-    _mapped_query = query
-    for _colloquial, _legal in sorted(_COLLOQUIAL_MAP.items(), key=lambda x: -len(x[0])):
-        if _colloquial in _mapped_query:
-            _mapped_query = _mapped_query.replace(_colloquial, _legal)
-    _has_mapping = (_mapped_query != query)
-    
-    # Step 1: 检测是否引用了民法典法条编号
-    if _CIVIL_CODE_ARTICLE_PATTERN.search(query):
-        result = RoutingResult(action="pass", match_type="article_ref",
-                               domain="民法典")
-        if _has_mapping:
-            result.mapped_query = _mapped_query
-        return result
-    
-    # Step 2: 强制白名单（人格权编/总则编必答词，优先级高于黑名单）
-    # 注：P0 #3 的"词边界匹配"方案经测试对中文不可靠（前后助词/动词导致漏判真实民事问题，
-    #     如"被人偷拍了"），故保留子串匹配，改为移除过于宽泛的关键词（见 _FORCED_CIVIL_KEYWORDS）。
-    #     完全防"附加词绕过"需语义级判断，已登记遗留。
-    for keyword in _FORCED_CIVIL_KEYWORDS:
-        if keyword in query:
-            result = RoutingResult(action="pass", match_type="forced_whitelist",
-                                   domain="民法典")
-            if _has_mapping:
-                result.mapped_query = _mapped_query
-            return result
-    
-    # Step 3: 检查黑名单
     for entry in _BLACKLIST:
         if any(kw in query for kw in entry["trigger_keywords"]):
             if entry.get("gray_zone", False):
-                # 灰色地带：放行给LLM做混合回答（民事+行政并行）
-                result = RoutingResult(action="pass", match_type=f"gray_zone_{entry['domain']}",
-                                       domain=entry["domain"])
-                if _has_mapping:
-                    result.mapped_query = _mapped_query
-                return result
+                return _pass_result(f"gray_zone_{entry['domain']}", entry["domain"],
+                                    mapped_query, has_mapping)
             return RoutingResult(
                 action="reject",
                 message=f"您好，我是民法典助手！{entry['message']}",
                 domain=entry["domain"],
                 match_type="blacklist"
             )
-    
+    return None
+
+
+def route_query(query: str) -> RoutingResult:
+    """
+    前置路由裁决：用户输入 → 裁决结果
+
+    流程：
+    1. 检查是否明确引用民法典法条编号 → pass
+    2. 检查强制白名单（人格权编/总则编必答词，优先级最高）→ pass
+    3. 检查黑名单 → 灰色地带放行 / 纯排除拒答
+    4. 检查白名单 → pass
+    5. 口语映射后重新裁决
+    6. 通用安全关键词拦截
+    7. 默认 pass（给LLM判断）
+    """
+    if not query:
+        return RoutingResult(action="pass")
+
+    # Step 0: 口语→术语映射（优先进行，使 mapped_query 在所有路径中可用；全部替换，P2 #39）
+    _mapped_query = query
+    for _colloquial, _legal in sorted(_COLLOQUIAL_MAP.items(), key=lambda x: -len(x[0])):
+        if _colloquial in _mapped_query:
+            _mapped_query = _mapped_query.replace(_colloquial, _legal)
+    _mq = dict(mapped_query=_mapped_query, has_mapping=(_mapped_query != query))
+
+    # Step 1: 检测是否引用了民法典法条编号
+    if _CIVIL_CODE_ARTICLE_PATTERN.search(query):
+        return _pass_result("article_ref", "民法典", **_mq)
+
+    # Step 2: 强制白名单（优先级高于黑名单）
+    # 注：P0 #3 的"词边界匹配"方案经测试对中文不可靠（前后助词/动词导致漏判真实民事问题，
+    #     如"被人偷拍了"），故保留子串匹配，改为移除过于宽泛的关键词（见 _FORCED_CIVIL_KEYWORDS）。
+    #     完全防"附加词绕过"需语义级判断，已登记遗留。
+    for keyword in _FORCED_CIVIL_KEYWORDS:
+        if keyword in query:
+            return _pass_result("forced_whitelist", "民法典", **_mq)
+
+    # Step 3: 黑名单（灰色地带放行混合回答，纯排除拒答）
+    r = _blacklist_result(query, **_mq)
+    if r:
+        return r
+
     # Step 4: 检查白名单（民法典关键词）
     if _WHITELIST_PATTERN.search(query):
-        result = RoutingResult(action="pass", match_type="whitelist",
-                               domain="民法典")
-        if _has_mapping:
-            result.mapped_query = _mapped_query
-        return result
-    
-    # Step 5: 口语映射后重新检查（映射已在 Step 0 完成，此处只检查映射后的结果）
-    if _has_mapping:
-        if _WHITELIST_PATTERN.search(_mapped_query) or _CIVIL_CODE_ARTICLE_PATTERN.search(_mapped_query):
-            return RoutingResult(action="pass", match_type="whitelist",
-                                 domain="民法典", mapped_query=_mapped_query)
-        # 映射后再次检查黑名单（含灰度处理）
-        for entry in _BLACKLIST:
-            if any(kw in _mapped_query for kw in entry["trigger_keywords"]):
-                if entry.get("gray_zone", False):
-                    result = RoutingResult(action="pass", match_type=f"gray_zone_{entry['domain']}",
-                                           domain=entry["domain"])
-                    if _has_mapping:
-                        result.mapped_query = _mapped_query
-                    return result
-                return RoutingResult(
-                    action="reject",
-                    message=f"您好，我是民法典助手！{entry['message']}",
-                    domain=entry["domain"],
-                    match_type="blacklist"
-                )
-    
+        return _pass_result("whitelist", "民法典", **_mq)
+
+    # Step 5: 口语映射后重新裁决（映射已在 Step 0 完成，此处只检查映射后的结果）
+    if _mq["has_mapping"]:
+        if _WHITELIST_PATTERN.search(_mq["mapped_query"]) or _CIVIL_CODE_ARTICLE_PATTERN.search(_mq["mapped_query"]):
+            return _pass_result("whitelist", "民法典", **_mq)
+        r = _blacklist_result(_mq["mapped_query"], **_mq)
+        if r:
+            return r
+
     # Step 6: 通用安全关键词拦截（P0 #14：防危险问题默认放行给 LLM）
     for _kw in _SAFETY_KEYWORDS:
         if _kw in query:
@@ -439,15 +442,13 @@ def route_query(query: str) -> RoutingResult:
             )
 
     # 默认放行（给LLM判断）
-    result = RoutingResult(action="pass", match_type="unknown")
-    if _has_mapping:
-        result.mapped_query = _mapped_query
-    return result
+    return _pass_result("unknown", **_mq)
 
 
 # ============================================================
 # 辅助函数
 # ============================================================
+def get_colloquial_map() -> dict:
     """获取口语→术语映射表"""
     return dict(_COLLOQUIAL_MAP)
 

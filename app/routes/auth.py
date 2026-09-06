@@ -19,6 +19,48 @@ logger = setup_logging()
 
 router = APIRouter()
 
+# ---------- 登录防暴力破解（P2 修复：密码登录原先可无限尝试）----------
+_LOGIN_FAIL_LIMIT = 5
+_LOGIN_LOCK_SECONDS = 900
+
+
+def _client_ip(request: Request) -> str:
+    """取真实客户端 IP（CF-Connecting-IP > X-Forwarded-For 首个 > 直连 IP），供失败计数键使用"""
+    ip = (request.headers.get("cf-connecting-ip")
+          or request.headers.get("x-forwarded-for")
+          or (request.client.host if request.client else ""))
+    if ip and "," in ip:
+        ip = ip.split(",")[0].strip()
+    return ip or "unknown"
+
+
+async def _check_login_lock(ip: str, username: str):
+    """登录前检查失败锁：达上限的 IP+用户名组合 15 分钟内拒绝"""
+    from ..core.redis import get_redis
+    r = await get_redis()
+    if await r.get(f"login_lock:{ip}:{username}"):
+        raise HTTPException(429, "尝试次数过多，请 15 分钟后再试")
+
+
+async def _record_login_failure(ip: str, username: str):
+    """登录失败累计：达上限写入锁定键（TTL 即锁时长，自愈）"""
+    from ..core.redis import get_redis
+    r = await get_redis()
+    key = f"login_fail:{ip}:{username}"
+    count = await r.incr(key)
+    if count == 1:
+        await r.expire(key, _LOGIN_LOCK_SECONDS)
+    if count >= _LOGIN_FAIL_LIMIT:
+        await r.setex(f"login_lock:{ip}:{username}", _LOGIN_LOCK_SECONDS, "1")
+        await r.delete(key)
+
+
+async def _clear_login_failures(ip: str, username: str):
+    """登录成功清零失败计数"""
+    from ..core.redis import get_redis
+    r = await get_redis()
+    await r.delete(f"login_fail:{ip}:{username}")
+
 
 class LoginRequest(BaseModel):
     """登录请求（P2 #17：Pydantic 校验 + 自动生成 OpenAPI 文档）"""
@@ -46,15 +88,19 @@ async def resolve_login_username(username: str) -> str:
 
 
 @router.post("/api/login")
-async def login(payload: LoginRequest):
-    """登录（Pydantic 校验自动文档，P2 #17；请求体限流见中间件层）"""
+async def login(payload: LoginRequest, request: Request):
+    """登录（Pydantic 校验自动文档；失败计数防暴力破解，成功清零）"""
     username = payload.username
     password = payload.password
+    client_ip = _client_ip(request)
+    await _check_login_lock(client_ip, username)
     # 支持手机号作为账号登录（账号即手机号）
     username = await resolve_login_username(username)
     user = await authenticate_user(username, password)
     if not user:
+        await _record_login_failure(client_ip, username)
         raise HTTPException(401, "Invalid username or password")
+    await _clear_login_failures(client_ip, username)
     pair = create_token_pair(username)
     # 审计：登录成功
     from ..core.audit import audit

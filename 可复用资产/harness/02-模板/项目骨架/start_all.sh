@@ -22,7 +22,7 @@ for arg in "$@"; do
     case "$arg" in
         --all) ALL_MODE=1 ;;
         --no-autoscale) AUTOSCALE=0 ;;
-        *) echo "[❌] 未知参数: $arg" >&2; exit 1 ;;
+        *) echo "[错误] 未知参数: $arg" >&2; exit 1 ;;
     esac
 done
 
@@ -32,7 +32,7 @@ SINGLE_SERVICE=(app)
 # ===== 基础设施（容错：postgres/redis 已在运行则继续）=====
 log "启动基础设施（postgres / redis / 监控）..."
 if ! docker compose up -d --no-recreate postgres redis; then
-    echo "[⚠️] 基础设施部分启动失败（若已在运行可忽略）" >&2
+    echo "[警告] 基础设施部分启动失败（若已在运行可忽略）" >&2
 else
     ok "基础设施就绪"
 fi
@@ -70,6 +70,6 @@ fi
 
 # ===== 自动伸缩 =====
 if [ "$AUTOSCALE" = "1" ] && [ -f scripts/autoscale.sh ]; then
-    bash scripts/autoscale.sh start || echo "[⚠️] autoscale 启动失败（不影响主服务）" >&2
+    bash scripts/autoscale.sh start || echo "[警告] autoscale 启动失败（不影响主服务）" >&2
 fi
 ok "完成"

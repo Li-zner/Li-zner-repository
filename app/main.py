@@ -163,13 +163,13 @@ async def _stop_background_tasks(maintenance_task, slowq_task, cdc_task, cdc_wor
         slowq_task.cancel()
         try:
             await slowq_task
-        except asyncio.CancelledError:
+        except asyncio.CancelledError:  # noqa: silent-except 豁免：优雅关停惯例（吞 CancelledError）
             pass
     if maintenance_task:
         maintenance_task.cancel()
         try:
             await maintenance_task
-        except asyncio.CancelledError:
+        except asyncio.CancelledError:  # noqa: silent-except 豁免：优雅关停惯例（吞 CancelledError）
             pass
         logger.info("数据库维护任务已停止")
     # 停止 CDC worker（先落 checkpoint 再关文件）
@@ -177,7 +177,7 @@ async def _stop_background_tasks(maintenance_task, slowq_task, cdc_task, cdc_wor
         cdc_task.cancel()
         try:
             await cdc_task
-        except asyncio.CancelledError:
+        except asyncio.CancelledError:  # noqa: silent-except 豁免：优雅关停惯例（吞 CancelledError）
             pass
     if cdc_worker:
         await cdc_worker.stop()
@@ -189,7 +189,8 @@ async def lifespan(app: FastAPI):
     # --- 初始化连接池 ---
     try:
         pool = await init_pool()
-        logger.info(f"数据库连接池已初始化 (min=10, max=30)")
+        from .core.db import _POOL_CONFIG
+        logger.info(f"数据库连接池已初始化 (min={_POOL_CONFIG['min_size']}, max={_POOL_CONFIG['max_size']})")
     except Exception as e:
         logger.warning(f"连接池初始化失败: {e}")
 
@@ -203,14 +204,6 @@ async def lifespan(app: FastAPI):
     # CDC 事件表与触发器由 Alembic 迁移管理（A19/A23，迁移 e5f6a7b8c9d0），
     # 启动不再执行 DDL；缺失时 init_db 已 fail loudly。
     logger.info("CDC schema 由 Alembic 迁移管理")
-
-    # 确保数据库索引
-    try:
-        from .core.db_maintenance import ensure_indexes
-        await ensure_indexes()
-        logger.info("数据库索引已确保")
-    except Exception as e:
-        logger.warning(f"索引创建跳过（首次运行可能无表）: {e}")
 
     # 初始化 Redis 连接池
     try:
@@ -274,8 +267,8 @@ async def monitor_requests(request: Request, call_next):
         ctx = span.get_span_context()
         if ctx and ctx.is_valid:
             set_trace_id(format(ctx.trace_id, '032x'))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"trace_id 读取失败: {e}")
     start_time = time.perf_counter()
     status_code = 500
     try:
@@ -288,8 +281,8 @@ async def monitor_requests(request: Request, call_next):
         try:
             from .core.error_aggregator import record_error
             await record_error(request, exc)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("异常聚合写入失败")
         raise
     finally:
         duration = time.perf_counter() - start_time
@@ -317,9 +310,6 @@ app.add_middleware(
 # 非认证主体（JWT 才是认证）；main指点 #16 建议移除，但移除会破坏 OAuth state 机制，故保留并注明。
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET_KEY)
 
-# 幂等创建 static 目录，防目录缺失导致启动崩溃（P0 #8）
-os.makedirs("static", exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
 os.makedirs("uploads", exist_ok=True)
 # 安全：uploads 目录不移除通过 StaticFiles 公开挂载，文件只能通过 API 授权访问
 
@@ -338,6 +328,24 @@ app.include_router(phone_router)
 app.include_router(oauth_router)
 app.include_router(users_router)
 app.include_router(observability_router)
+
+# ---------- 前端 SPA（frontend/dist，Dockerfile 多阶段构建产出拷入 static/） ----------
+# 必须挂在所有 API 路由之后：html=True 让 /chat /login 等 SPA 路径回退到 index.html
+# index.html 必须禁缓存：assets hash 随构建变化，缓存旧 html 会引用已删除的旧 hash → 白屏
+os.makedirs("static", exist_ok=True)
+
+
+class _NoCacheStaticFiles(StaticFiles):
+    """html 响应加 no-cache 头的 StaticFiles（assets 带 hash 不受影响，浏览器仍可长缓存）"""
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        if resp.headers.get("content-type", "").startswith("text/html"):
+            resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return resp
+
+
+app.mount("/", _NoCacheStaticFiles(directory="static", html=True), name="frontend")
 
 # ============================================================
 # 根页面/favicon/健康就绪探针/metrics/OTEL 自测已移至 app/routes/observability.py（2026-08-31 模块化）

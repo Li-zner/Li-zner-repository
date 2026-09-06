@@ -9,9 +9,8 @@ Redis 存储:
   task:{task_id}  (Hash)
     - status: pending|generating|completed|cancelled|error
     - result: 最终/部分结果文本
-    - session_id: 会话ID
+    - conversation_id: 会话ID（与 models.ChatRequest.conversation_id 对齐）
     - user_message: 用户原始消息
-    - user_location: 用户定位（可选）
     - created_at: ISO时间
     - updated_at: ISO时间
 
@@ -29,6 +28,10 @@ from typing import Optional, Dict
 from ..core.redis import get_redis as _get_redis
 from ..core.config import TASK_TTL_SECONDS, TASK_TIMEOUT
 
+from ..core.logging import setup_logging
+
+logger = setup_logging()
+
 # ---- 全局取消信号表 ----
 _cancel_events: Dict[str, asyncio.Event] = {}
 
@@ -43,17 +46,22 @@ async def _redis():
     return await _get_redis()
 
 
-async def create_task(session_id: str, user_message: str, user_location: str = "") -> str:
-    """创建任务，返回 task_id"""
+async def create_task(conversation_id: str, user_message: str,
+                      owner: str = "") -> str:
+    """创建任务，返回 task_id
+
+    owner：创建者 username，写入任务 hash 供端点做归属校验（防任何登录用户
+    凭 task_id 读取/取消/恢复他人任务——跨用户信息泄露，P1）。
+    """
     task_id = f"task_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
     r = await _redis()
     await r.hset(f"task:{task_id}", mapping={
         "status": "pending",
         "result": "",
-        "session_id": session_id,
+        "conversation_id": conversation_id,
         "user_message": user_message,
-        "user_location": user_location,
+        "owner": owner,
         "created_at": now,
         "updated_at": now,
     })
@@ -78,8 +86,8 @@ async def get_task(task_id: str) -> Optional[dict]:
                 _dt = _dt.replace(tzinfo=timezone.utc)
             if (datetime.now(timezone.utc) - _dt).total_seconds() > TASK_TIMEOUT:
                 result["status"] = "timeout"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"任务超时检查时间解析失败: {e}")
     return result
 
 
@@ -96,9 +104,7 @@ async def update_status(task_id: str, status: str, result: str = ""):
 async def append_result(task_id: str, chunk: str):
     """追加结果文本"""
     r = await _redis()
-    # 长度是整数，用 HINCRBY 而非 HINCRBYFLOAT（P1 #36）
-    await r.hincrby(f"task:{task_id}", "_result_len", len(chunk))
-    # 用 append 到独立 key 避免 hset 覆盖
+    # 用 append 到独立 key 避免 hset 覆盖（原 _result_len 计数器零消费方，2026-09-05 审查删除）
     await r.append(f"task:{task_id}:result_buf", chunk)
     await r.expire(f"task:{task_id}:result_buf", TASK_TTL)
 
@@ -156,8 +162,8 @@ async def _persist_idempotent(key: str, task_id: str):
     try:
         r = await _redis()
         await r.setex(f"{_IDEMPOTENT_PREFIX}{key}", 10, task_id)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"幂等映射写入失败: {e}")
 
 
 # 占位值：表示同键请求正在创建任务（TTL 10s 自愈，创建方崩溃后自动过期）
@@ -221,8 +227,8 @@ async def release_idempotency_claim(session_id: str, msg: str):
     try:
         r = await _redis()
         await r.eval(_RELEASE_CLAIM_LUA, 1, key, _CREATING)
-    except Exception:
-        pass  # 释放失败仅影响短暂等待（TTL 自愈），不影响主流程
+    except Exception as e:
+        logger.debug(f"幂等占位释放失败（TTL 自愈）: {e}")
 
 
 def save_idempotent(session_id: str, msg: str, task_id: str):
@@ -230,5 +236,5 @@ def save_idempotent(session_id: str, msg: str, task_id: str):
     key = _idempotent_key(session_id, msg)
     try:
         asyncio.get_running_loop().create_task(_persist_idempotent(key, task_id))
-    except RuntimeError:
+    except RuntimeError:  # noqa: silent-except 豁免：无运行循环为预期路径
         pass  # 无运行循环（非 async 上下文）时静默跳过，幂等写入尽力而为

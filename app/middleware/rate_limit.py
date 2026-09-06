@@ -148,8 +148,8 @@ async def release_concurrent(username: str):
     try:
         r = await get_redis()
         await r.eval(_CONCURRENT_RELEASE_LUA, 1, f"concurrent:{username}")
-    except Exception:
-        pass  # 释放失败仅影响并发统计，不覆盖业务异常
+    except Exception as e:
+        logger.debug(f"并发槽位释放失败（30s EXPIRE 自愈）: {e}")
 
 
 # ============================================================
@@ -190,10 +190,12 @@ async def update_daily_usage(username: str, date_str: str, inc_request=1, inc_to
         r = await get_redis()
         req_key = f"daily_req:{username}:{date_str}"
         token_key = f"daily_token:{username}:{date_str}"
-        # TTL 对齐到次日 UTC 零点
+        # TTL 对齐到次日 UTC 零点；+60s 余量防跨天边界 Key 提前过期（P2）——
+        # 若请求恰在 23:59:59 落在旧日期 Key 上，ttl 仅约 1s，可能在毫秒级读到计数前
+        # 被 Redis 清掉，导致当日计数丢失。留 60s 缓冲让边界请求计数在重置前被读走。
         now = time.time()
         tomorrow = int(now) - (int(now) % 86400) + 86400
-        ttl = max(1, tomorrow - int(now))
+        ttl = max(1, (tomorrow - int(now)) + 60)
         await r.eval(
             _DAILY_UPDATE_LUA, 2, req_key, token_key,
             inc_request, inc_token, ttl,

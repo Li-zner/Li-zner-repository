@@ -43,22 +43,26 @@ async def _generate_order_no() -> str:
     生成订单号: PA + YYYYMMDD + 10位序列
     按日期分 Key 自增：同日序列唯一，跨日不重复，取模碰撞已消除（P0 #3）；
     日期 Key 带 7 天 TTL，防无限增长（P2 #38）。
+    INCR 与 EXPIRE 原子化（2026-09-05）：两步写法在"创建后、EXPIRE 前"崩溃会留下
+    无 TTL 的日期键，永不过期、逐年累积。
     """
     r = await get_redis()
     now = _utcnow()
     date_part = now.strftime("%Y%m%d")
     seq_key = f"payment:order_seq:{date_part}"
-    seq = await r.incr(seq_key)
-    await r.expire(seq_key, 7 * 86400)
+    seq = await r.eval(_ORDER_SEQ_LUA, 1, seq_key, 7 * 86400)
     seq_str = str(seq).zfill(10)
     return f"PA{date_part}{seq_str}"
 
 
-async def _generate_invoice_no() -> str:
-    """生成发票号: INV + YYYYMMDD + 6位随机"""
-    now = _utcnow().strftime("%Y%m%d")
-    rand = str(random.randint(100000, 999999))
-    return f"INV{now}{rand}"
+# INCR + 首次 EXPIRE 原子脚本：seq==1 说明是本日首个请求，由本请求负责设置 TTL
+_ORDER_SEQ_LUA = """
+local seq = redis.call('INCR', KEYS[1])
+if seq == 1 then
+    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+end
+return seq
+"""
 
 
 # ============================================================
@@ -222,11 +226,42 @@ async def _apply_balance_change(
     return False, None, None, None
 
 
+async def _locked_wallet_change(
+    conn, user_id: str, delta: Decimal, tx_type: str = "recharge"
+) -> tuple:
+    """行锁方式变更余额（确定性，无乐观锁重试）：FOR UPDATE 锁行（缺失则原子创建）后直接更新。
+
+    适用已开启事务的关键结算路径（充值/退款，2026-09-05 新增）：乐观锁重试在事务内
+    耗尽会抛异常整体回滚，而渠道等外部动作可能已生效——行锁在手时更新必然成功，
+    从根上消除「外部已扣款、本地回滚」的缺口。并发写者会在行锁上排队而非版本冲突。
+    返回 (是否成功, before, after, version)，与 _apply_balance_change 同构。
+    """
+    row = await conn.fetchrow(
+        "SELECT balance, version FROM user_wallets WHERE user_id = $1 FOR UPDATE",
+        user_id,
+    )
+    if not row:
+        # 钱包不存在：并发安全创建后重读（P0 #34 同款语义）
+        await conn.execute(
+            "INSERT INTO user_wallets (user_id, balance, status) "
+            "VALUES ($1, $2, 'active') ON CONFLICT (user_id) DO NOTHING",
+            user_id, DEFAULT_WALLET_BALANCE,
+        )
+        row = await conn.fetchrow(
+            "SELECT balance, version FROM user_wallets WHERE user_id = $1 FOR UPDATE",
+            user_id,
+        )
+    updated = await _do_update_balance(conn, user_id, delta, row["version"], tx_type)
+    if not updated:
+        # 行锁在手理论上不可能冲突；防御保留同构返回
+        return False, None, None, None
+    return True, row["balance"], row["balance"] + delta, row["version"]
+
+
 # ============================================================
 # 交易流水
 # ============================================================
 async def _record_transaction(
-    order_no: str,
     user_id: str,
     tx_type: str,
     amount: Decimal,

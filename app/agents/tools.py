@@ -5,8 +5,7 @@ import asyncio
 import httpx
 from ..core.logging import setup_logging
 from ..core.config import (
-    HTTP_TIMEOUT_SHORT, HTTP_TIMEOUT_MEDIUM, HTTP_TIMEOUT_LONG,
-    DEEPSEEK_API_BASE, DEEPSEEK_MODEL, RERANK_SIM_THRESHOLD,
+    HTTP_TIMEOUT_SHORT, HTTP_TIMEOUT_MEDIUM,
 )
 
 logger = setup_logging()
@@ -44,7 +43,9 @@ async def fetch_weather_async(city: str):
                 "wind": live["winddirection"]
             }
     except Exception as e:
-        return {"error": str(e)}
+        # 异常 str 可能带含 key 的完整 URL，用户侧只给通用文案（细节进日志）
+        logger.warning(f"天气查询异常: {type(e).__name__}: {e}")
+        return {"error": "天气查询失败"}
 
 
 # ============================================================
@@ -120,17 +121,33 @@ def _law_mapping_check(query):
                 "mapping_hit": True,
                 "message": _match["message"],
             }
-    except Exception:
-        pass  # 映射表检查失败不应影响正常检索
+    except Exception as e:
+        # 映射表检查失败只降级跳过，不影响正常检索（P2 修复：不再裸 pass，留排查日志）
+        logger.warning(f"法律映射表检查失败，跳过: {e}")
     return None
 
 
-def _dedup(candidates: list, heading: str, content: str, sim: float) -> bool:
-    """候选去重：heading 与内容前 50 字相同则跳过"""
+def _dedup(candidates: list, chunk_key: str, heading: str, content: str, sim: float) -> bool:
+    """候选去重：heading 与内容前 50 字相同则跳过（保留 chunk_key 供引用溯源）"""
     if any(e["heading"] == heading and e["content"][:50] == content[:50] for e in candidates):
         return False
-    candidates.append({"heading": heading, "content": content[:500], "similarity": sim})
+    candidates.append({"chunk_key": chunk_key, "heading": heading,
+                       "content": content[:500], "similarity": sim})
     return True
+
+
+def _perm_clause(permissions: list | None) -> str:
+    """知识库权限过滤 SQL 片段（P0 #29/#41）。
+
+    None=不过滤（内部/admin）；[]=仅公开（空数组 && 会漏掉公开文档，须等值判断）；
+    非空=公开+命中权限组。三处调用（trgm/ILIKE/向量）占位符布局一致：
+    $1 检索参数、$2 limit、$3 权限数组，故固定用 $3。
+    """
+    if permissions is None:
+        return ""
+    if permissions:
+        return " AND (COALESCE(permission, '{}') = '{}' OR permission && $3) "
+    return " AND COALESCE(permission, '{}') = '{}' "
 
 
 async def _recall_pg_trgm(conn, search_query: str, recall_limit: int,
@@ -139,24 +156,19 @@ async def _recall_pg_trgm(conn, search_query: str, recall_limit: int,
 
     permissions=None = 不过滤（内部/admin）；[] = 仅公开；['vip'] = 公开+vip。
     """
-    perm_clause = ""
     args = [search_query, recall_limit]
     if permissions:
-        # 有权限组：公开 + 命中权限组（P0 #29/#41）
-        perm_clause = " AND (COALESCE(permission, '{}') = '{}' OR permission && $3) "
         args.append(permissions)
-    elif permissions is not None:
-        # permissions=[]：仅公开，避免空数组 && 导致公开文档被排除（P0 #29）
-        perm_clause = " AND COALESCE(permission, '{}') = '{}' "
     rows = await conn.fetch(
         "SELECT chunk_key, source, heading, content, source_doc, "
         "similarity(content, $1) as sim "
         "FROM knowledge_chunks WHERE source = 'civil_code' "
-        + perm_clause +
+        + _perm_clause(permissions) +
         "ORDER BY sim DESC LIMIT $2",
         *args,
     )
     return [{
+        "chunk_key": r["chunk_key"],
         "heading": r["heading"],
         "content": r["content"][:500],
         "similarity": round(r["sim"], 4) if r["sim"] else 0,
@@ -164,35 +176,150 @@ async def _recall_pg_trgm(conn, search_query: str, recall_limit: int,
     } for r in rows]
 
 
+async def _recall_pg_vector(conn, query_embedding: list, recall_limit: int,
+                            permissions: list | None = None) -> list:
+    """向量召回（pgvector 余弦；civil 通道 2026-09 启用——索引早已建好但一直无人查询）。
+
+    query_embedding 为空（Ollama 不可用等）返回 []，调用方自然退化为 trgm 单路。
+    """
+    if not query_embedding:
+        return []
+    args = [json.dumps(query_embedding), recall_limit]
+    if permissions:
+        args.append(permissions)
+    rows = await conn.fetch(
+        "SELECT chunk_key, source, heading, content, source_doc, "
+        "1 - (embedding <=> $1::vector) AS sim "
+        "FROM knowledge_chunks WHERE source = 'civil_code' AND embedding IS NOT NULL "
+        + _perm_clause(permissions) +
+        "ORDER BY embedding <=> $1::vector LIMIT $2",
+        *args,
+    )
+    return [{
+        "chunk_key": r["chunk_key"],
+        "heading": r["heading"],
+        "content": r["content"][:500],
+        "similarity": round(r["sim"], 4) if r["sim"] else 0,
+        "source_doc": r["source_doc"] or r["source"],
+    } for r in rows]
+
+
+def _rrf_merge(*ranked_lists: list, k: int = 60) -> list:
+    """RRF 倒数排名融合：trgm 相似度 / 向量余弦 / ILIKE 命中不在同一度量空间，
+    按排名位置融合回避归一化；k=60 削弱单路榜首 dominance（社区经验值）。"""
+    scores = {}
+    for lst in ranked_lists:
+        for rank, item in enumerate(lst):
+            e = scores.setdefault(item["chunk_key"], {"item": item, "score": 0.0})
+            e["score"] += 1.0 / (k + rank + 1)
+    return [e["item"] for e in sorted(scores.values(), key=lambda x: -x["score"])]
+
+
 async def _keyword_fill(conn, query: str, recall_limit: int, candidates: list,
                         permissions: list | None = None):
     """关键词 ILIKE 补充（去重；补满 recall_limit 即停；支持权限过滤）"""
-    perm_clause = ""
     for kw in query.replace("?", "").replace("，", " ").replace("？", " ").split():
         if len(kw) < 2:
             continue
         args = [f"%{kw}%", recall_limit - len(candidates)]
         if permissions:
-            perm_clause = " AND (COALESCE(permission, '{}') = '{}' OR permission && $3) "
             args.append(permissions)
-        elif permissions is not None:
-            # permissions=[]：仅公开（P0 #29）
-            perm_clause = " AND COALESCE(permission, '{}') = '{}' "
         more = await conn.fetch(
             "SELECT chunk_key, source, heading, content, 0.5 as sim "
             "FROM knowledge_chunks WHERE source = 'civil_code' "
-            + perm_clause +
+            + _perm_clause(permissions) +
             "AND content ILIKE $1 LIMIT $2",
             *args,
         )
         for r in more:
-            _dedup(candidates, r["heading"], r["content"], 0.5)
+            _dedup(candidates, r["chunk_key"], r["heading"], r["content"], 0.5)
         if len(candidates) >= recall_limit:
             break
 
 
+# 召回窗 15 / 重排 5（2026-09-06 用户决策：原 max(top_k*4,20) 召回 + LLM 全量精排
+# 过大过贵——LLM rerank 曾 100% 超时，每查询白等 30s）
+RECALL_LIMIT = 15
+RERANK_TOP = 5
+
+# 本地重排器单例（sentence-transformers CrossEncoder；镜像内 torch 已预装）
+_RERANKER = None
+_RERANKER_INIT_FAILED = False
+
+
+def _get_reranker():
+    """懒加载本地重排模型（进程内单例）；不可用返回 None，调用方回退 RRF 排序。
+
+    模型经 HF_ENDPOINT 镜像站预置进镜像（见 Dockerfile 构建期下载）。加载前强制
+    HF_HUB_OFFLINE=1：否则 huggingface_hub 每次加载都对 huggingface.co 做 HEAD
+    校验，离线机器上重试 5 轮、首查实测卡死 4 分钟后仍失败（2026-09-06 冒烟实测）。
+    构建期下载由 Dockerfile RUN 里显式 HF_HUB_OFFLINE=0 覆盖。
+    """
+    global _RERANKER, _RERANKER_INIT_FAILED
+    if _RERANKER is not None:
+        return _RERANKER
+    if _RERANKER_INIT_FAILED:
+        return None
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    try:
+        from sentence_transformers import CrossEncoder
+        _RERANKER = CrossEncoder(
+            os.getenv("RERANK_MODEL", "BAAI/bge-reranker-base"), max_length=256)
+        return _RERANKER
+    except Exception as e:
+        _RERANKER_INIT_FAILED = True
+        logger.warning(f"本地重排模型不可用（回退 RRF 排序）: {type(e).__name__}: {str(e)[:120]}")
+        return None
+
+
+async def _rerank_local(query: str, candidates: list) -> list:
+    """本地 cross-encoder（bge-reranker）精排 RRF 前 5 候选。
+
+    ponytail: CPU 软推理 5 对约 1.5-3s。模型刻意选 bge-reranker-base（278M/1.1GB）——
+    主人决策：后续要把 rerank 迁到云端 Ollama，不得换成更大的模型（如 v2-m3 568M）；
+    可用 RERANK_MODEL 环境变量无码切换。未启用/模型不可用返回 []，调用方保持 RRF 排序。
+    """
+    if os.getenv("LOCAL_RERANK_ENABLED", "1") != "1":
+        return []
+    ranker = _get_reranker()
+    if ranker is None or not candidates:
+        return []
+
+    def _predict() -> dict:
+        scores = ranker.predict([(query[:256], c["content"][:300]) for c in candidates])
+        return {c["chunk_key"]: float(s) for c, s in zip(candidates, scores)}
+
+    score_by_key = await asyncio.to_thread(_predict)
+    for c in candidates:
+        c["rerank_score"] = round(score_by_key.get(c["chunk_key"], 0.0), 4)
+    return sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
+
+
+async def _search_two_legs(conn, query: str, search_query: str,
+                           top_k: int, permissions: list | None) -> dict:
+    """双路召回（trgm + 向量）→ RRF 融合 → 本地重排 RRF 前 5。
+
+    原实现的"口语映射后重试"是逻辑死代码（重试查询与首次完全相同，结果恒等），
+    随本次重写移除；口语映射已在进入本函数前完成。
+    """
+    recall_limit = max(RECALL_LIMIT, top_k)
+    trgm = await _recall_pg_trgm(conn, search_query, recall_limit, permissions)
+    await _keyword_fill(conn, search_query, recall_limit, trgm, permissions)
+    embedding = await _generate_embedding(search_query)
+    vector = await _recall_pg_vector(conn, embedding, recall_limit, permissions)
+    merged = _rrf_merge(trgm, vector)
+    if not merged:
+        return {"results": [], "method": "trgm+vector"}
+
+    top_candidates = merged[:RERANK_TOP]
+    reranked = await _rerank_local(query, top_candidates)
+    if reranked:
+        return {"results": reranked[:top_k], "method": "trgm+vector+rrf+local_rerank"}
+    return {"results": top_candidates[:top_k], "method": "trgm+vector+rrf"}
+
+
 async def search_knowledge(query: str, top_k: int = 5, permissions: list | None = None):
-    """语义搜索知识库（pg_trgm 召回 + 关键词补充 + DeepSeek Rerank）
+    """语义搜索知识库：trgm + 向量双路召回 → RRF 融合 → 本地 bge-reranker 重排前 5。
 
     在检索前，先通过法律依据纠正映射表检查用户问题是否属于其他法律领域。
     如果命中映射表，直接返回纠正引导信息，不执行知识库搜索。
@@ -211,215 +338,130 @@ async def search_knowledge(query: str, top_k: int = 5, permissions: list | None 
     if _search_query != query:
         logger.info(f"搜索前置口语映射: {query[:30]}... → {_search_query[:60]}...")
 
-    recall_limit = max(top_k * 4, 20)
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # === 第一阶段：pg_trgm 宽召回 + 关键词补充 ===
-        candidates = await _recall_pg_trgm(conn, _search_query, recall_limit, permissions)
-        await _keyword_fill(conn, _search_query, recall_limit, candidates, permissions)
-
-        # === 无结果 → 用口语映射后的专业术语重试 ===
-        if not candidates:
-            try:
-                _mapped_query = _map_colloquial_to_legal(query)
-                if _mapped_query != query:
-                    candidates = await _recall_pg_trgm(conn, _mapped_query, recall_limit, permissions)
-                    await _keyword_fill(conn, _mapped_query, recall_limit, candidates, permissions)
-                    if candidates:
-                        logger.info(f"口语映射后找到 {len(candidates)} 条结果")
-            except Exception as _map_err:
-                logger.warning(f"口语映射检索失败: {_map_err}")
-
-        if not candidates:
-            return {"results": [], "method": "pg_trgm"}
-
-        # === 第二阶段：阈值粗筛 → 只在模糊时调用昂贵的 LLM Rerank ===
-        # 粗筛：候选集中存在相似度 >= RERANK_SIM_THRESHOLD 的高置信结果时，
-        # 说明 pg_trgm 已给出明确答案，直接按相似度排序截取，跳过 LLM Rerank（省 token）
-        _top_sim = max(c["similarity"] for c in candidates)
-        if _top_sim >= RERANK_SIM_THRESHOLD:
-            candidates = sorted(candidates, key=lambda x: x["similarity"], reverse=True)[:top_k]
-            method = "pg_trgm"
-        else:
-            # 检索结果模糊（低相似度）→ 升级 LLM Rerank 精排
-            try:
-                candidates = await _rerank_with_deepseek(query, candidates, top_k)
-                method = "pg_trgm+rerank"
-            except Exception as e:
-                logger.warning(f"Rerank失败，使用pg_trgm原始排序: {e}")
-                candidates = sorted(candidates, key=lambda x: x["similarity"], reverse=True)[:top_k]
-                method = "pg_trgm"
-
-        return {"results": candidates, "method": method}
-
-
-async def _rerank_with_deepseek(query: str, candidates: list, top_k: int) -> list:
-    """使用 DeepSeek 对候选结果进行重排序"""
-    import os, json, httpx
-
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    if not api_key:
-        raise ValueError("DEEPSEEK_API_KEY not set")
-
-    # 构建评分 prompt
-    items_text = "\n\n".join([
-        f"[{i+1}] {c['heading']}\n{c['content'][:300]}"
-        for i, c in enumerate(candidates)
-    ])
-    prompt = (
-        "你是一个法律知识检索重排序专家。请判断以下候选段落与用户查询的相关性。\n\n"
-        f"用户查询：{query}\n\n"
-        f"候选段落：\n{items_text}\n\n"
-        "请对每个候选段落给出相关性评分（0-10分，10分最相关），只返回JSON格式的评分数组，不要其他文字。\n"
-        "格式：{\"scores\": [分数1, 分数2, ...]}（分数顺序与候选段落一一对应）"
-    )
-
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_LONG) as client:
-        resp = await client.post(
-            f"{DEEPSEEK_API_BASE}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": DEEPSEEK_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"},
-                "temperature": 0.1,
-                "max_tokens": 1024
-            }
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        result = json.loads(content)
-
-    scores = result.get("scores", [])
-    if not scores or len(scores) != len(candidates):
-        # 空/不匹配评分直接失败，由调用方回退 pg_trgm 排序（P1 #42）
-        raise ValueError(f"评分数量({len(scores)})与候选数({len(candidates)})不匹配")
-
-    # 合并评分并排序
-    for i, c in enumerate(candidates):
-        c["rerank_score"] = round(scores[i], 2) if isinstance(scores[i], (int, float)) else 0
-
-    candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
-    return candidates[:top_k]
+        return await _search_two_legs(conn, query, _search_query, top_k, permissions)
 
 
 # web_search 本地限流（P1 #13/#40：防高频调用导致外部搜索 API 封 IP）
+# 按 user_key 独立计数（P1：改全局限流为用户级，避免多用户并发互相误伤）。
 _search_rate_lock = asyncio.Lock()
-_search_rate_last = 0.0
-_search_rate_count = 0
+_search_rate_state: dict = {}   # user_key -> (window_start, count)
 _SEARCH_WINDOW_SECONDS = 10.0
 _SEARCH_MAX_PER_WINDOW = 10
+# 计数字典键数上限：超过即触发惰性清扫（防每用户一个键无界增长，P2 修复）
+_SEARCH_STATE_MAX_KEYS = 512
 
 
-async def _check_search_rate():
-    """web_search 本地限流：每 10 秒最多 10 次（全局兜底；每用户限流需调用方传标识）"""
-    global _search_rate_last, _search_rate_count
+async def _check_search_rate(user_key: str = ""):
+    """web_search 本地限流：每 user_key 每 10 秒最多 10 次。
+
+    user_key 缺省为 ""（未透传用户时降到全局兜底），透传 username 后按用户隔离。
+    键数超阈值时惰性清扫已过窗口的旧计数（活跃用户的窗口未过期不受影响）。
+    """
+    key = user_key or "_global"
     async with _search_rate_lock:
         now = time.time()
-        if now - _search_rate_last > _SEARCH_WINDOW_SECONDS:
-            _search_rate_count = 0
-            _search_rate_last = now
-        if _search_rate_count >= _SEARCH_MAX_PER_WINDOW:
+        if len(_search_rate_state) > _SEARCH_STATE_MAX_KEYS:
+            expired = [k for k, (ws, _c) in _search_rate_state.items()
+                       if now - ws > _SEARCH_WINDOW_SECONDS]
+            for k in expired:
+                del _search_rate_state[k]
+        window_start, count = _search_rate_state.get(key, (0.0, 0))
+        if now - window_start > _SEARCH_WINDOW_SECONDS:
+            window_start, count = now, 0
+        if count >= _SEARCH_MAX_PER_WINDOW:
             raise RuntimeError("搜索过于频繁，请稍后再试")
-        _search_rate_count += 1
+        _search_rate_state[key] = (window_start, count + 1)
 
 
-async def web_search(query: str, max_results: int = 5):
+async def web_search(query: str, max_results: int = 5, user_key: str = ""):
     """
     联网搜索工具 — 当用户询问实时信息、营业时间、评价、排队情况等
     现有工具无法覆盖的内容时调用。
 
-    使用 DuckDuckGo 搜索（免费，无需 API Key），返回结构化结果。
+    主路径：duckduckgo_search 的 DDGS 是纯同步客户端（8.x 只导出 DDGS，
+    没有 AsyncDDGS/atext），阻塞调用放 asyncio.to_thread 执行；
+    未安装/无结果/异常时降级 httpx 直连 Instant Answer API。
+    user_key 为调用方用户名，用于按用户限流（缺省走全局兜底）。
     """
-    await _check_search_rate()  # 本地限流（P1 #13/#40）
+    await _check_search_rate(user_key)  # 本地限流（P1 #13/#40）
     try:
         from duckduckgo_search import DDGS
-        results = []
-        async with DDGS() as ddgs:
-            async for r in ddgs.atext(
-                query,
-                region='cn-zh',
-                max_results=max_results,
-            ):
-                results.append({
-                    "title": r.get("title", ""),
-                    "body": r.get("body", "")[:500],
-                    "href": r.get("href", ""),
-                })
-        if not results:
-            # 降级：用 httpx 直接请求 DuckDuckGo API
-            logger.info("DDGS 无结果，降级使用 httpx 直连")
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
-                resp = await client.get(
-                    "https://api.duckduckgo.com/",
-                    params={"q": query, "format": "json", "no_html": "1"},
-                )
-                data = resp.json()
-                abstract = data.get("AbstractText", "")
-                if abstract:
-                    results.append({
-                        "title": data.get("Heading", "摘要"),
-                        "body": abstract[:500],
-                        "href": data.get("AbstractURL", ""),
-                    })
-                for topic in data.get("RelatedTopics", [])[:3]:
-                    if "Text" in topic:
-                        results.append({
-                            "title": topic.get("Text", "")[:100],
-                            "body": topic.get("Text", "")[:500],
-                            "href": topic.get("FirstURL", ""),
-                        })
 
-        logger.info(f"联网搜索完成: query={query[:30]}, results={len(results)}")
-        return {"results": results, "total": len(results)}
+        def _ddg_text() -> list:
+            # 同步阻塞搜索放线程池，避免卡住事件循环
+            with DDGS() as ddgs:
+                return ddgs.text(query, region='cn-zh', max_results=max_results) or []
 
+        raw = await asyncio.to_thread(_ddg_text)
+        results = [{
+            "title": r.get("title", ""),
+            "body": r.get("body", "")[:500],
+            "href": r.get("href", ""),
+        } for r in raw]
+        if results:
+            logger.info(f"联网搜索完成: query={query[:30]}, results={len(results)}")
+            return {"results": results, "total": len(results)}
+        logger.info("DDGS 无结果，降级 Instant Answer")
     except ImportError:
-        logger.warning("duckduckgo_search 未安装，降级使用 httpx 直连")
+        logger.warning("duckduckgo_search 未安装，降级 Instant Answer")
+    except Exception as e:
+        logger.warning(f"DDGS 搜索失败，降级 Instant Answer: {e}")
+
+    return await _instant_answer(query)
+
+
+async def _instant_answer(query: str) -> dict:
+    """降级：DuckDuckGo Instant Answer API（通常只返回一条摘要，搜索能力弱于主路径）"""
+    try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
             resp = await client.get(
                 "https://api.duckduckgo.com/",
                 params={"q": query, "format": "json", "no_html": "1"},
             )
             data = resp.json()
-            results = []
-            abstract = data.get("AbstractText", "")
-            if abstract:
+        results = []
+        abstract = data.get("AbstractText", "")
+        if abstract:
+            results.append({
+                "title": data.get("Heading", "摘要"),
+                "body": abstract[:500],
+                "href": data.get("AbstractURL", ""),
+            })
+        for topic in data.get("RelatedTopics", [])[:3]:
+            if "Text" in topic:
                 results.append({
-                    "title": data.get("Heading", "摘要"),
-                    "body": abstract[:500],
-                    "href": data.get("AbstractURL", ""),
+                    "title": topic.get("Text", "")[:100],
+                    "body": topic.get("Text", "")[:500],
+                    "href": topic.get("FirstURL", ""),
                 })
-            for topic in data.get("RelatedTopics", [])[:3]:
-                if "Text" in topic:
-                    results.append({
-                        "title": topic.get("Text", "")[:100],
-                        "body": topic.get("Text", "")[:500],
-                        "href": topic.get("FirstURL", ""),
-                    })
-            return {"results": results, "total": len(results)}
-
+        return {"results": results, "total": len(results)}
     except Exception as e:
-        logger.error(f"联网搜索失败: {e}")
-        return {"error": str(e), "results": [], "total": 0}
+        # httpx 部分异常 str 为空，补类型名保证日志可排查
+        logger.error(f"联网搜索失败: {type(e).__name__}: {e}")
+        # 异常 str 可能带含 key 的完整 URL，前端只给类型名（细节已进日志）
+        return {"error": type(e).__name__, "results": [], "total": 0}
 
 
 # ============================================================
 # 项目知识库搜索（求职场景用，Embedding 向量召回 + pg_trgm 兜底）
 # ============================================================
 async def _generate_embedding(text: str):
-    """调用 Ollama Embedding 生成向量"""
+    """调用 Ollama Embedding 生成向量。
+
+    localhost 优先：容器内 localhost 连接拒绝是即时的（随后试 host.docker.internal），
+    而反序在主机上会对 host.docker.internal 空等到连接超时（实测每查询白等 15s）。
+    超时收窄到 5s：正常嵌入 <1s，给慢机留裕量即可，不该拖住整条检索。
+    """
     import httpx
     urls = [
-        "http://host.docker.internal:11434/api/embeddings",
         "http://localhost:11434/api/embeddings",
+        "http://host.docker.internal:11434/api/embeddings",
     ]
     for url in urls:
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
                 resp = await client.post(
                     url,
                     json={"model": "shaw/dmeta-embedding-zh", "prompt": text[:512]}
@@ -431,6 +473,68 @@ async def _generate_embedding(text: str):
     return None
 
 
+async def _project_embedding_search(pool, query: str, top_k: int) -> list:
+    """项目知识库 Embedding 向量召回（Ollama）；失败或无结果返回 []，由调用方降级"""
+    try:
+        emb = await _generate_embedding(query)
+        if not emb:
+            return []
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT chunk_key, source, heading, content, "
+                "1 - (embedding <=> $1::vector) as sim "
+                "FROM knowledge_chunks WHERE source = 'project' "
+                "AND embedding IS NOT NULL "
+                "ORDER BY embedding <=> $1::vector "
+                "LIMIT $2",
+                json.dumps(emb), max(top_k * 2, 10)
+            )
+        return [{
+            "heading": r["heading"],
+            "content": r["content"][:800],
+            "similarity": round(r["sim"], 4) if r["sim"] else 0
+        } for r in rows if r["sim"] and r["sim"] > 0.3]
+    except Exception as e:
+        logger.warning(f"Embedding 检索失败，降级: {e}")
+        return []
+
+
+async def _project_keyword_fill(pool, query: str, results: list, top_k: int) -> None:
+    """项目知识库关键词 ILIKE 兜底：提取 2-4 字中文片段（长词优先），补满 top_k 即停"""
+    keywords = set()
+    raw = query.replace("?", "").replace("？", "").replace("的", "").replace("怎么", "")
+    # 按空格拆分
+    for part in raw.split():
+        if len(part) >= 2:
+            keywords.add(part)
+    # 滑动窗口提取 2-4 字片段
+    for i in range(len(raw)):
+        for j in range(2, 5):
+            if i + j <= len(raw):
+                kw = raw[i:i+j]
+                if len(kw) >= 2:
+                    keywords.add(kw)
+    # 优先用长关键词
+    keywords = sorted(keywords, key=len, reverse=True)[:8]
+
+    if not keywords:
+        return
+    async with pool.acquire() as conn:
+        for kw in keywords:
+            more = await conn.fetch(
+                "SELECT chunk_key, source, heading, content, 0.5 as sim "
+                "FROM knowledge_chunks WHERE source = 'project' "
+                "AND content ILIKE $1 LIMIT $2",
+                f"%{kw}%", top_k - len(results)
+            )
+            for r in more:
+                heading, content = r["heading"], r["content"][:800]
+                if not any(e["heading"] == heading and e["content"][:50] == content[:50] for e in results):
+                    results.append({"heading": heading, "content": content, "similarity": 0.5})
+            if len(results) >= top_k:
+                break
+
+
 async def search_project_knowledge(query: str, top_k: int = 5):
     """
     搜索项目知识库 — 当访客询问项目技术细节时调用。
@@ -439,35 +543,13 @@ async def search_project_knowledge(query: str, top_k: int = 5):
     """
     from ..core.db import get_pool
     pool = await get_pool()
-    results = []
-    method = "embedding"
+    results = await _project_embedding_search(pool, query, top_k)
+    method = "embedding" if results else "pg_trgm"
 
-    # 第一优先：Embedding 向量检索
-    try:
-        emb = await _generate_embedding(query)
-        if emb:
-            async with pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT chunk_key, source, heading, content, "
-                    "1 - (embedding <=> $1::vector) as sim "
-                    "FROM knowledge_chunks WHERE source = 'project' "
-                    "AND embedding IS NOT NULL "
-                    "ORDER BY embedding <=> $1::vector "
-                    "LIMIT $2",
-                    json.dumps(emb), max(top_k * 2, 10)
-                )
-                results = [{
-                    "heading": r["heading"],
-                    "content": r["content"][:800],
-                    "similarity": round(r["sim"], 4) if r["sim"] else 0
-                } for r in rows if r["sim"] and r["sim"] > 0.3]
-    except Exception as e:
-        logger.warning(f"Embedding 检索失败，降级: {e}")
-        method = "fallback"
-
-    # 第二优先/降级：pg_trgm 相似度检索
+    # 第二优先/降级：pg_trgm 相似度检索（embedding 部分命中时为 hybrid 补充）
     if len(results) < top_k:
-        method = "pg_trgm" if not results else "hybrid"
+        if results:
+            method = "hybrid"
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT chunk_key, source, heading, content, "
@@ -485,38 +567,7 @@ async def search_project_knowledge(query: str, top_k: int = 5):
 
     # 关键词补充兜底（拆分为 2-4 字片段，提高中文匹配率）
     if len(results) < top_k:
-        # 从查询中提取有意义的 2-4 字中文词组
-        keywords = set()
-        raw = query.replace("?", "").replace("？", "").replace("的", "").replace("怎么", "")
-        # 按空格拆分
-        for part in raw.split():
-            if len(part) >= 2:
-                keywords.add(part)
-        # 滑动窗口提取 2-4 字片段
-        for i in range(len(raw)):
-            for j in range(2, 5):
-                if i + j <= len(raw):
-                    kw = raw[i:i+j]
-                    if len(kw) >= 2:
-                        keywords.add(kw)
-        # 优先用长关键词
-        keywords = sorted(keywords, key=len, reverse=True)[:8]
-        
-        if keywords:
-            async with pool.acquire() as conn:
-                for kw in keywords:
-                    more = await conn.fetch(
-                        "SELECT chunk_key, source, heading, content, 0.5 as sim "
-                        "FROM knowledge_chunks WHERE source = 'project' "
-                        "AND content ILIKE $1 LIMIT $2",
-                        f"%{kw}%", top_k - len(results)
-                    )
-                    for r in more:
-                        heading, content = r["heading"], r["content"][:800]
-                        if not any(e["heading"] == heading and e["content"][:50] == content[:50] for e in results):
-                            results.append({"heading": heading, "content": content, "similarity": 0.5})
-                    if len(results) >= top_k:
-                        break
+        await _project_keyword_fill(pool, query, results, top_k)
 
     results = sorted(results, key=lambda x: x["similarity"], reverse=True)[:top_k]
     logger.info(f"项目知识库检索: query={query[:30]}, method={method}, results={len(results)}")

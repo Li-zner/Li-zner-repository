@@ -18,7 +18,7 @@ import httpx
 import asyncio
 from typing import List, Dict, Optional
 from ..core.logging import setup_logging
-from ..core.config import DEEPSEEK_API_BASE, HTTP_TIMEOUT_MEDIUM
+from ..core.config import DEEPSEEK_MODEL, HTTP_TIMEOUT_MEDIUM, llm_endpoint
 from ..core.metrics import llm_tokens_total, llm_tokens_detail, llm_requests_total
 
 logger = setup_logging()
@@ -96,11 +96,9 @@ AGENT_REVIEW_PROMPT_TEMPLATE = """你是{name}，你的专长是{focus}。
 """
 
 
-def build_shared_context(user_query: str, user_location: str = "", user_profile: str = "", recent_summary: str = "") -> str:
+def build_shared_context(user_query: str, user_profile: str = "", recent_summary: str = "") -> str:
     """构造一个精简的共享背景，供多 Agent 和主 Agent 复用。"""
     parts = ["【共享背景】"]
-    if user_location:
-        parts.append(f"用户位置: {user_location}")
     if user_profile:
         parts.append(f"用户画像: {user_profile}")
     if recent_summary:
@@ -136,9 +134,8 @@ def _compact_tool_result(result: dict) -> str:
 class DiscussionBoard:
     """讨论板 — 所有 Agent 共享的上下文"""
 
-    def __init__(self, user_query: str, user_context: str = ""):
+    def __init__(self, user_query: str):
         self.user_query = user_query
-        self.user_context = user_context
         self.tool_results: Dict[str, dict] = {}       # agent_id → raw tool result
         self.phase1_opinions: Dict[str, dict] = {}    # agent_id → Phase 1 分析
         self.phase2_reviews: Dict[str, dict] = {}     # agent_id → Phase 2 审阅
@@ -148,6 +145,13 @@ class DiscussionBoard:
         self.tool_results[agent_id] = result
 
     def add_phase1_opinion(self, agent_id: str, opinion: dict):
+        # 入库前统一消毒：phase1 的 LLM 输出会同时进入 Phase2 的 review system prompt
+        # （AGENT_REVIEW_PROMPT_TEMPLATE，该路径不经过 context 消毒）和主 Agent 讨论摘要
+        if isinstance(opinion, dict):
+            for key in ("analysis", "cross_comments"):
+                val = opinion.get(key)
+                if isinstance(val, str):
+                    opinion[key] = _sanitize_context(val)
         self.phase1_opinions[agent_id] = opinion
 
     def add_phase2_review(self, agent_id: str, review: dict):
@@ -156,8 +160,6 @@ class DiscussionBoard:
     def get_phase1_context(self) -> str:
         """Phase 1 的上下文：所有工具结果，使用精简版共享背景。"""
         parts = [f"## 用户问题\n{self.user_query}"]
-        if self.user_context:
-            parts.append(f"## 共享背景\n{self.user_context}")
         parts.append("## 各专家工具查询结果（精简版）")
         for agent_id, result in self.tool_results.items():
             profile = AGENT_PROFILES.get(agent_id, {})
@@ -212,7 +214,8 @@ class DiscussionBoard:
             for agent_id, opinion in self.phase1_opinions.items():
                 profile = AGENT_PROFILES.get(agent_id, {})
                 name = profile.get("name", agent_id)
-                analysis = opinion.get("analysis", "无")
+                # str() 兜底：LLM 返回的 JSON 里 analysis 可能是数组/数字等非字符串类型
+                analysis = str(opinion.get("analysis", "无"))
                 analysis = analysis.replace("\n", " ").strip()
                 if len(analysis) > 120:
                     analysis = analysis[:117] + "..."
@@ -235,12 +238,14 @@ def _brief_result(result: dict) -> str:
         rests = result["restaurants"]
         return f"找到 {len(rests)} 家餐厅"
     if "route" in result:
-        r = result["route"]
+        # or {} 兜底：LLM 子代理可能返回 {"route": null}，直接 .get 会 AttributeError
+        r = result["route"] or {}
         return f"路线: {r.get('distance_km','?')}km, {r.get('duration_min','?')}min, {r.get('mode','?')}"
     if "temperature" in result:
         return f"{result.get('city','')}天气: {result.get('weather','')}, {result.get('temperature','?')}°C"
     if "error" in result:
-        return f"查询失败: {result['error'][:50]}"
+        # str() 兜底：error 值可能被 LLM 输出成非字符串
+        return f"查询失败: {str(result['error'])[:50]}"
     return json.dumps(result, ensure_ascii=False)[:80]
 
 
@@ -285,10 +290,12 @@ async def _call_deepseek_think(
     ]
 
     from ..core.config import DEEPSEEK_MODEL
+    # 主力模型可能是 qwen（百炼端点），按模型名路由端点与密钥
+    base_url, api_key = llm_endpoint(DEEPSEEK_MODEL, api_key)
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
             resp = await client.post(
-                f"{DEEPSEEK_API_BASE}/chat/completions",
+                f"{base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json={
                     "model": DEEPSEEK_MODEL,
@@ -339,8 +346,8 @@ class AgentOrchestrator:
         summary = await orch.run()
     """
 
-    def __init__(self, user_query: str, user_context: str = ""):
-        self.board = DiscussionBoard(user_query, user_context)
+    def __init__(self, user_query: str):
+        self.board = DiscussionBoard(user_query)
 
     def add_tool_result(self, agent_id: str, result: dict, error: str = ""):
         if error:
@@ -378,6 +385,12 @@ class AgentOrchestrator:
             result = results[idx]
             if isinstance(result, Exception):
                 result = {"analysis": f"（分析异常: {str(result)[:50]}）", "cross_comments": "无", "suggestions": [], "error": True}
+            if result.get("error"):
+                # 分析失败（JSON 解析错误/API 异常）：不当作有效意见入库，
+                # 只在错误表登记，使 Phase 2 与摘要跳过该 Agent，防止错误文本污染讨论（P1）。
+                self.board.errors[agent_id] = "分析未完成"
+                logger.warning(f"Phase 1 Agent {agent_id} 分析失败，标记未响应")
+                continue
             opinions[agent_id] = result
             self.board.add_phase1_opinion(agent_id, result)
 

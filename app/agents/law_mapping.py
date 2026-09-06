@@ -3,7 +3,8 @@
 加载 tests/民法典补充协议.txt 中的 40 条常见法律误区，
 在民法典知识库检索前，先判断用户问题是否属于其他法律领域。
 """
-import os, csv, re, json
+import csv
+import re
 import threading
 from pathlib import Path
 from typing import Optional
@@ -116,7 +117,7 @@ def _calculate_match_score(query: str, keywords: list[str]) -> float:
     return 0.0
 
 
-def check_query(query: str, threshold: float = 0.3) -> Optional[dict]:
+def check_query(query: str, threshold: float = 0.5) -> Optional[dict]:
     """
     检查用户问题是否与映射表中的法律误区匹配。
     如果匹配，返回对应的纠正信息；否则返回 None。
@@ -137,7 +138,6 @@ def check_query(query: str, threshold: float = 0.3) -> Optional[dict]:
     """
     # 如果问题明确提到了「民法典」或具体法条编号，跳过映射表
     #    避免将明确的民法典问题误归入其他法律
-    import re
     if "民法典" in query or re.search(r'第[0-9零一二三四五六七八九十百千]+条', query):
         return None
 

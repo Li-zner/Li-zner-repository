@@ -1,0 +1,27 @@
+FROM docker.io/library/python:3.11-slim
+WORKDIR /app
+
+# 仅保留 curl（健康检查）。去掉 tesseract-ocr 与 torch/sentence-transformers：
+#   - 重排序走 DeepSeek API（app/agents/tools.py _rerank_with_deepseek），本地无 torch 依赖
+#   - 去 torch 后镜像从 ~3GB 瘦到 ~500MB，1 GiB 内存实例才能跑
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+# 主依赖（轻量，tsinghua 镜像源加速）
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+COPY app/ ./app/
+COPY static/ ./static/
+COPY prompts/ ./prompts/
+COPY tools/ ./tools/
+COPY tests/ ./tests/
+COPY alembic/ ./alembic/
+COPY alembic.ini .
+COPY _env.py .
+
+EXPOSE 10086
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+  CMD curl -f http://localhost:10086/health || exit 1
+
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "10086"]

@@ -28,8 +28,8 @@ def _get_trace_id():
             span_context = current_span.get_span_context()
             if span_context and span_context.is_valid:
                 return format(span_context.trace_id, '032x')
-    except Exception:
-        pass  # OpenTelemetry 不可用时不阻塞
+    except Exception as e:
+        logging.getLogger(__name__).debug(f"OTel trace_id 读取失败: {e}")
     return None
 
 
@@ -50,12 +50,19 @@ class JsonFormatter(logging.Formatter):
         return _fast_dumps(log_entry)
 
 
+_configured = False
+
+
 def setup_logging():
+    global _configured
     logger = logging.getLogger()
+    # 幂等守卫（P3 修复）：原先每次调用清空重加 root handlers，30 个模块 import 时
+    # 反复重置，且会误伤其他模块自定义的 handler
+    if _configured and logger.handlers:
+        return logger
     logger.setLevel(logging.INFO)
-    if logger.hasHandlers():
-        logger.handlers.clear()
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())
     logger.addHandler(handler)
+    _configured = True
     return logger

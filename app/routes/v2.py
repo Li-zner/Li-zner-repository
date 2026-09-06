@@ -12,7 +12,8 @@ from ..middleware.auth import get_current_user
 from ..models.schemas import ChatRequest, CreateTaskRequest
 from ..core.task_manager import get_task
 from ..services.agent_tasks import (
-    cancel_agent_task, create_agent_task, resume_agent_task, wait_task_result,
+    cancel_agent_task, create_agent_task, ensure_task_access, resume_agent_task, wait_task_result,
+    task_user_perms,
 )
 from ..services.chat_stream_core import chat_generate
 from ..services.chat_stream_ctx import ensure_chat_allowed
@@ -52,7 +53,7 @@ class TaskResultResponse(BaseModel):
     """任务结果/状态响应"""
     status: str
     content: str
-    session_id: str
+    conversation_id: str
 
 
 # ---------- 文件上传 ----------
@@ -108,6 +109,7 @@ async def get_task_result(
     task = await get_task(task_id)
     if not task:
         return JSONResponse({"error": "task not found"}, status_code=404)
+    ensure_task_access(task, current_user)
     return await wait_task_result(task_id, task, wait)
 
 
@@ -120,6 +122,7 @@ async def cancel_task(
     task = await get_task(task_id)
     if not task:
         return JSONResponse({"error": "task not found"}, status_code=404)
+    ensure_task_access(task, current_user)
     return await cancel_agent_task(task_id, task)
 
 
@@ -132,4 +135,6 @@ async def resume_task(
     task = await get_task(task_id)
     if not task:
         return JSONResponse({"error": "task not found"}, status_code=404)
-    return await resume_agent_task(task_id, task, current_user["username"])
+    ensure_task_access(task, current_user)
+    return await resume_agent_task(task_id, task, current_user["username"],
+                                   task_user_perms(current_user))

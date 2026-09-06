@@ -6,6 +6,9 @@ import json
 import re
 from ..middleware.auth import get_current_user
 from ..core.config import HTTP_TIMEOUT_MEDIUM, MAP_API_TIMEOUT
+from ..core.logging import setup_logging
+
+logger = setup_logging()
 
 class RouteRequest(BaseModel):
     departure: str
@@ -15,7 +18,7 @@ router = APIRouter(prefix="/api/map", tags=["map"])
 
 
 @router.get("/regeo")
-async def reverse_geocode(lat: float, lng: float):
+async def reverse_geocode(lat: float, lng: float, current_user: dict = Depends(get_current_user)):
     """经纬度→城市名（高德逆地理编码）"""
     amap_key = os.getenv("AMAP_API_KEY")
     if not amap_key:
@@ -65,7 +68,7 @@ def _is_reserved_ip(ip: str) -> bool:
 
 
 @router.get("/iploc")
-async def ip_location(request: Request):
+async def ip_location(request: Request, current_user: dict = Depends(get_current_user)):
     """IP 近似定位兜底：浏览器 geolocation 不可用时（国内 Chrome 走 Google 定位常被墙），
     用请求 IP 经高德 IP 定位接口拿城市。CF-Connecting-IP 是 Cloudflare 传的真实用户 IP。
 
@@ -103,8 +106,8 @@ async def ip_location(request: Request):
                 if not city:
                     city = province
                 return {"city": city, "province": province, "ip": ip}
-    except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError):
-        pass
+    except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+        logger.debug(f"IP 定位服务不可用: {type(e).__name__}")
     return {"city": "", "province": ""}
 
 def _weather_candidates(name: str):
@@ -139,12 +142,12 @@ async def _resolve_adcode(amap_key: str, name: str, client):
             data = resp.json()
             if data.get("status") == "1" and data.get("geocodes"):
                 return data["geocodes"][0].get("adcode")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"adcode 查询失败: {type(e).__name__}")
     return None
 
 @router.get("/weather")
-async def get_weather(city: str):
+async def get_weather(city: str, current_user: dict = Depends(get_current_user)):
     amap_key = os.getenv("AMAP_API_KEY")
     fallback = {"status": "1", "lives": [{"city": city, "weather": "暂无数据", "temperature": "--", "winddirection": "", "windpower": ""}]}
     if not amap_key:
@@ -202,8 +205,10 @@ async def get_weather(city: str):
     return fallback
 
 @router.post("/recommend")
-async def get_recommend(city: str):
-    deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+async def get_recommend(city: str, current_user: dict = Depends(get_current_user)):
+    # 与主链路同款 Key 轮询（统一 chat_support 取 Key，杜绝多 Key 白名单不一致的 400）
+    from ..services.chat_support import get_deepseek_key
+    deepseek_key = await get_deepseek_key()
 
     # ===== 通用兜底数据（API不可用时返回）=====
     _default_rec = {"foods": ["当地特色小吃", "地道家常菜", "招牌美食"], "spots": ["城市地标", "历史文化街区", "自然公园"]}
@@ -224,31 +229,31 @@ async def get_recommend(city: str):
         "Authorization": f"Bearer {deepseek_key}",
         "Content-Type": "application/json"
     }
+    # payload 对齐主链路成功形态：无 temperature/max_tokens（部分网关拒绝这些参数返回 400）
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "max_tokens": 250
     }
+    # 带主/备模型降级（qwen 主模型 400 时自动用 deepseek-v4-flash 重试）
+    from ..services.chat_support import post_chat_completion
     try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
-                resp = await client.post(url, json=payload, headers=headers)
-            if resp.status_code != 200:
-                return _default_rec  # 不抛异常，直接返回兜底
-            data = resp.json()
-            try:
-                content = data["choices"][0]["message"]["content"]
-                return json.loads(content)
-            except:
-                return _default_rec
+        ok, data = await post_chat_completion(payload, timeout=HTTP_TIMEOUT_MEDIUM)
+        if not ok:
+            logger.warning(f"recommend 上游失败: {data}")
+            return _default_rec
+        content = data["choices"][0]["message"]["content"]
+        # LLM 可能返回 ```json 包裹：走 _extract_json 容错解析
+        from ..agents.sub_agents import _extract_json
+        return _extract_json(content)
     except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError, httpx.HTTPStatusError):
         return _default_rec
-    except Exception:
+    except Exception as e:
+        logger.warning(f"recommend 解析失败（返回兜底）: {str(e)[:120]} | 原始内容: {str(data)[:120] if data else ''}")
         return _default_rec
 
 
 @router.post("/route")
-async def plan_route(req: RouteRequest):
+async def plan_route(req: RouteRequest, current_user: dict = Depends(get_current_user)):
     """规划多段路线（支持高铁/飞机/火车/公交组合），返回每段的模式、起止城市、耗时"""
     departure = req.departure
     destination = req.destination
@@ -296,7 +301,7 @@ async def plan_route(req: RouteRequest):
 
 
 @router.post("/amap-route")
-async def amap_route(req: RouteRequest):
+async def amap_route(req: RouteRequest, current_user: dict = Depends(get_current_user)):  # noqa: func-length 豁免（主人决策 2026-09-05）：高德 API 集成层，与外部服务端点一一对应，拆分破坏内聚
     """使用高德地图 API 规划真实路线（驾车/公交/步行）"""
     amap_key = os.getenv("AMAP_API_KEY")
     if not amap_key:
@@ -429,6 +434,9 @@ async def amap_route(req: RouteRequest):
 @router.get("/geojson")
 async def get_geojson(adcode: str = "100000", current_user: dict = Depends(get_current_user)):
     """代理 GeoJSON 地图数据，绕过阿里云 DataV 的 Referer 防盗链（需登录）"""
+    # P3 修复：adcode 只允许 6 位数字，防 URL 路径拼接
+    if not re.fullmatch(r"\d{6}", adcode):
+        raise HTTPException(400, "adcode 必须为 6 位数字")
     if adcode == "100000":
         url = "https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json"
     else:

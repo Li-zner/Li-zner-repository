@@ -2,7 +2,9 @@
 
 > 从 agent_gateway 生产实战沉淀的可复用 MCP Server。每个 Server 一个子目录：
 > 代码自包含（只依赖 `_env.py` 读配置）+ 验证 Client + README。
-> 规则与五步法见 `harness/03-参考-项目经验/` 与 agent_gateway `mcp_assets/MCP指南.md`。
+> 规则与五步法见 `../harness/03-参考-项目经验/` 与 `../skill/mcp-server开发五步法/`。
+> 能力盘点：新增能力前先查开源清单 awesome-mcp-servers（github.com/punkpeye/awesome-mcp-servers），
+> 有成熟实现直接复用，不重复自研（成熟库优先原则）。
 
 ## 资产清单
 
@@ -46,3 +48,9 @@ python "MCP sever/JWT令牌签发与校验/jwt_token_service_server.py" --self-c
 这 5 个 Server 可与 `../skill/` 流程技能组合成验收工具：见
 `../AI应用验收工具/`（五阶段验收：认证→并发限流→语义缓存→知识检索→纠错映射，
 `python verify_all.py` 一键执行）。
+
+## 图谱入口
+
+- 主题图谱：[[图谱/MOC-MCP生态|MOC-MCP 生态]]（5 个 Server 的清单、五步法、官方对照、组合样板）
+- 机制本体：[[图谱/MOC-生产机制与稳定性|MOC-生产机制与稳定性]]（被封装的锁 / 限流 / 缓存参考实现）
+- 全库总览：[[图谱/MOC-总览|MOC-总览]]

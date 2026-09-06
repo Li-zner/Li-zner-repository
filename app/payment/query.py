@@ -4,25 +4,14 @@
 订单/流水/渠道/统计的 SELECT 查询 + 系列化。与「账务写/流」(service.py) 分离，
 避免读逻辑与资金事务耦合；service.py 经 re-export 保留原公开符号。
 """
-from datetime import datetime, timezone, timedelta
+from datetime import timedelta
 from typing import Optional, List
 
 from ..core.db import get_pool
 from ..core.logging import setup_logging
+from ._ledger import _utcnow, _to_iso  # 复用时间原语，避免重复定义（单一定义源 _ledger）
 
 logger = setup_logging()
-
-
-def _utcnow():
-    """返回 offset-naive 的 UTC 时间（兼容 asyncpg；避免弃用的 datetime.utcnow）"""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
-def _to_iso(dt):
-    """返回带 Z 后缀的 ISO 时间字符串（兼容 JavaScript 解析）"""
-    if dt is None:
-        return None
-    return dt.isoformat() + "Z"
 
 
 def _order_to_dict(row) -> dict:
@@ -180,7 +169,7 @@ async def get_order_detail(order_no: str, user_id: str) -> Optional[dict]:
 
 
 async def get_channels() -> list:
-    """获取可用支付渠道"""
+    """获取可用支付渠道（用户侧；P2：balance 是扣费记账渠道，不对外作为充值渠道）"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -190,7 +179,7 @@ async def get_channels() -> list:
             "ORDER BY sort_order ASC"
         )
         if rows:
-            return [
+            items = [
                 {
                     "channel_code": r["channel_code"],
                     "channel_name": r["channel_name"],
@@ -203,11 +192,11 @@ async def get_channels() -> list:
                 }
                 for r in rows
             ]
+            # 用户侧渠道列表隐藏 balance（服务端充值白名单同步拦截，双保险）
+            return [c for c in items if c["channel_code"] != "balance"]
     # DB 无渠道配置时回退默认（记录日志便于排查，P2 #39 防静默降级掩盖异常）
     logger.warning("payment_channels 表无数据，回退到硬编码默认渠道")
     return [
-        {"channel_code": "balance", "channel_name": "余额支付", "icon": "",
-         "is_active": True, "fee_rate": 0, "min_amount": 0.01, "max_amount": 999999, "sort_order": 0},
         {"channel_code": "simulated_alipay", "channel_name": "模拟支付宝", "icon": "",
          "is_active": True, "fee_rate": 0, "min_amount": 0.01, "max_amount": 999999, "sort_order": 1},
         {"channel_code": "simulated_wxpay", "channel_name": "模拟微信支付", "icon": "",
@@ -222,22 +211,27 @@ async def get_admin_stats() -> dict:
         _now = _utcnow()
         _start = _now.replace(hour=0, minute=0, second=0, microsecond=0)
         _end = _start + timedelta(days=1)
+        # P2 口径修复：金额只计成功口径（success/部分退款）且排除退款单，退款单独行统计
         today_row = await conn.fetchrow(
-            "SELECT COUNT(*) as total, COALESCE(SUM(amount), 0) as total_amount "
+            "SELECT COUNT(*) as total, "
+            "COALESCE(SUM(CASE WHEN status IN ('success', 'partial_refunded') AND order_type != 'refund' "
+            "THEN amount ELSE 0 END), 0) as total_amount "
             "FROM payment_orders WHERE created_at >= $1 AND created_at < $2",
             _start, _end,
         )
         # 总统计
         total_row = await conn.fetchrow(
-            "SELECT COUNT(*) as total, COALESCE(SUM(amount), 0) as total_amount "
-            "FROM payment_orders WHERE status = 'success'",
+            "SELECT COUNT(*) as total, "
+            "COALESCE(SUM(CASE WHEN status IN ('success', 'partial_refunded') AND order_type != 'refund' "
+            "THEN amount ELSE 0 END), 0) as total_amount "
+            "FROM payment_orders",
         )
         # 钱包总数
         wallet_count = await conn.fetchval("SELECT COUNT(*) FROM user_wallets")
-        # 总充值
+        # 总充值（含部分退款的原单：钱确实进过账）
         recharge_total = await conn.fetchval(
             "SELECT COALESCE(SUM(amount), 0) FROM payment_orders "
-            "WHERE order_type = 'recharge' AND status = 'success'",
+            "WHERE order_type = 'recharge' AND status IN ('success', 'partial_refunded')",
         )
         # 总消费
         consume_total = await conn.fetchval(

@@ -11,6 +11,7 @@ from ..core.logging import setup_logging
 from ..core.metrics import llm_tokens_total, llm_tokens_detail, llm_requests_total
 from ..core.stream_utils import dispatch_tool, sse
 from ..core.safety_filter import get_filter
+from ..payment.service import deduct_token_cost
 from .chat_stream_ctx import ChatStreamCtx, finalize_answer
 from .chat_support import hide_reasoning, mark_key_result
 from .reasoning_guard import sanitize_reasoning
@@ -21,10 +22,16 @@ logger = setup_logging()
 MAX_STEPS = 3
 
 
+def _log_deduct_task_error(task: asyncio.Task) -> None:
+    """扣费后台任务的异常认领：记 warning，不打断对话，也不留未认领的 Task 异常"""
+    if not task.cancelled() and task.exception():
+        logger.warning(f"Token扣费后台任务失败（不影响对话）: {task.exception()}")
+
+
 def record_token_usage(_stream_usage: dict, username: str, conv_id: str):
     """Token 精细计量 + 扣费（10元/万token，模拟模式）
 
-    Prometheus 指标 + 异步扣费；扣费失败仅记 warning，不影响对话主流程。
+    Prometheus 指标 + 异步扣费；扣费失败经 done_callback 记 warning，不影响对话主流程。
     """
     from ..core.config import DEEPSEEK_MODEL as _dm
     prompt_tk = _stream_usage.get("prompt_tokens", 0)
@@ -37,14 +44,10 @@ def record_token_usage(_stream_usage: dict, username: str, conv_id: str):
     llm_requests_total.labels(model=_dm, endpoint='v2_chat', status='success').inc()
     if prompt_tk or completion_tk:
         total_tk = prompt_tk + completion_tk
-        try:
-            from ..payment.service import deduct_token_cost
-            asyncio.create_task(deduct_token_cost(
-                user_id=username, token_count=total_tk, session_id=conv_id or "",
-                remark=f"AI对话消耗 {total_tk} tokens（输入 {prompt_tk} + 输出 {completion_tk}）",
-            ))
-        except Exception as deduct_err:
-            logger.warning(f"Token扣费失败（不影响对话）: {deduct_err}")
+        asyncio.create_task(deduct_token_cost(
+            user_id=username, token_count=total_tk, session_id=conv_id or "",
+            remark=f"AI对话消耗 {total_tk} tokens（输入 {prompt_tk} + 输出 {completion_tk}）",
+        )).add_done_callback(_log_deduct_task_error)
 
 
 def _accumulate_tool_calls(tool_calls_index: Dict, delta: List[dict]) -> Dict:
@@ -79,10 +82,12 @@ def _frame_tool_calls(tool_calls_index: Dict) -> Optional[List[dict]]:
 
 
 async def _stream_react(ctx: ChatStreamCtx, model_try: str, frame: Dict) -> AsyncIterator[str]:
-    """单步流式消费；产出 SSE；frame 记录 {full_reasoning, full_content, tool_calls, usage, fallback}"""
+    """单步流式消费；产出 SSE；frame 记录 {full_reasoning, full_content, tool_calls, usage, fallback, content_blocked}"""
     full_reasoning = ""
     full_content = ""
     has_tool_calls = False
+    content_blocked = False
+    sf = get_filter()
     tool_calls_index: Dict = {}
     usage = {"prompt_tokens": 0, "completion_tokens": 0}
     try:
@@ -99,6 +104,14 @@ async def _stream_react(ctx: ChatStreamCtx, model_try: str, frame: Dict) -> Asyn
                         full_reasoning += chunk
                         yield sse("reasoning_chunk", chunk)
             elif kind == "answer":
+                # 逐块 DFA 过滤：answer_chunk 此刻已实时发往前端，事后检查拦不回
+                # （与 runner 任务路径同一标准；跨块词由收尾终检兜底）
+                _chk = sf.check_stream(payload)
+                if not _chk["safe"]:
+                    full_content += sf.safe_message
+                    yield sse("answer_chunk", sf.safe_message)
+                    content_blocked = True
+                    break
                 full_content += payload
                 yield sse("answer_chunk", payload)
             elif kind == "tool_calls":
@@ -119,19 +132,38 @@ async def _stream_react(ctx: ChatStreamCtx, model_try: str, frame: Dict) -> Asyn
         return
     frame["full_reasoning"] = full_reasoning
     frame["full_content"] = full_content
+    frame["content_blocked"] = content_blocked
     frame["usage"] = usage
     frame["tool_calls"] = _frame_tool_calls(tool_calls_index) if (has_tool_calls and tool_calls_index) else None
 
 
+async def _tool_arg_error(func_name: str) -> dict:
+    """LLM 工具参数不是合法 JSON 时的占位结果（对齐 runner._tool_arg_error，P1 修复）"""
+    return {"error": f"{func_name} 参数不是有效 JSON"}
+
+
 async def _execute_react_tools(ctx: ChatStreamCtx, tool_calls: List[dict], frame: Dict) -> AsyncIterator[str]:
     """并行执行工具（wait_for 超时手动 cancel）；产出事件；frame 记录 {tool_results, law_mapping_hit}"""
-    for tc in tool_calls:
-        yield f"data: {json.dumps({'type': 'tool_call', 'name': tc['function']['name'], 'args': json.loads(tc['function']['arguments'])})}\n\n"
-    tasks = []
+    # P1 修复：arguments 的 json.loads 必须有防护——LLM 偶发产出非法 JSON 时，
+    # 原实现异常会打穿 async generator，整条 SSE 流无 answer_complete 直接断流
+    parsed: List[tuple] = []
     for tc in tool_calls:
         func_name = tc["function"]["name"]
-        args = json.loads(tc["function"]["arguments"])
-        tasks.append(dispatch_tool(func_name, args, ctx.req.query, ctx.req.user_location, ctx.user_perms))
+        try:
+            args = json.loads(tc["function"]["arguments"])
+        except (json.JSONDecodeError, TypeError):
+            # 非法 JSON 也必须占位进 parsed：tool_results 与 tool_calls 按下标对齐，
+            # 跳过会让坏调用拿到别人的结果、末尾 tool_call 缺 tool 消息（下轮 LLM 请求 400）
+            args = None
+        parsed.append((func_name, args))
+        yield f"data: {json.dumps({'type': 'tool_call', 'name': func_name, 'args': args if args is not None else {}})}\n\n"
+
+    tasks = []
+    for func_name, args in parsed:
+        if args is None:
+            tasks.append(_tool_arg_error(func_name))
+        else:
+            tasks.append(dispatch_tool(func_name, args, ctx.req.query, ctx.user_perms, ctx.username))
     _tool_task_list = [asyncio.create_task(coro) for coro in tasks]
     try:
         tool_results = await asyncio.wait_for(
@@ -200,7 +232,7 @@ async def _roundtable(ctx: ChatStreamCtx, tool_calls: List[dict], tool_results: 
     try:
         from ..agents.orchestrator import AgentOrchestrator
         from ..agents.router import get_agent_names_for_orchestrator
-        orch = AgentOrchestrator(ctx.req.query, ctx.req.user_location or "")
+        orch = AgentOrchestrator(ctx.req.query)
         agent_names = get_agent_names_for_orchestrator(ctx.matched_agents)
         if not agent_names:
             agent_names = ["query_weather", "query_hotel", "query_route", "query_food"]
@@ -251,6 +283,17 @@ async def _react_step(ctx: ChatStreamCtx, step: int) -> AsyncIterator[str]:
     if frame.get("fallback"):
         return
     record_token_usage(frame["usage"], ctx.username, ctx.conv_id)
+
+    # 流中被 DFA 拦截：直接以已发送的安全文本收尾（full_content = 安全前缀 + 安全文案），
+    # 不再进入工具分支；被拦截内容不写缓存（避免把"安全文案"钉成该 query 的长期答案）
+    if frame.get("content_blocked"):
+        final_safe = frame["full_content"] or "抱歉，我暂时无法回答。"
+        yield sse("answer_complete", final_safe) + "data: [DONE]\n\n"
+        ctx.partial_answer = final_safe
+        await finalize_answer(ctx, final_safe, write_cache=False)
+        ctx.saved_normally = True
+        ctx.finished = True
+        return
 
     tool_calls = frame["tool_calls"]
     if not tool_calls:

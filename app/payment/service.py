@@ -1,22 +1,14 @@
 """
-支付核心业务逻辑
-
-包含：
-- 钱包管理（获取、创建、更新）
-- 订单管理（创建充值/消费/退款订单）
-- 支付处理（含分布式锁 + 乐观锁）
-- 交易流水记录
-- Token 扣费计算（10元/万token）
+支付核心业务逻辑：钱包/订单管理、充值支付（含分布式锁+乐观锁）、Token 扣费（10元/万token）、退款、流水。
+账本/锁/余额原语见 _ledger.py；只读查询见 query.py。
 """
 import json
-import uuid
-import random
 import asyncio
 from decimal import Decimal
-from datetime import datetime, timezone, timedelta
+from datetime import timedelta
 
 # 兼容性：asyncpg 对 offset-aware datetime 有 bug，统一用 naive UTC
-from typing import Optional, List
+from typing import Optional
 
 from ..core.db import get_pool
 from ..core.redis import get_redis
@@ -28,19 +20,23 @@ from ..core.config import (
     TOKEN_COST_RATE,  # 每万token价格（元）
 )
 from ..core.logging import setup_logging
-from .channels import get_channel, get_available_channels
+from .channels import get_channel, RECHARGE_ALLOWED_CHANNELS
 # 账本/锁/余额原语（2026-08-31 从本模块拆出，见 _ledger.py）：re-export 保留对外公开符号
 from ._ledger import (
-    _utcnow, _to_iso, _generate_order_no, _generate_invoice_no,
+    _utcnow, _to_iso, _generate_order_no,
     _acquire_lock, _release_lock, _apply_balance_change, _do_update_balance,
     _do_record_tx, _record_transaction, ensure_wallet_exists, get_wallet,
-    _update_wallet_balance, _LOCK_PREFIX,
+    _update_wallet_balance, _locked_wallet_change, _LOCK_PREFIX,
 )
 # 只读查询层（2026-08-31 从本模块拆出，见 query.py）：re-export 保留对外公开符号
 from .query import (
     get_transaction_logs, get_order_list, get_order_detail, get_channels,
     get_admin_stats, get_admin_order_list,
 )
+# 退款流程（2026-09-05 拆出，见 refund.py）：re-export 保留对外公开符号
+from .refund import process_refund  # noqa: F401
+# 待结算扣费（2026-09-05 新增，见 deferred.py）：钱包忙时的占位与补偿结算
+from .deferred import defer_deduction  # noqa: F401
 from prometheus_client import Counter
 
 logger = setup_logging()
@@ -118,6 +114,10 @@ async def create_recharge_order(
         }
 
     try:
+        # 充值渠道白名单（P0 修复）：balance 是"用余额支付"，用于充值=无资金动作直接加余额
+        if payment_method not in RECHARGE_ALLOWED_CHANNELS:
+            raise ValueError(f"充值不支持该支付渠道: {payment_method}")
+
         # 校验金额
         _validate_recharge_amount(amount)
 
@@ -146,8 +146,9 @@ async def create_recharge_order(
         if _idem_occupied and r is not None:
             try:
                 await r.delete(_idem_key)
-            except Exception:
-                pass
+            except Exception as _e:
+                # 占位回滚失败只影响"失败后能否立即重试"，幂等键自带 TTL 自愈，不影响资金
+                logger.warning(f"幂等占位回滚失败（TTL 自愈）: {_e}")
         raise
 
     logger.info(f"创建充值订单: order_no={order_no}, user={user_id}, amount={amount}")
@@ -175,11 +176,12 @@ async def _load_order(pool, order_no: str, user_id: str) -> dict:
 
 
 async def _precheck_terminal_status(order: dict, pool, user_id: str) -> Optional[dict]:
-    """状态前置判断：已成功 → 返回幂等成功结果 dict（调用方直接返回）；终态 → 抛 ValueError；空状态 → None
+    """状态前置判断：已成功 → 返回幂等成功结果 dict（调用方直接返回）；终态 → 抛 ValueError；可继续 → None
 
+    P2 修复：failed 不再视为终态，允许同单重试支付（渠道失败后无需重建订单）。
     非事务读（单独短连接）；终态判断与状态更新原子性交由事务内 FOR UPDATE 兜底（P0 #1）。
     """
-    if order["status"] == "pending":
+    if order["status"] in ("pending", "failed"):
         return None
     if order["status"] == "success":
         async with pool.acquire(timeout=5) as conn:
@@ -238,6 +240,68 @@ def _recharge_response(channel_result: dict, order_no: str, now, after_balance) 
     }
 
 
+async def _settle_recharge(conn, order_no: str, user_id: str, channel_result: dict) -> tuple:
+    """事务内结算充值：FOR UPDATE 锁行 → 状态/过期最终校验 → 更新订单 + 钱包 + 流水（原子，P0 #1）。
+
+    返回 (支付时间 now, 变更后余额)；渠道失败返回 (None, None)（fix：避免 else 分支末尾引用
+    未定义 now/after_balance 引发 UnboundLocalError 500）。
+    """
+    async with conn.transaction():
+        locked = await conn.fetchrow(
+            "SELECT * FROM payment_orders WHERE order_no = $1 FOR UPDATE",
+            order_no,
+        )
+        if not locked:
+            raise ValueError("订单不存在")
+        # P2 修复：failed 允许重试（同单重新支付），其余非 pending 状态拒绝
+        if locked["status"] not in ("pending", "failed"):
+            raise ValueError(f"订单状态不允许支付: {locked['status']}")
+        if locked["expire_at"] and locked["expire_at"] < _utcnow():
+            await conn.execute(
+                "UPDATE payment_orders SET status = 'expired', updated_at = CURRENT_TIMESTAMP "
+                "WHERE order_no = $1", order_no,
+            )
+            raise ValueError("订单已过期")
+
+        if not channel_result["success"]:
+            # 渠道失败：标记 failed（无 paid_at / 无余额变动），返回 None 占位
+            await conn.execute(
+                "UPDATE payment_orders SET status = 'failed', updated_at = CURRENT_TIMESTAMP "
+                "WHERE order_no = $1", order_no,
+            )
+            logger.warning(f"充值失败: order_no={order_no}, reason={channel_result.get('message')}")
+            return None, None
+
+        now = _utcnow()
+        amount = locked["amount"]
+        payment_method = locked["payment_method"]
+        await conn.execute(
+            """UPDATE payment_orders SET
+               status = 'success', paid_at = $1,
+               channel_order_no = $2,
+               callback_status = 'not_needed',
+               updated_at = CURRENT_TIMESTAMP
+               WHERE order_no = $3""",
+            now, channel_result.get("channel_order_no", ""), order_no,
+        )
+        # 行锁确定性更新余额（2026-09-05 由乐观锁重试改为 FOR UPDATE）：
+        # 渠道调用已生效后再回滚的代价是"用户已付款、余额未入账"，
+        # 乐观锁重试耗尽正是唯一的常态回滚源；行锁让并发写者排队而非冲突。
+        # tx_type 区分累计字段（P0 #15）
+        updated, before_balance, after_balance, _ = await _locked_wallet_change(
+            conn, user_id, amount, tx_type="recharge"
+        )
+        if not updated:
+            raise ValueError("钱包更新失败，请重试")
+        await _do_record_tx(
+            conn, order_no, user_id, "recharge", amount,
+            before_balance, after_balance,
+            f"充值 {amount} 元（{payment_method}）", "system",
+        )
+        logger.info(f"充值成功: order_no={order_no}, user={user_id}, amount={amount}")
+        return now, after_balance
+
+
 async def process_recharge(order_no: str, user_id: str) -> dict:
     """
     处理充值支付（模拟支付确认）
@@ -272,55 +336,9 @@ async def process_recharge(order_no: str, user_id: str) -> dict:
         # 5. 渠道 active 检查（A17：admin 停用渠道后立即生效）+ 调用（事务外，P0 #33；超时保护 P1 #20）
         channel_result = await _invoke_channel(order)
 
-        # 6. 事务内：FOR UPDATE 锁行 → 状态/过期最终校验 → 更新订单 + 钱包 + 流水（原子，P0 #1）
+        # 6. 事务内结算（FOR UPDATE 锁行 → 状态/过期最终校验 → 更新订单 + 钱包 + 流水，原子 P0 #1）
         async with pool.acquire(timeout=5) as conn:
-            async with conn.transaction():
-                locked = await conn.fetchrow(
-                    "SELECT * FROM payment_orders WHERE order_no = $1 FOR UPDATE",
-                    order_no,
-                )
-                if not locked:
-                    raise ValueError("订单不存在")
-                if locked["status"] != "pending":
-                    raise ValueError(f"订单状态不允许支付: {locked['status']}")
-                if locked["expire_at"] and locked["expire_at"] < _utcnow():
-                    await conn.execute(
-                        "UPDATE payment_orders SET status = 'expired', updated_at = CURRENT_TIMESTAMP "
-                        "WHERE order_no = $1", order_no,
-                    )
-                    raise ValueError("订单已过期")
-
-                if channel_result["success"]:
-                    now = _utcnow()
-                    amount = locked["amount"]
-                    payment_method = locked["payment_method"]
-                    await conn.execute(
-                        """UPDATE payment_orders SET
-                           status = 'success', paid_at = $1,
-                           channel_order_no = $2,
-                           callback_status = 'not_needed',
-                           updated_at = CURRENT_TIMESTAMP
-                           WHERE order_no = $3""",
-                        now, channel_result.get("channel_order_no", ""), order_no,
-                    )
-                    # 乐观锁更新余额（冲突自动重试，有上限）；tx_type 区分累计字段（P0 #15）
-                    updated, before_balance, after_balance, _ = await _apply_balance_change(
-                        conn, user_id, amount, tx_type="recharge"
-                    )
-                    if not updated:
-                        raise ValueError("钱包更新冲突，请重试")
-                    await _do_record_tx(
-                        conn, order_no, user_id, "recharge", amount,
-                        before_balance, after_balance,
-                        f"充值 {amount} 元（{payment_method}）", "system",
-                    )
-                    logger.info(f"充值成功: order_no={order_no}, user={user_id}, amount={amount}")
-                else:
-                    await conn.execute(
-                        "UPDATE payment_orders SET status = 'failed', updated_at = CURRENT_TIMESTAMP "
-                        "WHERE order_no = $1", order_no,
-                    )
-                    logger.warning(f"充值失败: order_no={order_no}, reason={channel_result.get('message')}")
+            now, after_balance = await _settle_recharge(conn, order_no, user_id, channel_result)
 
         # 7. 返回结果（A20 埋点）
         return _recharge_response(channel_result, order_no, now, after_balance)
@@ -345,6 +363,78 @@ def _compute_token_cost(token_count: int) -> Optional[Decimal]:
     return cost_amount
 
 
+async def _apply_token_deduction(
+    conn, user_id: str, cost_amount: Decimal, token_count: int,
+    order_no: str, session_id: str, remark: str,
+) -> tuple:
+    """事务内扣费核心：写扣费订单 → 乐观锁更新余额 → 记流水（原子，任一失败整体回滚）。
+
+    余额读取与"不足按余额扣"的判定都在事务内完成（P1 修复：快照原先在事务外读，
+    充值路径不持钱包锁，并发时流水 before/after 不衔接、实扣金额基于过期余额）；
+    FOR UPDATE 行锁使充值/退款/扣费在本行上串行（单行锁无死锁环）。
+    返回 (变更前余额, 实际扣费, 变更后余额)；无钱包则并发安全创建（P0 #34）。
+    """
+    async with conn.transaction():
+        # 事务内读钱包并锁行；无钱包则原子创建后重读（P0 #34：防并发主键冲突）
+        wallet_row = await conn.fetchrow(
+            "SELECT balance FROM user_wallets WHERE user_id = $1 FOR UPDATE",
+            user_id,
+        )
+        if not wallet_row:
+            await conn.execute(
+                "INSERT INTO user_wallets (user_id, balance, status) "
+                "VALUES ($1, $2, 'active') ON CONFLICT (user_id) DO NOTHING",
+                user_id, DEFAULT_WALLET_BALANCE,
+            )
+            wallet_row = await conn.fetchrow(
+                "SELECT balance FROM user_wallets WHERE user_id = $1 FOR UPDATE",
+                user_id,
+            )
+
+        before_balance = wallet_row["balance"]
+        actual_deduct = cost_amount
+
+        # 余额不足时按剩余余额扣（模拟模式不拦截）
+        if before_balance < cost_amount and before_balance > 0:
+            actual_deduct = before_balance
+            logger.info(f"余额不足，按剩余余额扣费: user={user_id}, "
+                        f"应扣={cost_amount}, 实扣={actual_deduct}")
+
+        # 写入扣费订单
+        subject = f"AI对话消耗 {token_count} tokens"
+        await conn.execute(
+            """INSERT INTO payment_orders
+               (order_no, user_id, order_type, amount, status, subject,
+                payment_method, paid_at, callback_status, metadata)
+               VALUES ($1, $2, 'payment', $3, 'success', $4,
+                       'balance', CURRENT_TIMESTAMP, 'not_needed', $5)""",
+            order_no, user_id, -actual_deduct, subject,
+            json.dumps({
+                "token_count": token_count,
+                "rate": f"{TOKEN_COST_RATE}元/万token",
+                "session_id": session_id,
+                "deduct_type": "full" if actual_deduct == cost_amount else "partial",
+            }),
+        )
+
+        # 更新余额（乐观锁 + 冲突自动重试；行锁已持有，余额可以为负，模拟模式不阻止对话）
+        updated, tx_before, new_balance, _ = await _apply_balance_change(
+            conn, user_id, -actual_deduct, tx_type="consume"
+        )
+        if not updated:
+            # 版本冲突：抛异常强制回滚（P0 #2），避免"扣费订单已入但余额未减"的账实不符
+            raise ValueError("钱包版本冲突，请重试")
+
+        # 记录流水（before 用事务内快照，保证与实际变更衔接、对账平滑）
+        await _do_record_tx(
+            conn, order_no, user_id, "consume", actual_deduct,
+            tx_before, new_balance,
+            remark or f"AI对话消耗 {token_count} tokens，费用 {actual_deduct} 元",
+            "system",
+        )
+    return tx_before, actual_deduct, new_balance
+
+
 async def deduct_token_cost(
     user_id: str,
     token_count: int,
@@ -364,77 +454,27 @@ async def deduct_token_cost(
     # 生成扣费订单号
     order_no = await _generate_order_no()
 
-    # 分布式锁：同一用户钱包的并发变更串行化（防止并发扣费版本冲突）
+    # 分布式锁：同一用户钱包的并发变更串行化（防止并发扣费版本冲突）。
+    # 竞争时退避重试 3 次；仍失败转「待结算占位单」由维护任务补偿结算——
+    # 原实现直接跳过 = 高并发下漏计费且无痕（2026-09-05 修复，占位见 deferred.py）。
     lock_key = f"wallet:{user_id}"
-    lock_token = await _acquire_lock(lock_key)
+    lock_token = None
+    for attempt in range(3):
+        lock_token = await _acquire_lock(lock_key)
+        if lock_token:
+            break
+        await asyncio.sleep(0.05 * (2 ** attempt))
     if not lock_token:
-        logger.warning(f"钱包繁忙，本次扣费跳过: user={user_id}")
-        return {"deducted": False, "amount": 0, "reason": "wallet busy"}
+        await defer_deduction(order_no, user_id, cost_amount, token_count, session_id, remark)
+        return {"deducted": False, "amount": 0, "reason": "wallet busy, deferred",
+                "order_no": order_no, "pending_settlement": True}
 
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # 获取钱包
-            wallet_row = await conn.fetchrow(
-                "SELECT balance, version FROM user_wallets WHERE user_id = $1",
-                user_id,
+            before_balance, actual_deduct, new_balance = await _apply_token_deduction(
+                conn, user_id, cost_amount, token_count, order_no, session_id, remark,
             )
-            if not wallet_row:
-                # 无钱包则原子创建（P0 #34：并发安全，用当前连接，避免重复获取）
-                await conn.execute(
-                    "INSERT INTO user_wallets (user_id, balance, status) "
-                    "VALUES ($1, $2, 'active') ON CONFLICT (user_id) DO NOTHING",
-                    user_id, DEFAULT_WALLET_BALANCE,
-                )
-                wallet_row = await conn.fetchrow(
-                    "SELECT balance, version FROM user_wallets WHERE user_id = $1",
-                    user_id,
-                )
-
-            before_balance = wallet_row["balance"]
-            actual_deduct = cost_amount
-
-            # 余额不足时按剩余余额扣（模拟模式不拦截）
-            if before_balance < cost_amount and before_balance > 0:
-                actual_deduct = before_balance
-                logger.info(f"余额不足，按剩余余额扣费: user={user_id}, "
-                            f"应扣={cost_amount}, 实扣={actual_deduct}")
-
-            # 写入扣费订单 + 更新余额 + 记录流水（同一事务：version conflict 或流水失败
-            # 时整体回滚，防"订单已插但没扣钱"或"钱扣了流水没记"的不一致）
-            async with conn.transaction():
-                # 写入扣费订单
-                subject = f"AI对话消耗 {token_count} tokens"
-                await conn.execute(
-                    """INSERT INTO payment_orders
-                       (order_no, user_id, order_type, amount, status, subject,
-                        payment_method, paid_at, callback_status, metadata)
-                       VALUES ($1, $2, 'payment', $3, 'success', $4,
-                               'balance', CURRENT_TIMESTAMP, 'not_needed', $5)""",
-                    order_no, user_id, -actual_deduct, subject,
-                    json.dumps({
-                        "token_count": token_count,
-                        "rate": f"{TOKEN_COST_RATE}元/万token",
-                        "session_id": session_id,
-                        "deduct_type": "full" if actual_deduct == cost_amount else "partial",
-                    }),
-                )
-
-                # 更新余额（乐观锁 + 冲突自动重试；余额可以为负，模拟模式不阻止对话）
-                updated, _, new_balance, _ = await _apply_balance_change(
-                    conn, user_id, -actual_deduct, tx_type="consume"
-                )
-                if not updated:
-                    # 版本冲突：抛异常强制回滚（P0 #2），避免"扣费订单已入但余额未减"的账实不符
-                    raise ValueError("钱包版本冲突，请重试")
-
-                # 记录流水
-                await _do_record_tx(
-                    conn, order_no, user_id, "consume", actual_deduct,
-                    before_balance, new_balance,
-                    remark or f"AI对话消耗 {token_count} tokens，费用 {actual_deduct} 元",
-                    "system",
-                )
     except ValueError as e:
         # 业务失败（版本冲突等）：事务已回滚，返回未扣费（P0 #2）
         logger.warning(f"扣费业务失败，跳过: user={user_id}, reason={e}")
@@ -462,105 +502,8 @@ async def deduct_token_cost(
 
 
 # ============================================================
-# 退款流程
-# ============================================================
-def _validate_refund_amount(order: dict, amount: Optional[Decimal]) -> Decimal:
-    """校验退款：订单须已成功；退款金额>0 且不超过原订单，返回实际退款金额"""
-    if order["status"] != "success":
-        raise ValueError("仅已成功的订单可退款")
-    refund_amount = amount if amount else order["amount"]
-    if refund_amount <= 0:
-        raise ValueError("退款金额必须大于 0")  # P2 #40：防 0 元无效退款单
-    if refund_amount > order["amount"]:
-        raise ValueError("退款金额不能超过原订单金额")
-    return refund_amount
-
-
-def _refund_result(order_no: str, refund_order_no: str, refund_amount: Decimal, now) -> dict:
-    """组装退款结果（含成功日志）"""
-    logger.info(f"退款成功: 原订单={order_no}, 退款单={refund_order_no}, amount={refund_amount}")
-    return {
-        "order_no": order_no,
-        "refund_order_no": refund_order_no,
-        "status": "refunded",
-        "refund_amount": float(refund_amount),
-        "refunded_at": _to_iso(now),
-    }
-
-
-async def process_refund(
-    order_no: str,
-    user_id: str,
-    amount: Optional[Decimal] = None,
-    reason: str = "用户申请退款",
-) -> dict:
-    """处理退款"""
-    lock_key = f"refund:{order_no}"
-    lock_token = await _acquire_lock(lock_key)
-    if not lock_token:
-        raise ValueError("退款正在处理中")
-
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # 获取原订单
-            row = await conn.fetchrow(
-                "SELECT * FROM payment_orders WHERE order_no = $1 AND user_id = $2",
-                order_no, user_id,
-            )
-            if not row:
-                raise ValueError("订单不存在")
-            order = dict(row)
-
-            refund_amount = _validate_refund_amount(order, amount)
-
-            # 创建退款订单 + 更新原订单 + 退钱 + 流水（同一事务：
-            # 任一步失败整体回滚，防"订单标记退款但钱没退回"的不一致）
-            async with conn.transaction():
-                # 创建退款订单
-                refund_order_no = await _generate_order_no()
-                await conn.execute(
-                    """INSERT INTO payment_orders
-                       (order_no, user_id, order_type, amount, status, subject,
-                        payment_method, metadata, callback_status)
-                       VALUES ($1, $2, 'refund', $3, 'refunded', $4,
-                               $5, $6, 'not_needed')""",
-                    refund_order_no, user_id, refund_amount,
-                    f"退款: {order.get('subject', '')}",
-                    order["payment_method"],
-                    json.dumps({"original_order_no": order_no, "reason": reason}),
-                )
-
-                # 更新原订单状态
-                now = _utcnow()
-                await conn.execute(
-                    "UPDATE payment_orders SET status = 'refunded', refunded_at = $1, "
-                    "updated_at = CURRENT_TIMESTAMP WHERE order_no = $2",
-                    now, order_no,
-                )
-
-                # 退钱回钱包（乐观锁 + 冲突自动重试）
-                updated, before_balance, after_balance, _ = await _apply_balance_change(
-                    conn, user_id, refund_amount, tx_type="refund"  # P0 #15：退款累计到 total_refunded
-                )
-                if not updated:
-                    raise ValueError("钱包更新冲突")
-
-                # 流水
-                await _do_record_tx(
-                    conn, refund_order_no, user_id, "refund", refund_amount,
-                    before_balance, after_balance,
-                    reason, "system",
-                )
-
-            return _refund_result(order_no, refund_order_no, refund_amount, now)
-    finally:
-        await _release_lock(lock_key, lock_token)
-
-
-# ============================================================
-# 支付 schema DDL 已移除：由 Alembic 迁移管理（A19/A23），启动不再执行建表。
-# 原 init_payment_tables / _create_*table 为遗留死代码（0 调用），2026-08-31 清理。
+# 退款流程已拆至 refund.py（2026-09-05，行为等价移动）；
+# 支付 schema DDL 由 Alembic 迁移管理（A19/A23）。
 # ============================================================
 async def recover_stale_processing(age_seconds: int = 300) -> int:
     """恢复超时的 processing 订单（P2 C10：模拟支付期间进程崩溃后订单卡死）

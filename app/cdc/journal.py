@@ -8,13 +8,43 @@ import asyncio
 import json
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
 from ..core.logging import setup_logging
 
 logger = setup_logging()
 
 _FSYNC_EVERY = 100  # 每 N 条 fsync 一次
+
+
+def parse_jsonb(value):
+    """把 asyncpg 返回的 JSONB 值规范化为结构化对象。
+
+    asyncpg 默认把 jsonb 列解码成 JSON 文本 str；若直接塞进事件，json.dumps 会双重编码
+    （before/after 变成 \"{...}\" 字符串，而非嵌套对象）。此处 str -> dict/list 解析一次，
+    已是对象则原样返回；解析失败（如纯文本）则回退为原值（P1 修复双重编码）。
+    """
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return value
+    return value
+
+
+def format_ts(dt):
+    """把数据库时间规范化为 UTC ISO 字符串（末尾带 Z）。
+
+    TIMESTAMPTZ 列返回 aware datetime（可能非 UTC 会话时区），naive 视为 UTC。
+    统一成 \"YYYY-MM-DDTHH:MM:SS(.ffffff)Z\"，保证 journal 与 API 的 ts 一致（P1 #11）。
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class CdcJournal:
@@ -70,7 +100,10 @@ class CdcJournal:
                 old_fh = self._fh
                 self._fh = new_fh
                 old_fh.close()
-                self._current_basename = f"{basename}.{seq}"
+                # 注意：此处不更新 _current_basename（仍为“当日文件名”）。
+                # _current_basename 只用于“跨天/首开”判断；若改成 f"{basename}.{seq}"，
+                # 下一笔校验 self._current_basename != basename 恒真，会反复重开超限的当日文件，
+                # 导致每条写入都新建一个滚动文件（文件无限增殖）。保留当日名，写入自然落到滚动序号文件。
             self._fh.write(line)
             # P1 #8：移除每条 flush，fsync 前统一 flush（fsync 每 100 条一次）
             self._since_fsync += 1
@@ -80,7 +113,15 @@ class CdcJournal:
                 self._since_fsync = 0
 
     async def save_checkpoint(self, last_id: int):
-        """原子写 checkpoint（临时文件 + os.replace；记录当前 journal 文件名，P2 #18）"""
+        """原子写 checkpoint（临时文件 + os.replace；记录当前 journal 文件名，P2 #18）
+
+        单调保护：多实例部署时，非 leader 实例的 last_id 停留在启动时的旧值，
+        停机时若直接覆写会把已推进的 checkpoint 回退，导致重启后重放已处理事件（重复）。
+        这里先读盘，仅当 last_id 不低于当前值才写入（P1）。
+        """
+        if last_id < self.load_checkpoint():
+            logger.warning(f"checkpoint 回退被忽略: {last_id} < 当前值")
+            return
         self.last_id = last_id
         data = {
             "last_id": last_id,
@@ -105,8 +146,21 @@ class CdcJournal:
                 with open(self.checkpoint_path, "r", encoding="utf-8") as f:
                     return int(json.load(f).get("last_id", 0))
             except Exception as e:
-                logger.warning(f"checkpoint 读取失败，从 0 开始: {e}")
+                # 保留“从 0 开始”语义（#9 不改），但日志更清晰，便于排障 checkpoint 损坏
+                logger.warning(
+                    f"checkpoint 读取失败（{e}），将按 last_id=0 重放，可能产生重复事件；"
+                    "请检查 checkpoint.json 是否损坏"
+                )
         return 0
+
+    def refresh_checkpoint(self) -> int:
+        """从磁盘重读 checkpoint 的 last_id 并刷新 self.last_id。
+
+        状态/查看接口（routes.py）每次调用刷新，避免实例在首次创建后 last_id 永久冻结
+        （worker 另建实例写 checkpoint，本实例若不重读则永远显示旧值）。
+        """
+        self.last_id = self.load_checkpoint()
+        return self.last_id
 
     def list_files(self):
         """列出落盘的日志文件信息（供 API 查看）"""
@@ -119,10 +173,13 @@ class CdcJournal:
         return out
 
     def close(self):
-        if self._fh:
-            try:
-                os.fsync(self._fh.fileno())
-            except Exception:
-                pass
-            self._fh.close()
-            self._fh = None
+        # P1：与 _write_line 共用 _write_lock，避免停机时正在线程池中写文件、
+        # 而 close() 并发关闭句柄造成的写入报错/文件损坏。
+        with self._write_lock:
+            if self._fh:
+                try:
+                    os.fsync(self._fh.fileno())
+                except Exception as e:
+                    logger.debug(f"journal fsync 失败（尽力而为）: {e}")
+                self._fh.close()
+                self._fh = None

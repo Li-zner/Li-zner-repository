@@ -1,47 +1,18 @@
 """
-语义缓存预热模块
-在服务启动时，将高频查询预写入 pgvector 语义缓存，
-减少首次查询的冷启动时间。
+语义缓存预热模块：启动时写入有标准答案的固定问答。
+
+修复（P2）：旧实现会给 20 个无答案的热门查询写"正在为您查询…请稍候..."占位，
+并声称"首次访问时会被真实结果覆盖"——该机制不存在（缓存命中不会触发生成），
+占位会被原样当答案返回；且写入用 cache_ctx=""，运行时永远按 build_cache_ctx
+（人格|位置|画像指纹）查询，这些条目实际永远不可达（纯死写）。现仅预热有
+标准答案的条目，并按匿名请求的上下文键写入，保证可命中。
 """
-import json
-import hashlib
-import asyncio
-from pathlib import Path
 from .semantic_cache import SemanticCache
 from .logging import setup_logging
 
 logger = setup_logging()
 
 # 高频查询列表（硬编码，来自实际使用统计）
-_HOT_QUERIES = [
-    # ── 天气 ──
-    ("北京今天天气怎么样", None),  # None = 自动运行工具生成
-    ("上海天气", None),
-    ("广州天气", None),
-    ("深圳今天多少度", None),
-    ("杭州气温", None),
-    # ── 美食 ──
-    ("推荐北京好吃的餐厅", None),
-    ("上海有什么好吃的", None),
-    ("广州美食推荐", None),
-    ("成都特色美食", None),
-    ("杭州有什么好吃的餐厅", None),
-    # ── 路线 ──
-    ("从北京到上海怎么去", None),
-    ("从广州到深圳怎么走", None),
-    ("北京到杭州路线", None),
-    # ── 酒店 ──
-    ("北京经济型酒店推荐", None),
-    ("上海酒店推荐", None),
-    ("杭州民宿推荐", None),
-    # ── 综合规划 ──
-    ("帮我规划一下去杭州的旅游攻略", None),
-    ("成都旅游攻略推荐", None),
-    # ── 民法典 ──
-    ("民法典关于合同纠纷的规定", None),
-    ("民法典关于遗产继承", None),
-    ("离婚冷静期是多久", None),
-]
 
 # 无需调用工具，直接有标准答案的查询
 _HOT_ANSWERS = {
@@ -50,33 +21,13 @@ _HOT_ANSWERS = {
 
 
 async def warmup_semantic_cache():
-    """
-    启动预热：将高频查询写入语义缓存。
-    有标准答案的直接写入；需要工具查询的标记待首次命中后自动填充。
-    """
+    """启动预热：只写入有标准答案的固定问答（按匿名请求上下文键，保证可命中）"""
     logger.info("开始预热语义缓存...")
-
-    # 先写入有标准答案的
+    anon_ctx = SemanticCache.build_cache_ctx("", "")
     for query, answer in _HOT_ANSWERS.items():
         try:
-            await SemanticCache.set(query, answer)
+            await SemanticCache.set(query, answer, cache_ctx=anon_ctx)
             logger.info(f"  预热缓存: {query[:30]}")
         except Exception as e:
             logger.warning(f"  预热失败: {query[:30]} - {e}")
-
-    # 其余查询标记为"待预热"——首次命中后自动替换为真实结果
-    for query, _ in _HOT_QUERIES:
-        if query in _HOT_ANSWERS:
-            continue
-        try:
-            # 检查是否已缓存
-            cached = await SemanticCache.get(query)
-            if cached is None:
-                # 写入占位标记，首次访问时会被真实结果覆盖
-                placeholder = f"正在为您查询「{query}」的最新信息，请稍候..."
-                await SemanticCache.set(query, placeholder)
-                logger.info(f"  标记预热: {query[:30]}")
-        except Exception as e:
-            logger.warning(f"  标记失败: {query[:30]} - {e}")
-
-    logger.info(f"语义缓存预热完成，共处理 {len(_HOT_ANSWERS) + len(_HOT_QUERIES)} 条")
+    logger.info(f"语义缓存预热完成，共 {len(_HOT_ANSWERS)} 条固定答案")

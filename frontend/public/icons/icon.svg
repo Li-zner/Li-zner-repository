@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- 旅行助手图标：云杉绿圆角底 + 白色纸飞机 -->
+  <rect width="512" height="512" rx="112" fill="#3d7a5c"/>
+  <path d="M96 264 400 128l-56 264-104-72-56 88-8-120z" fill="#ffffff"/>
+  <path d="M400 128 240 320l-8-96z" fill="#dfeee4"/>
+</svg>

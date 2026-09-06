@@ -114,6 +114,13 @@ def create_token_pair(username: str) -> dict:
     }
 
 
+# 回滚黑名单占位：仅当值仍为本次写入的 "1" 才删（防误删登出写入的同键标记）
+_RELEASE_BLACKLIST_LUA = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('del', KEYS[1]) else return 0 end"
+)
+
+
 def _decode_token(token: str, verify_exp: bool = True) -> dict:
     """用当前密钥 + 旧密钥依次尝试解码（支持轮换并行期）
 
@@ -154,11 +161,6 @@ async def refresh_access_token(token: str) -> dict:
         username = payload.get("sub")
         if not username:
             raise HTTPException(401, "Invalid token")
-        # 黑名单检查（登出/轮换后的旧 refresh）
-        if jti:
-            r = await get_redis()
-            if await r.get(f"auth:refresh_blacklist:{jti}"):
-                raise HTTPException(401, "Token revoked")
         iat = payload.get("iat")
         if iat:
             age_days = (datetime.now(timezone.utc) - datetime.fromtimestamp(iat, tz=timezone.utc)).days
@@ -171,19 +173,28 @@ async def refresh_access_token(token: str) -> dict:
         raise
     except Exception:
         raise HTTPException(401, "Invalid token")
-    # 先签发新 Token 对，再拉黑旧 refresh（P1 #34：避免"旧已失效、新未签发"的用户锁定窗口）
-    new_pair = {
-        "username": username,
-        "access_token": create_access_token({"sub": username}),
-        "refresh_token": create_refresh_token({"sub": username}),
-    }
-    if jti:
-        r = await get_redis()
-        await r.set(
-            f"auth:refresh_blacklist:{jti}", "1",
-            ex=REFRESH_TOKEN_EXPIRE_DAYS * 86400,
-        )
-    return new_pair
+    r = await get_redis()
+    blacklist_key = f"auth:refresh_blacklist:{jti}" if jti else None
+    claim_val = uuid.uuid4().hex
+    if blacklist_key:
+        # 原子抢占（SET NX）：同一 refresh token 只能成功兑换一次。
+        # 并发重放（旧 token 被盗后与真实客户端同时兑换）第二个请求直接 401。
+        claimed = await r.set(blacklist_key, claim_val, nx=True, ex=REFRESH_TOKEN_EXPIRE_DAYS * 86400)
+        if not claimed:
+            raise HTTPException(401, "Token revoked")
+    try:
+        # 先校验与抢占全部成功后才签发，签发异常时回滚抢占（不让用户被锁死）
+        new_pair = {
+            "username": username,
+            "access_token": create_access_token({"sub": username}),
+            "refresh_token": create_refresh_token({"sub": username}),
+        }
+        return new_pair
+    except Exception:
+        if blacklist_key:
+            # 仅回滚自己写入的占位（值不匹配说明已被登出覆盖，保留撤销语义）
+            await r.eval(_RELEASE_BLACKLIST_LUA, 1, blacklist_key, claim_val)
+        raise
 
 
 async def revoke_refresh_token(token: str):
@@ -197,29 +208,32 @@ async def revoke_refresh_token(token: str):
                 f"auth:refresh_blacklist:{jti}", "1",
                 ex=REFRESH_TOKEN_EXPIRE_DAYS * 86400,
             )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"登出撤销 refresh token 失败（幂等忽略）: {e}")
 
 async def get_cached_user(username: str):
     """带 Redis 缓存读取用户信息（TTL 5 分钟；不含 hashed_password，P1 #2 防每次查库）
 
     仅用于鉴权（角色/权限）；登录/改密等需要密码哈希的场景仍走 get_user（DB）。
+    缓存键前缀单源定义在 core/quota（USER_INFO_CACHE_PREFIX），quota 字段变更后
+    由变更方调用 invalidate_user_cache 失效，防止额度判断读到旧值（P1 修复）。
     """
+    from ..core.quota import USER_INFO_CACHE_PREFIX
     r = await get_redis()
-    cache_key = f"user:info:{username}"
+    cache_key = f"{USER_INFO_CACHE_PREFIX}{username}"
     try:
         raw = await r.get(cache_key)
         if raw:
             return json.loads(raw)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"用户缓存读取失败（回源 DB）: {e}")
     user = await get_user(username)
     if user:
         user.pop("hashed_password", None)  # 缓存不含密码哈希，降低泄露面
         try:
             await r.setex(cache_key, 300, json.dumps(user, ensure_ascii=False))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"用户缓存写入失败: {e}")
     return user
 
 

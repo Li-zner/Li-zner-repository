@@ -74,11 +74,16 @@ class PluginLoader:
                 handler_module = manifest.get("handler", "")
                 handler_func = manifest.get("handler_func", "handle")
                 if handler_module:
-                    try:
-                        mod = importlib.import_module(handler_module)
-                        handler = getattr(mod, handler_func, None)
-                    except Exception as e:
-                        logger.warning(f"加载插件 handler 失败 {manifest['name']}: {e}")
+                    # 信任边界：manifest 只允许加载 tools.* 下的模块，
+                    # 防止被篡改的 manifest 借 importlib 引入任意模块（如 os/subprocess）
+                    if not handler_module.startswith("tools."):
+                        logger.warning(f"插件 {manifest['name']} handler 非法（必须 tools.* 前缀）: {handler_module}")
+                    else:
+                        try:
+                            mod = importlib.import_module(handler_module)
+                            handler = getattr(mod, handler_func, None)
+                        except Exception as e:
+                            logger.warning(f"加载插件 handler 失败 {manifest['name']}: {e}")
 
                 plugin = ToolPlugin(manifest, handler)
                 self._plugins[plugin.name] = plugin

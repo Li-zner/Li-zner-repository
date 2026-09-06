@@ -23,6 +23,7 @@ async def delete_conversation(
 ):
     """删除指定对话的所有消息，并清除该用户的画像"""
     username = current_user["username"]
+    profile_cleared = False
 
     try:
         pool = await get_pool()
@@ -47,17 +48,19 @@ async def delete_conversation(
                     "DELETE FROM user_profiles WHERE user_id = $1",
                     username
                 )
+                profile_cleared = True
                 logger.info(f"已清除用户画像（用户已无对话）: user={username}")
             else:
                 logger.info(f"保留用户画像（用户仍有其他对话）: user={username}")
     except Exception as e:
+        # 内部错误只留日志，响应给固定文案防信息泄露（P3 修复）
         logger.error(f"删除对话失败: {e}")
-        raise HTTPException(status_code=500, detail=f"删除对话失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="删除对话失败，请稍后再试")
 
-    # 3. 清除 Redis 缓存
+    # 3. 清除 Redis 缓存（历史 + 滚动摘要一并清，防删除后同会话 ID 读到旧摘要，P3 修复）
     try:
         r = await get_redis()
-        await r.delete(f"conv:{conversation_id}")
+        await r.delete(f"conv:{conversation_id}", f"conv_summary:{conversation_id}")
         logger.info(f"已清除 Redis 缓存: conv:{conversation_id}")
     except Exception as e:
         logger.warning(f"Redis 缓存清除失败（不影响主流程）: {e}")
@@ -65,5 +68,5 @@ async def delete_conversation(
     return {
         "message": "对话已删除",
         "conversation_id": conversation_id,
-        "profile_cleared": True
+        "profile_cleared": profile_cleared  # P3 修复：按实际清理结果返回（原先恒 True）
     }

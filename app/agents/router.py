@@ -13,12 +13,15 @@
 
 import json
 import os
+import time
 import asyncio
 import httpx
-import re
 from typing import List, Dict, Optional
 from ..core.logging import setup_logging
-from ..core.config import DEEPSEEK_API_BASE, DEEPSEEK_MODEL, HTTP_TIMEOUT_SHORT, HTTP_TIMEOUT_MEDIUM
+from ..core.config import DEEPSEEK_MODEL, HTTP_TIMEOUT_SHORT, HTTP_TIMEOUT_MEDIUM, llm_endpoint
+# 必须模块级导入：safe_set 是模块级函数，曾因 SemanticCache 只在
+# handle_simple_task 内局部导入而必然 NameError（被 except 吞掉，缓存静默不写入）
+from ..core.semantic_cache import SemanticCache, safe_set
 
 logger = setup_logging()
 
@@ -148,6 +151,9 @@ async def classify_by_llm(query: str) -> Dict:
         logger.warning("LLM 分类无 API Key，回退关键词分类")
         return classify_by_keywords(query)
 
+    # 主力模型可能是 qwen（百炼端点），按模型名路由端点与密钥
+    base_url, api_key = llm_endpoint(DEEPSEEK_MODEL, api_key)
+
     system_prompt = """你是一个意图分类器。分析用户问题，判断涉及以下哪些领域（可多选）：
 - query_weather: 天气/气温相关
 - query_hotel: 酒店/住宿相关
@@ -168,7 +174,7 @@ async def classify_by_llm(query: str) -> Dict:
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SHORT) as client:
             resp = await client.post(
-                f"{DEEPSEEK_API_BASE}/chat/completions",
+                f"{base_url}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json"
@@ -261,116 +267,127 @@ def get_agent_names_for_orchestrator(agents: List[str]) -> List[str]:
 # 简单任务执行器
 # ============================================================
 
+async def _call_simple_tool(agent_name: str, user_query: str,
+                            username: str, user_perms) -> dict:
+    """简单任务第 1 步：调用单个工具（天气/知识库/联网走 dispatch_tool，旅游三工具走子 Agent）"""
+    if agent_name in ("query_weather", "search_knowledge", "search_project_knowledge", "web_search"):
+        # 统一走 dispatch_tool：天气自动提取城市（不再把整句话当地址），
+        # 知识库/联网检索按原 query 调用（修复知识类问题被误报"未知工具"的 P0）
+        from ..core.stream_utils import dispatch_tool
+        return await dispatch_tool(agent_name, {}, user_query, user_perms, username)
+    if agent_name in ("query_hotel", "query_route", "query_food"):
+        # 简单任务：从关键词中提取城市/目的地参数
+        args = _extract_simple_args(agent_name, user_query)
+        from .sub_agents import call_sub_agent
+        return await call_sub_agent(agent_name, args, user_query)
+    return {"error": f"未知工具: {agent_name}"}
+
+
+async def _format_via_llm(api_key: str, system: str, user_query: str) -> Optional[str]:
+    """简单任务第 2 步：单次 LLM 格式化（带 token 计量）。
+
+    失败返回 None，调用方降级用工具原始结果，不让任务报错。
+    """
+    from ..core.config import DEEPSEEK_MODEL, llm_endpoint
+    from ..core.metrics import llm_tokens_total, llm_tokens_detail, llm_requests_total
+    # 主力模型可能是 qwen（百炼端点），按模型名路由端点与密钥
+    base_url, api_key = llm_endpoint(DEEPSEEK_MODEL, api_key)
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
+            resp = await client.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": DEEPSEEK_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_query}
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 1024
+                }
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+
+            # Token 计量
+            usage = data.get("usage", {})
+            pt = usage.get("prompt_tokens", 0) or 0
+            ct = usage.get("completion_tokens", 0) or 0
+            if pt or ct:
+                llm_tokens_total.labels(type='input').inc(pt)
+                llm_tokens_total.labels(type='output').inc(ct)
+                llm_tokens_detail.labels(model=DEEPSEEK_MODEL, endpoint='simple_task', type='input').inc(pt)
+                llm_tokens_detail.labels(model=DEEPSEEK_MODEL, endpoint='simple_task', type='output').inc(ct)
+            llm_requests_total.labels(model=DEEPSEEK_MODEL, endpoint='simple_task', status='success').inc()
+            return content
+    except Exception as e:
+        logger.warning(f"简单任务 LLM 格式化失败: {e}")
+        return None
+
+
 async def handle_simple_task(
     task_id: str,
     username: str,
-    session_id: str,
+    conversation_id: str,
     user_query: str,
     agent_name: str,
-    user_location: str = "",
     persona_id: str = "",
     file_ids: Optional[List[str]] = None,
     cache_ctx: str = "",
+    lang: str = "zh",
+    # 知识库检索权限：默认仅公开（fail-closed）；None=不过滤只能由 admin 显式传入（P0 修复）
+    user_perms: list | None = [],
 ):
-    """
-    简单任务处理 — 不走四 Agent 圆桌讨论
-
-    流程:
-      1. 调用对应工具（单次调用，不流式）
-      2. 将结果发给 LLM 格式化回答（单次调用，不流式）
-      3. 结果写入 Redis
-
-    适用于: 查询天气、查酒店、查路线、查美食等单一领域问题
-    """
-    from ..core.redis import get_redis
-    from ..core.task_manager import update_status, append_result, read_accumulated_result, cleanup_event
+    """简单任务处理（不走圆桌）：调单工具 → 单次 LLM 格式化 → 分块写 Redis → 存记忆/缓存"""
+    from ..core.task_manager import update_status, append_result, cleanup_event
     from ..core.memory_manager import MemoryManager
-    from ..core.semantic_cache import SemanticCache
-    from ..core.metrics import llm_tokens_total, llm_tokens_detail, llm_requests_total
-    from .tools import fetch_weather_async
-    from .sub_agents import call_sub_agent
 
-    conv_id = session_id or f"conv_{username}_{int(time.time())}"
+    conv_id = conversation_id or f"conv_{username}_{int(time.time())}"
     mm = MemoryManager(username, conv_id)
-    full_text = ""
-    final_answer = ""
 
     try:
         await update_status(task_id, "generating")
 
         # ---- 1. 调用单个工具 ----
-        tool_result = None
-        if agent_name == "query_weather":
-            tool_result = await fetch_weather_async(user_query)
-        elif agent_name in ("query_hotel", "query_route", "query_food"):
-            # 简单任务：从关键词中提取城市/目的地参数
-            args = _extract_simple_args(agent_name, user_query, user_location)
-            tool_result = await call_sub_agent(agent_name, args, user_query)
-        else:
-            tool_result = {"error": f"未知工具: {agent_name}"}
-
+        tool_result = await _call_simple_tool(agent_name, user_query, username, user_perms)
         if tool_result is None:
             tool_result = {"error": "工具返回空"}
 
-        # 工具结果写入进度
-        await append_result(task_id, json.dumps({"tool_result": tool_result}, ensure_ascii=False) + "\n")
+        # 工具结果只进日志。结果缓冲（result_buf）会被前端当回答正文原样展示，
+        # 任何非正文文本写进去都会拼在最终回答里
+        logger.info(f"简单任务工具返回: agent={agent_name}, keys={list(tool_result) if isinstance(tool_result, dict) else type(tool_result).__name__}")
 
         # ---- 2. 轻量 LLM 格式化回答（单次调用）----
         api_key = os.getenv("DEEPSEEK_API_KEY")
         if not api_key:
-            await update_status(task_id, "error", "DEEPSEEK_API_KEY 未设置")
+            # 环境变量名不进任务状态（前端会原样展示）
+            logger.error("DEEPSEEK_API_KEY 未设置")
+            await update_status(task_id, "error", "服务配置不完整，请联系管理员")
             return
 
-        # 构建简单 prompt
-        prompt = _build_simple_prompt(user_query, agent_name, tool_result, user_location, persona_id)
+        prompt = _build_simple_prompt(user_query, agent_name, tool_result, persona_id, lang)
 
-        try:
-            from ..core.config import DEEPSEEK_MODEL
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
-                resp = await client.post(
-                    f"{DEEPSEEK_API_BASE}/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                    json={
-                        "model": DEEPSEEK_MODEL,
-                        "messages": [
-                            {"role": "system", "content": prompt["system"]},
-                            {"role": "user", "content": prompt["user"]}
-                        ],
-                        "temperature": 0.3,
-                        "max_tokens": 1024
-                    }
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                final_answer = data["choices"][0]["message"]["content"]
+        # 上传文件上下文注入（原实现直接忽略 file_ids，用户带文件提问时简单路径看不到文件内容）
+        if file_ids:
+            from types import SimpleNamespace
+            from ..core.stream_utils import build_file_context
+            file_ctx = await build_file_context(SimpleNamespace(file_ids=file_ids), username)
+            if file_ctx:
+                prompt["system"] += f"\n\n{file_ctx}"
 
-                # Token 计量
-                usage = data.get("usage", {})
-                pt = usage.get("prompt_tokens", 0) or 0
-                ct = usage.get("completion_tokens", 0) or 0
-                if pt or ct:
-                    llm_tokens_total.labels(type='input').inc(pt)
-                    llm_tokens_total.labels(type='output').inc(ct)
-                    llm_tokens_detail.labels(model=DEEPSEEK_MODEL, endpoint='simple_task', type='input').inc(pt)
-                    llm_tokens_detail.labels(model=DEEPSEEK_MODEL, endpoint='simple_task', type='output').inc(ct)
-                llm_requests_total.labels(model=DEEPSEEK_MODEL, endpoint='simple_task', status='success').inc()
-        except Exception as e:
-            logger.warning(f"简单任务 LLM 格式化失败: {e}")
-            # 降级：直接返回工具结果
-            final_answer = json.dumps(tool_result, ensure_ascii=False)
+        answer = await _format_via_llm(api_key, prompt["system"], user_query)
+        # LLM 格式化失败 → 降级直接返回工具原始结果
+        final_answer = answer if answer is not None else json.dumps(tool_result, ensure_ascii=False)
 
-        # ---- 3. 写入结果 ----
-        # DFA 检查
+        # ---- 3. 写入结果：DFA 检查 → 分块写 Redis → 状态/记忆/语义缓存 ----
         from ..core.safety_filter import get_filter
         sf = get_filter()
         if sf.contains_sensitive(final_answer):
             final_answer = sf.safe_message
-
-        # 分块写入 Redis
         for i in range(0, len(final_answer), 80):
-            chunk = final_answer[i:i+80]
-            await append_result(task_id, chunk)
-
+            await append_result(task_id, final_answer[i:i+80])
         await update_status(task_id, "completed", final_answer)
 
         # 保存记忆
@@ -378,32 +395,29 @@ async def handle_simple_task(
             {"role": "user", "content": user_query},
             {"role": "assistant", "content": final_answer}
         )
-        asyncio.create_task(SemanticCache.set(user_query, final_answer, cache_ctx=cache_ctx))
+        asyncio.create_task(safe_set(user_query, final_answer, cache_ctx=cache_ctx))
         logger.info(f"简单任务完成: task_id={task_id}, agent={agent_name}")
 
     except Exception as e:
         logger.error(f"简单任务异常: {e}", exc_info=True)
-        await update_status(task_id, "error", str(e))
+        from ..core.safety_filter import sanitize_error_text
+        # 异常 str 可能带完整 URL/Key，剥指纹后再进任务状态（前端原样展示）
+        await update_status(task_id, "error", sanitize_error_text(str(e)))
     finally:
         cleanup_event(task_id)
 
 
-def _extract_simple_args(agent_name: str, query: str, user_location: str = "") -> dict:
+def _extract_simple_args(agent_name: str, query: str) -> dict:
     """
     从查询中提取简单参数（关键词匹配，无需 LLM）
-    用于简单任务的工具调用
+
+    地名语义走 place_extract 公共层（与快速通道同源：目的地=问题中的城市，
+    出发地只作 route 起点）；本函数仅保留 hotel 预算 / food 菜系两类关键词扩展。
     """
-    args = {}
+    from ..core.place_extract import auto_tool_args
+    args = auto_tool_args(agent_name, query)
 
     if agent_name == "query_hotel":
-        # 提取目的地城市
-        city = _extract_city(query)
-        if city:
-            args["destination"] = city
-        elif user_location:
-            args["destination"] = user_location.replace("市", "")
-        else:
-            args["destination"] = query
         # 提取预算关键词
         budget_kw = ["经济", "便宜", "实惠", "预算", "省钱"]
         luxury_kw = ["豪华", "五星", "高档", "贵", "奢侈"]
@@ -412,26 +426,7 @@ def _extract_simple_args(agent_name: str, query: str, user_location: str = "") -
         elif any(kw in query for kw in luxury_kw):
             args["budget"] = "豪华"
 
-    elif agent_name == "query_route":
-        # 简单提取：如果用户说"从A到B"
-        from_match = re.search(r'从(.+?)到(.+?)(?:怎么|的|$|，)', query)
-        if from_match:
-            args["departure"] = from_match.group(1).strip()
-            args["destination"] = from_match.group(2).strip()
-        else:
-            # 默认当前位置到某地
-            args["departure"] = user_location or "当前位置"
-            dest = _extract_city(query)
-            args["destination"] = dest or query
-
     elif agent_name == "query_food":
-        city = _extract_city(query)
-        if city:
-            args["destination"] = city
-        elif user_location:
-            args["destination"] = user_location.replace("市", "")
-        else:
-            args["destination"] = query
         # 提取菜系
         cuisine_kw = ["川菜", "粤菜", "湘菜", "火锅", "烧烤", "日料", "西餐", "中餐"]
         for c in cuisine_kw:
@@ -442,35 +437,27 @@ def _extract_simple_args(agent_name: str, query: str, user_location: str = "") -
     return args
 
 
-def _extract_city(text: str) -> Optional[str]:
-    """从文本中提取城市名（简单关键词匹配）"""
-    from ..core.constants import CITIES
-    for c in CITIES:
-        if c in text:
-            return c
-    return None
-
-
 def _build_simple_prompt(query: str, agent_name: str, tool_result: dict,
-                         user_location: str = "", persona_id: str = "") -> dict:
+                         persona_id: str = "", lang: str = "zh") -> dict:
     """
     构建简单任务的 system + user prompt
     不走多 Agent 讨论，直接让 LLM 基于工具结果回答问题
     """
     from ..core.persona_manager import get_persona_manager
     pm = get_persona_manager()
-    persona = pm.current
+    # 按请求解析人格（原实现忽略 persona_id 直接用全局 current，并发下串人格）
+    persona = pm.get_effective(persona_id)
 
-    today_str = __import__('datetime').datetime.now().strftime("%Y年%m月%d日 %A")
+    from ..core.constants import today_cn
+    today_str = today_cn()
     try:
         system = persona.system_prompt.format(today=today_str, name=persona.name) if persona else f"你是AI助手。今天是{today_str}。"
     except (KeyError, ValueError):
         # 人格提示词缺占位符时不崩溃（与 v2 的 _safe_format_prompt 一致）
         system = persona.system_prompt if persona else f"你是AI助手。今天是{today_str}。"
-
-    # 注入定位
-    if user_location:
-        system += f"\n用户当前所在城市：{user_location}。"
+    # 多语言指令：与流式路径 chat_support.lang_instruction 一致（P2：任务路径此前漏掉 lang）
+    from ..services.chat_support import lang_instruction
+    system += lang_instruction(lang)
 
     # 注入工具结果
     system += (

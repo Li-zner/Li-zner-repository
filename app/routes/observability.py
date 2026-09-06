@@ -5,7 +5,7 @@
 /metrics 供 Prometheus 抓取；/test-otel 用于 OTEL 链路自测（不可用时降级返回）。
 """
 from fastapi import APIRouter
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import JSONResponse, Response
 
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
@@ -13,12 +13,11 @@ from ..core.db import get_pool
 from ..core.redis import get_redis
 from ..core.otel import OTEL_AVAILABLE
 
+from ..core.logging import setup_logging
+
+logger = setup_logging()
+
 router = APIRouter()
-
-
-@router.get("/")
-async def root():
-    return FileResponse("static/index.html")
 
 
 @router.get("/favicon.ico")
@@ -35,15 +34,15 @@ async def _check_deps():
         async with pool.acquire(timeout=2) as conn:
             await conn.execute("SELECT 1")
         db_ok = True
-    except Exception:
-        pass  # DB 探测失败即视为不可用（/health /ready 返 503），不向外抛异常
+    except Exception as e:
+        logger.debug(f"DB 探测失败: {e}")  # /health /ready 返 503
     redis_ok = False
     try:
         r = await get_redis()
         await r.ping()
         redis_ok = True
-    except Exception:
-        pass  # Redis 探测失败即视为不可用（/health /ready 返 503），不向外抛异常
+    except Exception as e:
+        logger.debug(f"Redis 探测失败: {e}")  # /health /ready 返 503
     return db_ok, redis_ok
 
 

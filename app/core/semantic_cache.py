@@ -71,17 +71,17 @@ class SemanticCache:
     SIMILARITY_THRESHOLD = CACHE_SIMILARITY_THRESHOLD
 
     @staticmethod
-    def build_cache_ctx(persona_id: str = "", user_location: str = "", user_profile: str = "") -> str:
-        """构建语义缓存上下文维度（人格|位置|画像指纹）
+    def build_cache_ctx(persona_id: str = "", user_profile: str = "") -> str:
+        """构建语义缓存上下文维度（人格|画像指纹）
 
-        背景（Bug #1）：缓存按 query 建键，而回答会注入人格/位置/画像等个性化上下文，
+        背景（Bug #1）：缓存按 query 建键，而回答会注入人格/画像等个性化上下文，
         导致 A 用户的个性化回答被缓存命中给 B 用户。
         修复：回答进入缓存必须带上下文维度；画像用 SHA-256 前 8 位做指纹，
         既隔离不同画像的回答，又不把画像明文写进缓存表。
         相同上下文可互用，不同上下文互不可见。
         """
         profile_fp = hashlib.sha256((user_profile or "").encode("utf-8")).hexdigest()[:8]
-        return f"{persona_id or ''}|{user_location or ''}|{profile_fp}"
+        return f"{persona_id or ''}|{profile_fp}"
 
     @staticmethod
     async def get(query: str, cache_ctx: str = ""):
@@ -110,6 +110,9 @@ class SemanticCache:
                 query_hash, cache_ctx,
             )
             if row:
+                # 命中计数无条件累加（P2 修复：原先 1/10 Python 抽样使热门条目计数停在
+                # 0~1，与 clean_stale_cache 的 hit_count<2 判冷口径漂移，60 天后可能被误清；
+                # 单行索引 UPDATE 的代价相对其省下的 LLM 调用可忽略）
                 await conn.execute(
                     "UPDATE semantic_cache SET hit_count = hit_count + 1 "
                     "WHERE query_hash = $1 AND cache_ctx = $2",
@@ -138,9 +141,10 @@ class SemanticCache:
                 SemanticCache.SIMILARITY_THRESHOLD,
             )
             if row:
+                # 只累加命中计数，不改写 query_hash：改写会让行"易主"给最新相似查询，
+                # 原查询的精确匹配 hash 丢失（下次又降级走 L2），且高并发下互相抢夺
                 await conn.execute(
-                    "UPDATE semantic_cache SET query_hash = $1, hit_count = hit_count + 1 WHERE id = $2",
-                    query_hash,
+                    "UPDATE semantic_cache SET hit_count = hit_count + 1 WHERE id = $1",
                     row["id"],
                 )
                 logger.info(f"语义缓存命中 (相似度 {row['sim']:.2f}): {query[:30]}...")
@@ -255,3 +259,15 @@ class SemanticCache:
 
 # 模块级别名：兼容以 `from .semantic_cache import build_cache_ctx` 形式的外部导入
 build_cache_ctx = SemanticCache.build_cache_ctx
+
+
+async def safe_set(query: str, answer: str, cache_ctx: str = "") -> None:
+    """写语义缓存的兜底封装：失败记日志不抛出。
+
+    供 asyncio.create_task 后台写入使用——裸协程进后台任务后异常无人认领
+    （RuntimeWarning 且静默），三处调用方（runner/router/chat_stream_ctx）统一走这里。
+    """
+    try:
+        await SemanticCache.set(query, answer, cache_ctx=cache_ctx)
+    except Exception as e:
+        logger.warning(f"语义缓存写入失败: {e}")

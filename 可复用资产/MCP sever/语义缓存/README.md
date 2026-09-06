@@ -50,3 +50,11 @@ python test_client.py                      # 完整验证（需 PG）
   ├─ 命中 → 直接返回缓存答案（记录 level，不调 LLM）
   └─ miss  → 调 LLM 生成 → cache_store(query, answer) → 返回
 ```
+
+## 库内关联
+
+- 机制参考实现：[[可复用代码/README|可复用代码]]（LRU+TTL 缓存 = L0 原型；singleflight+幂等 = 重建合并）
+- 链路位置：[[AI应用资产/RAG构建|RAG 构建]]第 8 环「语义缓存」
+- 安全案例：[[AI应用资产/安全审计|AI 应用安全审计]]（缓存上下文维度隔离 = LLM02/08 实战案例）
+- 验收：[[AI应用验收工具/README|AI 应用验收工具·阶段 3]]（L0 命中 / 语义命中 / 无关 miss）
+- 图谱：[[图谱/MOC-生产机制与稳定性|MOC-生产机制与稳定性]]、[[图谱/MOC-RAG与知识工程|MOC-RAG 与知识工程]]

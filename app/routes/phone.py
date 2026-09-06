@@ -5,6 +5,7 @@
 """
 import json
 
+import asyncpg
 from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -165,12 +166,16 @@ async def phone_register(payload: PhoneRegisterRequest):
                 "INSERT INTO tenants (name) VALUES ($1) RETURNING id",
                 f"租户_{username}",
             )
-            await conn.execute(
-                "INSERT INTO users (username, hashed_password, phone, display_name, email, extra, role, tenant_id) "
-                "VALUES ($1, $2, $3, $4, $5, $6, 'user', $7)",
-                username, hashed, phone, display_name or "", email or "",
-                json.dumps(extra), tenant["id"],
-            )
+            # P3 修复：并发同号注册捕获唯一约束转 400（原先 500）
+            try:
+                await conn.execute(
+                    "INSERT INTO users (username, hashed_password, phone, display_name, email, extra, role, tenant_id) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, 'user', $7)",
+                    username, hashed, phone, display_name or "", email or "",
+                    json.dumps(extra), tenant["id"],
+                )
+            except asyncpg.exceptions.UniqueViolationError:
+                raise HTTPException(400, "该手机号已注册")
     # 验证码已由 _verify_phone_code 校验并删除
     pair = create_token_pair(username)
     # 审计：注册成功（含租户）
@@ -195,23 +200,32 @@ async def phone_login(payload: PhoneLoginRequest):
     async with pool.acquire() as conn:
         user = await conn.fetchrow("SELECT username, hashed_password FROM users WHERE phone=$1", phone)
         if not user:
-            async with conn.transaction():
-                # 自动注册：账号即手机号，默认密码 123456789
-                # Bug #5 修复：与 phone_register 一致，同步创建个人租户，
-                # 避免验证码登录自动注册的用户落到默认租户（租户归属不一致）
-                username = f"phone_{phone}"
-                hashed = hash_password("123456789")
-                tenant = await conn.fetchrow(
-                    "INSERT INTO tenants (name) VALUES ($1) RETURNING id",
-                    f"租户_{username}",
-                )
-                await conn.execute(
-                    "INSERT INTO users (username, hashed_password, phone, tenant_id) "
-                    "VALUES ($1, $2, $3, $4)",
-                    username, hashed, phone, tenant["id"]
-                )
-            is_new = True
-            logger.info(f"手机号自动注册: phone={phone}, username={username}")
+            username = f"phone_{phone}"
+            hashed = hash_password("123456789")
+            # 自动注册：账号即手机号，默认密码 123456789（Bug #5：与 phone_register 一致同步建租户）
+            # P3 修复（二次遍历）：并发同号注册的败者复用胜者账号签发 token。
+            # try/except 必须包在事务外——唯一冲突会使事务中止，事务内再 SELECT 只会抛
+            # "current transaction is aborted"；异常向外传播时事务整体回滚，不留孤儿租户。
+            try:
+                async with conn.transaction():
+                    tenant = await conn.fetchrow(
+                        "INSERT INTO tenants (name) VALUES ($1) RETURNING id",
+                        f"租户_{username}",
+                    )
+                    await conn.execute(
+                        "INSERT INTO users (username, hashed_password, phone, tenant_id) "
+                        "VALUES ($1, $2, $3, $4)",
+                        username, hashed, phone, tenant["id"]
+                    )
+            except asyncpg.exceptions.UniqueViolationError:
+                winner = await conn.fetchrow("SELECT username FROM users WHERE phone=$1", phone)
+                if not winner:
+                    raise HTTPException(409, "注册冲突，请重试")
+                username = winner["username"]
+                logger.info(f"并发自动注册败者复用账号: phone={phone}, username={username}")
+            else:
+                is_new = True
+                logger.info(f"手机号自动注册: phone={phone}, username={username}")
         else:
             username = user["username"]
     token = create_token_pair(username)
@@ -220,12 +234,18 @@ async def phone_login(payload: PhoneLoginRequest):
 
 @router.post("/api/user/bind-phone")
 async def bind_phone(payload: BindPhoneRequest, current_user: dict = Depends(get_current_user)):
-    """绑定手机号到当前账号：验验证码 → 写入 phone 并解除 GitHub 试用额度限制（A24）"""
+    """绑定手机号到当前账号：验验证码 → 写入 phone 并解除 GitHub 试用额度限制（A24）
+
+    用户名策略（用户定稿）：绝大多数情况下以手机号做用户名——绑定成功且目标用户名
+    phone_{手机号} 未被占时，username 同步改绑并级联所有 user_id 引用表（无外键，
+    同事务手动维护）；目标用户名被占（GitHub 登录名恰为该格式的占位等）则仅绑定不改名。
+    """
     phone = payload.phone
     code = payload.code
     # 校验验证码（含错误次数防爆破，P0 #6）
     await _verify_phone_code(phone, code)
     username = current_user["username"]
+    new_username = f"phone_{phone}"
     pool = await get_pool()
     async with pool.acquire() as conn:
         # 该手机号不能已被其他账号绑定
@@ -234,19 +254,56 @@ async def bind_phone(payload: BindPhoneRequest, current_user: dict = Depends(get
         )
         if occupied:
             raise HTTPException(400, "该手机号已被其他账号绑定")
-        # 绑定 + 解除试用限制（幂等：同手机号重复绑定成功；已绑其他手机则 0 行）
-        result = await conn.execute(
-            "UPDATE users SET phone = $1, quota_limited = FALSE, used_requests = 0, "
-            "updated_at = CURRENT_TIMESTAMP WHERE username = $2 AND (phone IS NULL OR phone = $1)",
-            phone, username,
+        renamed = False
+        taken = await conn.fetchval(
+            "SELECT 1 FROM users WHERE username = $1 AND username <> $2",
+            new_username, username,
         )
+        # 绑定 + 解除限制 + 改名级联同一事务：任一步失败整体回滚，防账号与数据引用撕裂
+        async with conn.transaction():
+            if taken:
+                result = await conn.execute(
+                    "UPDATE users SET phone = $1, quota_limited = FALSE, used_requests = 0, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE username = $2 AND (phone IS NULL OR phone = $1)",
+                    phone, username,
+                )
+            else:
+                renamed = username != new_username
+                result = await conn.execute(
+                    "UPDATE users SET username = $1, phone = $2, quota_limited = FALSE, used_requests = 0, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE username = $3 AND (phone IS NULL OR phone = $2)",
+                    new_username, phone, username,
+                )
+                if "UPDATE 1" in result and renamed:
+                    for table in ("conversation_memories", "invoices", "payment_orders",
+                                  "transaction_logs", "user_profiles", "user_wallets",
+                                  "message_ratings", "audit_logs"):
+                        await conn.execute(
+                            f"UPDATE {table} SET user_id = $1 WHERE user_id = $2",
+                            new_username, username,
+                        )
         if "UPDATE 0" in result:
             raise HTTPException(400, "该账号已绑定其他手机号")
+    # 改名后旧 JWT 的 sub 指向旧用户名，签发新 token 对；缓存键随用户名变化，新旧都失效
+    final_username = new_username if renamed else username
+    pair = create_token_pair(final_username)
+    from ..core.quota import invalidate_user_cache
+    await invalidate_user_cache(username)
+    if renamed:
+        await invalidate_user_cache(new_username)
     # 验证码已由 _verify_phone_code 校验并删除
     from ..core.audit import audit
-    await audit(username, "phone_bind", {"phone": phone})
-    logger.info(f"手机号绑定成功: username={username}, phone={phone}")
-    return {"message": "手机号绑定成功，已解除限制", "quota_limited": False}
+    await audit(final_username, "phone_bind", {"phone": phone})
+    logger.info(f"手机号绑定成功: username={username} -> {final_username}, phone={phone}, renamed={renamed}")
+    return {
+        "message": "手机号绑定成功，已解除限制" + ("，登录名已更新为手机号" if renamed else ""),
+        "quota_limited": False,
+        "username": final_username,
+        "renamed": renamed,
+        "access_token": pair["access_token"],
+        "refresh_token": pair["refresh_token"],
+        "token_type": "bearer",
+    }
 
 
 @router.get("/api/sms/check-config")

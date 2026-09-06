@@ -118,3 +118,8 @@ cdc_lag_seconds = Gauge(
     'cdc_lag_seconds',
     'CDC 处理延迟（当前时间 - 最新事件时间，秒）'
 )
+# DFA 过滤器超时放行次数（P2 修复：超时 fail-open 原先不可观测）
+safety_filter_timeout_total = Counter(
+    'safety_filter_timeout_total',
+    'DFA safety filter scans aborted by timeout (content passed unfiltered)'
+)

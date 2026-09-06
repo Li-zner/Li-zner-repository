@@ -19,9 +19,9 @@ from ..agents.tools import (
     search_project_knowledge, web_search,
 )
 from ..core.config import (
-    DEEPSEEK_API_BASE, DEEPSEEK_API_TIMEOUT, LLM_CONNECT_TIMEOUT, LLM_TEMPERATURE,
+    DEEPSEEK_API_TIMEOUT, LLM_CONNECT_TIMEOUT, LLM_TEMPERATURE, llm_endpoint,
 )
-from ..core.constants import CITIES
+from ..core.place_extract import auto_tool_args, extract_destination
 from ..core.concurrency import llm_semaphore
 from ..core.jfast import loads as jloads
 from ..core.redis import get_redis
@@ -66,13 +66,16 @@ async def stream_llm(api_key: str, model: str, messages: list, *,
     if username:
         payload["user"] = username
 
+    # 主力/降级分属两家供应商（qwen→百炼，deepseek→官方），按模型名路由端点与密钥
+    base_url, api_key = llm_endpoint(model, api_key)
+
     async with llm_semaphore:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(DEEPSEEK_API_TIMEOUT, connect=LLM_CONNECT_TIMEOUT)
         ) as client:
             async with client.stream(
                 "POST",
-                f"{DEEPSEEK_API_BASE}/chat/completions",
+                f"{base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json=payload,
             ) as resp:
@@ -92,7 +95,7 @@ async def stream_llm(api_key: str, model: str, messages: list, *,
                     except IndexError:
                         # 兼容 usage-only chunk（choices 为空数组）：仅取 usage，无 delta
                         delta = {}
-                    if "usage" in data:
+                    if data.get("usage"):  # 百炼流式中间块会带 usage:null，仅真对象时计量
                         u = data["usage"]
                         yield {"type": "usage",
                                "prompt_tokens": u.get("prompt_tokens") or 0,
@@ -133,64 +136,38 @@ def sanitize_uploaded_content(content: str) -> str:
     return content
 
 
-# 城市别名映射（P1 #78：支持"帝都/魔都"等口语称呼）
-_CITY_ALIASES = {
-    "帝都": "北京", "魔都": "上海", "羊城": "广州", "鹏城": "深圳",
-    "蓉城": "成都", "山城": "重庆", "春城": "昆明", "冰城": "哈尔滨",
-    "泉城": "济南", "榕城": "福州", "星城": "长沙", "江城": "武汉",
-}
-
-
-def _extract_city(user_query: str, user_location: str) -> str:
-    """从用户问题/定位中提取城市名（优先级：别名 > 问题内城市 > 用户定位 > 原问题）"""
-    for alias, city in _CITY_ALIASES.items():
-        if alias in user_query:
-            return city
-    for c in CITIES:
-        if c in user_query:
-            return c
-    if user_location:
-        return user_location.replace("市", "")
-    return user_query
-
-
-def _auto_args(name: str, user_query: str, user_location: str) -> dict:
-    """简单/推荐通道：按用户上下文补全工具参数"""
-    if name == "query_weather":
-        return {"city": _extract_city(user_query, user_location)}
-    if name == "query_hotel" or name == "query_food":
-        return {"destination": user_location.replace("市", "") if user_location else user_query}
-    if name == "query_route":
-        return {"departure": user_location or "当前位置", "destination": user_query}
-    return {}
-
-
-async def dispatch_tool(name: str, args: dict, user_query: str = "", user_location: str = "",
-                        permissions: list | None = None):
+async def dispatch_tool(name: str, args: dict, user_query: str = "",
+                        permissions: list | None = None, username: str = ""):
     """统一工具分发：返回工具执行结果（dict）
 
-    args 为空时自动补全（简单/推荐通道）；LLM tool_calls 路径直接使用传入 args。
+    args 为空时自动补全（简单/推荐通道，走 place_extract 公共语义）；
+    LLM tool_calls 路径直接使用传入 args。
     permissions 透传给知识库检索（None=不过滤；[]=仅公开；['vip']=公开+vip）。
+    username 透传给 web_search 做按用户限流（P1）。
     """
     if not args:
-        args = _auto_args(name, user_query, user_location)
+        args = auto_tool_args(name, user_query)
     if name == "query_weather":
-        return await fetch_weather_async(args.get("city") or _extract_city(user_query, user_location))
+        return await fetch_weather_async(
+            args.get("city") or extract_destination(user_query) or user_query)
     if name in ("query_hotel", "query_route", "query_food"):
         return await call_sub_agent(name, args, user_query)
     if name == "search_knowledge":
         return await search_knowledge(args.get("query") or user_query, permissions=permissions)
     if name == "web_search":
-        return await web_search(args.get("query", ""))
+        # query 缺省时回退用户原话：LLM 漏传参不该搜出空查询
+        return await web_search(args.get("query") or user_query, user_key=username)
     if name == "search_project_knowledge":
         return await search_project_knowledge(args.get("query") or user_query)
     return {"error": f"未知工具: {name}"}
 
 
-async def build_file_context(req) -> str | None:
+async def build_file_context(req, username: str = "") -> str | None:
     """上传文件注入：读 Redis → 组装文件片段 + 智能引用要求。
 
     无文件或文件读取失败返回 None（调用方跳过注入）。
+    username：属主校验（P2 修复 IDOR 形状）——meta.uploaded_by 不匹配即跳过该文件；
+    与 get_user_file 的"仅上传者可读"同一语义。
     """
     file_ids = getattr(req, "file_ids", None)
     if not file_ids:
@@ -203,6 +180,9 @@ async def build_file_context(req) -> str | None:
         if not content or not meta_raw:
             continue
         meta = json.loads(meta_raw)
+        # P2 修复（IDOR）：文件内容只注入给上传者本人（username 传入时）
+        if username and meta.get("uploaded_by") != username:
+            continue
         safe = sanitize_uploaded_content(content.decode() if isinstance(content, bytes) else content)
         fname = meta.get("filename", "未知文件")
         ftype = meta.get("parse_note", "文档")

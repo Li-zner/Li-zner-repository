@@ -100,7 +100,7 @@ async def _extract_upload_text(save_path: str, safe_filename: str, ext: str, loo
         # 解析失败：删除落盘文件；可能已被并发清理，忽略 FileNotFoundError（P0 #2）
         try:
             await loop.run_in_executor(None, lambda: os.remove(save_path))
-        except FileNotFoundError:
+        except FileNotFoundError:  # noqa: silent-except 豁免：并发清理竞态为预期路径
             pass
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -139,7 +139,7 @@ async def handle_upload(file, username: str) -> dict:
     # 「写入磁盘后、解析前进程崩溃」这一窄窗口，由目录清理任务兜底（低风险）。
     try:
         await loop.run_in_executor(None, lambda: os.remove(save_path))
-    except FileNotFoundError:
+    except FileNotFoundError:  # noqa: silent-except 豁免：并发清理竞态为预期路径
         pass
 
     # 限制存入 Redis 的文本大小（防恶意上传撑爆 Redis 内存，P0 #4）

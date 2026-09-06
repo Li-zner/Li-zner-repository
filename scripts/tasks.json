@@ -1,0 +1,18 @@
+[
+  {
+    "name": "每日代码检查",
+    "enabled": true,
+    "schedule": {"type": "daily", "time": "08:00"},
+    "folder": "scripts",
+    "command": ["python", "check_code_rules.py"],
+    "permissions": {"read": ["app", "scripts"], "write": ["logs"]}
+  },
+  {
+    "name": "每周六评测门禁",
+    "enabled": true,
+    "schedule": {"type": "weekly", "weekday": 5, "time": "10:00"},
+    "folder": "tests",
+    "command": ["python", "run_evaluation.py", "--max-cases", "5", "--threshold", "8.0"],
+    "permissions": {"read": ["tests", "docs"], "write": ["logs", "tests"]}
+  }
+]

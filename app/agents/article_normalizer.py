@@ -98,6 +98,13 @@ def _chinese_to_arabic(text: str) -> int:
 # 正则：匹配"第X条"、"第X条之一"等格式
 _ARTICLE_PATTERN = re.compile(r'第([一二三四五六七八九十百千0-9]+)条(?:之一|之二|之三|之四)?')
 
+# 其它法律名称：紧跟"第X条"时说明引用的不是民法典条文，不做归一化
+_OTHER_LAW_NAMES = (
+    "消费者权益保护法", "食品安全法", "劳动法", "劳动合同法", "刑法",
+    "行政处罚法", "治安管理处罚法", "公司法", "商标法", "专利法", "著作权法",
+    "环境保护法", "税收征收管理法", "道路交通安全法", "保险法", "个人所得税法",
+)
+
 
 def normalize_article_ref(query: str) -> str:
     """
@@ -107,11 +114,10 @@ def normalize_article_ref(query: str) -> str:
     "第1077条" → "民法典第一千零七十七条"
     "第1079条" → "民法典第一千零七十九条"
     "第366条"  → "民法典第三百六十六条"
-    "第25条"   → "消费者权益保护法第二十五条"
-    
+
     Args:
         query: 用户查询文本
-    
+
     Returns:
         归一化后的文本（未匹配则返回原文）
     """
@@ -129,19 +135,20 @@ def normalize_article_ref(query: str) -> str:
         start = match.start()
         has_prefix = start >= 3 and query[start-3:start] == "民法典"
         has_law_prefix = start >= 2 and query[start-2:start] == "民法"
+        # 前面紧挨着其它法律名 → 引用的是那部法律的条文，不改写（否则会拼出"消保法民法典第X条"）
+        if any(start >= len(p) and query[start - len(p):start] == p for p in _OTHER_LAW_NAMES):
+            return match.group(0)
         
-        # 民法典法条范围（1-1260条）
+        # 民法典法条范围（1-1260条）；本应用是民法典助手，范围内的编号一律归入民法典。
+        # 超出范围（其它法律的条文编号，如消保法共63条也在范围内被民法典优先覆盖）不归一化。
+        # 注意：消保法条文号与民法典完全重叠，无上下文无法区分，按民法典处理是有意为之
         if 1 <= num <= 1260:
             cn_num = _arabic_to_chinese(num)
             result = f"第{cn_num}条"
             if not has_prefix and not has_law_prefix:
                 result = "民法典" + result
             return result
-        # 消费者权益保护法（1-63条）
-        elif num <= 63:
-            return f"消费者权益保护法第{num}条"
-        else:
-            return match.group(0)
+        return match.group(0)
     
     return _ARTICLE_PATTERN.sub(_replace, query)
 

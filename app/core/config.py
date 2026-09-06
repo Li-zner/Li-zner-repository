@@ -10,10 +10,17 @@ import os
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# 权威 .env 位于仓库上一级（D:\桌面\.env，2026-09-06 起用户指定桌面直放）。
+# 容器内该路径不存在也无妨：环境变量由 compose env_file 注入 os.environ，
+# 此处仅为本地直跑 python/脚本时的兜底读取。
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_DESKTOP_ENV = os.path.join(_REPO_ROOT, "..", ".env")
+
+
 class _Settings(BaseSettings):
     """全量配置（字段名小写，自动匹配 UPPER_SNAKE 环境变量，大小写不敏感）"""
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_DESKTOP_ENV,
         extra="ignore",
         case_sensitive=False,
     )
@@ -34,12 +41,16 @@ class _Settings(BaseSettings):
     refresh_token_expire_days: int = 30
     refresh_max_days: int = 30
 
-    # ---------- DeepSeek ----------
+    # ---------- DeepSeek（降级模型；deepseek_model 为主力模型槽位，2026-09 起可配 qwen 系）----------
     deepseek_api_base: str = "https://api.deepseek.com"
     deepseek_api_timeout: float = 30.0
     deepseek_model: str = "deepseek-v4-flash"
     deepseek_flash_model: str = "deepseek-v4-flash"
     deepseek_fallback_message: str = "服务器繁忙，请稍后再提问吧！"
+
+    # ---------- Qwen（阿里云百炼 OpenAI 兼容端点；主力模型为 qwen 系时使用）----------
+    qwen_api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    qwen_api_key: str = ""
     rerank_sim_threshold: float = 0.6
     llm_temperature: float = 0.3
 
@@ -159,6 +170,22 @@ DEEPSEEK_FLASH_MODEL = _settings.deepseek_flash_model
 DEEPSEEK_FALLBACK_MESSAGE = _settings.deepseek_fallback_message
 RERANK_SIM_THRESHOLD = _settings.rerank_sim_threshold
 LLM_TEMPERATURE = _settings.llm_temperature
+
+QWEN_API_BASE = _settings.qwen_api_base
+QWEN_API_KEY = _settings.qwen_api_key
+
+
+def llm_endpoint(model: str, deepseek_key: str = ""):
+    """按模型名路由 OpenAI 兼容端点，返回 (base_url, api_key)
+
+    qwen 系模型走阿里云百炼兼容端点 + QWEN_API_KEY；
+    其余（deepseek 系降级模型）走 DeepSeek 官方端点 + 传入的池化 key。
+    所有 /chat/completions 直连点都必须经此函数取 base 和 key，
+    否则主力/降级分属两家供应商时会拿错端点或密钥。
+    """
+    if model.startswith("qwen"):
+        return QWEN_API_BASE, QWEN_API_KEY
+    return DEEPSEEK_API_BASE, deepseek_key
 
 SUMMARY_THRESHOLD = _settings.summary_threshold
 HISTORY_LIMIT = _settings.history_limit

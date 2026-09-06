@@ -26,6 +26,11 @@ logger = setup_logging()
 ALIYUN_SMS_ENDPOINT = "https://dypnsapi.aliyuncs.com"
 
 
+def _mask_phone(phone: str) -> str:
+    """日志脱敏手机号（合规：日志不得打印明文手机号）"""
+    return f"{phone[:3]}****{phone[-4:]}" if phone and len(phone) >= 7 else "****"
+
+
 def _percent_encode(s: str) -> str:
     """阿里云签名专用 URL 编码"""
     return urllib.parse.quote(s, safe='').replace('+', '%20').replace('*', '%2A').replace('%7E', '~')
@@ -62,7 +67,7 @@ async def send_sms(phone: str, code: str, ttl_minutes: int = 5) -> bool:
     """
     if not ALIBABA_CLOUD_ACCESS_KEY_ID or not ALIBABA_CLOUD_ACCESS_KEY_SECRET:
         # ----- 无阿里云配置 → 演示模式仅打印日志 -----
-        logger.info(f"[演示模式] 验证码 {code} 已发送至 {phone}")
+        logger.info(f"[演示模式] 验证码 {code[:2]}**** 已生成（{_mask_phone(phone)}）")
         logger.info(f"需配置 ALIBABA_CLOUD_ACCESS_KEY_ID/SECRET 以启用真实短信")
         try:
             import subprocess
@@ -71,8 +76,8 @@ async def send_sms(phone: str, code: str, ttl_minutes: int = 5) -> bool:
                  f'Write-Host "验证码: {code} (发送至 {phone})" -ForegroundColor Green'],
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("演示模式弹窗显示失败（无桌面环境，忽略）")
         return True
 
     try:
@@ -107,10 +112,10 @@ async def send_sms(phone: str, code: str, ttl_minutes: int = 5) -> bool:
             result = resp.json()
 
             if result.get("Code") == "OK":
-                logger.info(f"短信发送成功: phone={phone}, bizId={result.get('BizId', '')}")
+                logger.info(f"短信发送成功: phone={_mask_phone(phone)}, bizId={result.get('BizId', '')}")
                 return True
             else:
-                logger.error(f"短信发送失败: phone={phone}, Code={result.get('Code')}, Message={result.get('Message')}")
+                logger.error(f"短信发送失败: phone={_mask_phone(phone)}, Code={result.get('Code')}, Message={result.get('Message')}")
                 logger.error(f"   建议检查: 1) AccessKey 权限 2) SMS_TEMPLATE_CODE 3) 短信签名审核状态")
                 return False
 

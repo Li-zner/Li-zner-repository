@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- maskable 版：图形收进中央 80% 安全区，背景铺满 -->
+  <rect width="512" height="512" fill="#3d7a5c"/>
+  <g transform="translate(51 51) scale(0.8)">
+    <path d="M96 264 400 128l-56 264-104-72-56 88-8-120z" fill="#ffffff"/>
+    <path d="M400 128 240 320l-8-96z" fill="#dfeee4"/>
+  </g>
+</svg>

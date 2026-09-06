@@ -6,6 +6,8 @@
 4. compress_old_conversations DELETE+INSERT 同事务（P0 #44）
 """
 import asyncio
+import os
+import shutil
 from datetime import datetime, timedelta
 
 from fake_redis import FakeRedis
@@ -80,6 +82,100 @@ def test_renew_lock_result_honored():
         assert await w._renew_lock(fake, "token_b") is False   # 他人 token → 拒绝
 
     asyncio.run(_run())
+
+
+def test_journal_rotation_no_file_per_write():
+    """回归：CdcJournal 单文件超限后应按序滚动，而非每条写入都新建一个滚动文件。
+
+    buggy：滚动分支把 _current_basename 改成 f"{basename}.{seq}"，
+    导致下一笔把“当日名 != 滚动名”误判成跨天，反复重开已超限的当日文件，
+    每写一条产生一个新文件（文件无限增殖）。本测试用很小 max_size 复现并断言文件数可控。
+    """
+    from app.cdc.journal import CdcJournal
+
+    # 落在仓库 .tmp（本沙箱只允许写工作区；CI 亦同）。用 os.makedirs 而非 tempfile.mkdtemp，
+    # 因部分受限环境对 mkdtemp 生成的目录防写，直接 makedirs 目录可正常写入。
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    tmp = os.path.join(repo_root, ".tmp", "cdc_journal_rotation_test")
+    os.makedirs(tmp, exist_ok=True)
+    total = 60
+    try:
+        j = CdcJournal(tmp)
+        j._max_size = 200  # 缩小阈值触发滚动
+        for i in range(total):
+            j._write_line(f"line{i}\n")
+        j.close()  # flush 最后的缓冲行（<FSYNC_EVERY 条时不自动落盘），避免少计一行
+
+        # 滚动文件名带序号后缀（xxx.jsonl.1），不能用 endswith(".jsonl") 过滤
+        files = sorted(n for n in os.listdir(tmp) if not n.startswith("checkpoint"))
+        # 关键断言：滚动文件数远小于写入条数（buggy 时接近 total，fixed 时恒为个位数）
+        assert len(files) < 10, f"滚动异常：每条写入新建文件，共 {len(files)} 个"
+        # 无丢失/无重复：所有文件行数总和 == 写入条数
+        got = sum(open(os.path.join(tmp, n), encoding="utf-8").read().count("\n")
+                  for n in files)
+        assert got == total, f"写入行数不一致：expect {total}, got {got}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_checkpoint_never_rewinds():
+    """回归：checkpoint 只允许推进，非 leader 实例停机时不得用过期 last_id 回退。
+
+    buggy：save_checkpoint 无条件覆写，多实例下非 leader 用启动时旧值停机，
+    会把已推进的 checkpoint 回退，重启后重放已处理事件（重复）。本测试复现并断言不回退。
+    """
+    import asyncio
+    from app.cdc.journal import CdcJournal
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    tmp = os.path.join(repo_root, ".tmp", "cdc_checkpoint_test")
+    os.makedirs(tmp, exist_ok=True)
+    try:
+        j = CdcJournal(tmp)
+
+        async def _advance():
+            await j.save_checkpoint(100)
+        asyncio.run(_advance())
+
+        # 过期值(50 < 100)不应覆写，保持 100
+        async def _stale():
+            await j.save_checkpoint(50)
+        asyncio.run(_stale())
+        assert j.load_checkpoint() == 100, "checkpoint 不应回退到 50"
+
+        # 正常推进仍生效
+        async def _advance2():
+            await j.save_checkpoint(120)
+        asyncio.run(_advance2())
+        assert j.load_checkpoint() == 120
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_parse_jsonb_normalizes():
+    """回归：asyncpg 把 jsonb 列返回为 str，须解析为对象，防双重编码。"""
+    from app.cdc.journal import parse_jsonb
+    assert parse_jsonb('{"a": 1}') == {"a": 1}
+    assert parse_jsonb('[1, 2]') == [1, 2]
+    assert parse_jsonb('"hello"') == "hello"
+    assert parse_jsonb({"a": 2}) == {"a": 2}   # 已是对象
+    assert parse_jsonb(None) is None
+    assert parse_jsonb(5) == 5
+    assert parse_jsonb('not json') == 'not json'  # 解析失败回退原值
+
+
+def test_format_ts_utc_normalization():
+    """回归：时间统一为带 Z 的 UTC ISO 串（#8/#11），naive 视为 UTC，None 原样。"""
+    from datetime import datetime, timezone, timedelta
+    from app.cdc.journal import format_ts
+    assert format_ts(None) is None
+    # naive 视为 UTC
+    assert format_ts(datetime(2024, 1, 1, 12, 30, 0)) == "2024-01-01T12:30:00Z"
+    # aware UTC
+    assert format_ts(datetime(2024, 1, 1, 12, 30, 0, tzinfo=timezone.utc)) == "2024-01-01T12:30:00Z"
+    # 非 UTC 会话时区 → 归一化到 UTC
+    aware_8 = datetime(2024, 1, 1, 12, 30, 0, tzinfo=timezone(timedelta(hours=8)))
+    assert format_ts(aware_8) == "2024-01-01T04:30:00Z"
 
 
 def test_compress_uses_transaction():

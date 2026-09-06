@@ -8,9 +8,26 @@ GitHub 试用额度 — 累计提问次数限制（绑定手机号后解除）
 """
 from ..core.config import GITHUB_QUESTION_LIMIT
 from ..core.db import get_pool
+from ..core.redis import get_redis
 from ..core.logging import setup_logging
 
 logger = setup_logging()
+
+# auth.get_cached_user 用户信息缓存键前缀（单源定义于此，middleware/routes 统一引用）
+USER_INFO_CACHE_PREFIX = "user:info:"
+
+
+async def invalidate_user_cache(username: str) -> None:
+    """失效 auth.get_cached_user 的用户信息缓存（TTL 5 分钟）
+
+    used_requests / quota_limited 变更后必须调用：否则额度判断在缓存窗口内
+    读到旧计数，GitHub 试用 20 次的上限在窗口内形同虚设（P1 修复）。
+    """
+    try:
+        r = await get_redis()
+        await r.delete(f"{USER_INFO_CACHE_PREFIX}{username}")
+    except Exception as e:
+        logger.debug(f"用户缓存失效失败（TTL 自愈）: {e}")
 
 
 def is_quota_exhausted(user: dict) -> bool:
@@ -36,11 +53,15 @@ async def inc_used_questions(username: str) -> None:
         pool = await get_pool()
         async with pool.acquire() as conn:
             # 原子：仅当未达上限时才自增，DB 层保证并发下不会超限（P0 #62）
-            await conn.execute(
+            result = await conn.execute(
                 "UPDATE users SET used_requests = used_requests + 1, updated_at = CURRENT_TIMESTAMP "
                 "WHERE username = $1 AND quota_limited = TRUE AND role != 'admin' "
                 "AND used_requests < $2",
                 username, GITHUB_QUESTION_LIMIT,
             )
+            # 实际自增才失效缓存：额度判断读的是 auth.get_cached_user 的 5 分钟缓存，
+            # 不失效的话窗口内所有请求都拿到旧计数，试用上限可被无限突破（P1 修复）
+            if result and result != "UPDATE 0":
+                await invalidate_user_cache(username)
     except Exception as e:
         logger.warning(f"GitHub 试用额度累计失败（不影响对话）: {e}")

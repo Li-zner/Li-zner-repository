@@ -22,8 +22,9 @@ from ..core.logging import setup_logging
 from ..core.metrics import gateway_requests_total
 from ..core.memory_manager import MemoryManager
 from ..core.persona_manager import get_persona_manager
+from ..core.constants import today_cn
 from ..core.quota import is_quota_exhausted
-from ..core.semantic_cache import SemanticCache
+from ..core.semantic_cache import SemanticCache, safe_set
 from ..core.stream_utils import build_file_context
 from ..core.redis import get_redis
 from ..middleware.rate_limit import check_qps, check_concurrent, get_daily_usage, release_concurrent
@@ -113,12 +114,9 @@ async def ensure_chat_allowed(current_user: dict) -> str:
 def _build_system_prompt(req: ChatRequest, today_str: str):
     """解析人格与模型链，返回 (persona, persona_id, selected_model, model_try_list, system_content)"""
     pm = get_persona_manager()
-    persona = pm.current
-    persona_id = req.persona_id or pm.current_id
-    if req.persona_id and req.persona_id != pm.current_id:
-        pm.switch(req.persona_id)
-        persona = pm.current
-        persona_id = req.persona_id
+    # 按请求解析人格，不改全局 current（并发用户互不覆盖，P1）
+    persona = pm.get_effective(req.persona_id)
+    persona_id = persona.id if persona else (req.persona_id or pm.current_id)
     if persona:
         system_content = safe_format_prompt(persona.system_prompt, today=today_str, name=persona.name)
         selected_model = persona.model or DEEPSEEK_MODEL
@@ -131,10 +129,11 @@ def _build_system_prompt(req: ChatRequest, today_str: str):
     return persona, persona_id, selected_model, model_try_list, system_content
 
 
-async def _assemble_messages(req: ChatRequest, mm: MemoryManager, system_content: str) -> list:
+async def _assemble_messages(req: ChatRequest, mm: MemoryManager, system_content: str,
+                             username: str = "") -> list:
     """组装 system/user 消息：人格 + 共享上下文 + 文件上下文 + 历史压缩 + 最新消息提示"""
     messages = [{"role": "system", "content": system_content}]
-    file_context_str = await build_file_context(req)
+    file_context_str = await build_file_context(req, username)
     if file_context_str:
         messages.append({"role": "system", "content": file_context_str})
     history_dicts = await mm.get_context(limit=SUMMARY_THRESHOLD)
@@ -148,14 +147,8 @@ async def _assemble_messages(req: ChatRequest, mm: MemoryManager, system_content
     return messages
 
 
-def _rewrite_user_query(req: ChatRequest, user_query: str, persona_id: str) -> str:
-    """用户在提问中附城市语境 + 民法典非民事领域提示"""
-    if req.user_location:
-        loc_name = req.user_location.replace("市", "")
-        if loc_name not in user_query:
-            intent_keywords = ["天气", "酒店", "路线", "美食", "餐厅", "怎么去", "旅游"]
-            if any(kw in user_query for kw in intent_keywords):
-                user_query = f"{user_query}（我在{req.user_location}）"
+def _rewrite_user_query(user_query: str, persona_id: str) -> str:
+    """民法典非民事领域提示（原附城市语境逻辑随"出发地"功能移除）"""
     if persona_id == "civil_code":
         hints = {
             "七天无理由退货": "【提示：此问题受《消费者权益保护法》调整，不属于民法典。请引用《消费者权益保护法》回答，不要引用民法典。】",
@@ -178,7 +171,7 @@ async def build_stream_ctx(req: ChatRequest, current_user: dict, today: str) -> 
     user_perms = None if user_role == "admin" else (current_user.get("permissions") or [])
 
     lang_instr = lang_instruction(req)
-    today_str = datetime.now().strftime("%Y年%m月%d日 %A")
+    today_str = today_cn()
     conv_id = req.conversation_id or f"conv_{username}_{int(time.time())}"
     mm = MemoryManager(username, conv_id)
     try:
@@ -187,7 +180,7 @@ async def build_stream_ctx(req: ChatRequest, current_user: dict, today: str) -> 
         logger.warning(f"画像加载失败（按无画像处理）: {_pf_err}")
         user_profile = ""
     _cache_ctx = SemanticCache.build_cache_ctx(
-        getattr(req, "persona_id", "") or "", req.user_location or "", user_profile
+        getattr(req, "persona_id", "") or "", user_profile
     )
 
     ctx = ChatStreamCtx(
@@ -201,15 +194,12 @@ async def build_stream_ctx(req: ChatRequest, current_user: dict, today: str) -> 
     ctx.persona, ctx.persona_id = persona, persona_id
     ctx.selected_model, ctx.model_try_list = selected_model, model_try_list
 
-    if req.user_location:
-        asyncio.create_task(mm.save_user_location(req.user_location))
-
-    shared_context = build_shared_context(req.query, req.user_location or "", user_profile or "")
+    shared_context = build_shared_context(req.query, user_profile or "")
     system_content += f"\n{shared_context}"
     system_content += lang_instr
 
-    ctx.messages = await _assemble_messages(req, mm, system_content)
-    ctx.user_query = _rewrite_user_query(req, req.query, persona_id)
+    ctx.messages = await _assemble_messages(req, mm, system_content, username)
+    ctx.user_query = _rewrite_user_query(req.query, persona_id)
     return ctx
 
 
@@ -226,6 +216,7 @@ async def finalize_answer(ctx: ChatStreamCtx, answer: str, write_cache: bool = T
         {"role": "assistant", "content": answer},
     )
     if write_cache:
-        asyncio.create_task(SemanticCache.set(ctx.req.query, answer, cache_ctx=ctx.cache_ctx))
+        # safe_set 兜底：后台任务异常不能无人认领（与 runner/router 同一封装）
+        asyncio.create_task(safe_set(ctx.req.query, answer, cache_ctx=ctx.cache_ctx))
     await update_daily_usage(ctx.username, ctx.today, inc_request=1, inc_token=0)
     asyncio.create_task(inc_used_questions(ctx.username))

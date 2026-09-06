@@ -73,8 +73,8 @@ async def fallback_flash(req: ChatRequest, username: str) -> AsyncIterator[str]:
                                         return
                                     # ============================
                                     yield sse("answer_chunk", chunk)
-                            except (json.JSONDecodeError, ValueError):
-                                pass
+                            except (json.JSONDecodeError, ValueError) as e:
+                                logger.debug(f"SSE 行解析失败跳过: {e}")
                     # 流正常结束但未收到 [DONE]（兜底）
                     yield "data: [DONE]\n\n"
     except Exception as e:
@@ -94,12 +94,16 @@ async def fallback_chain(req: ChatRequest, username: str, cache_ctx: str = "") -
             yielded = True
             yield chunk
     except Exception:
-        yielded = False
+        # P3 修复：保留 yielded 真值——Flash 已产出部分内容时不再叠加兜底文案（原实现
+        # 重置 yielded 会造成"部分内容 + 兜底文案"先后发出）；补 [DONE] 终结事件防前端悬挂
+        # （Flash 中途异常路径自身不发 [DONE]）
+        if yielded:
+            yield "data: [DONE]\n\n"
     # 兜底：主模型 + Flash 双双失败时，保证至少返回一个终结事件，避免空流（前端一直转圈）
     if not yielded:
         # 穿透防护：兜底失败 → 写入短 TTL 空值占位，避免后续请求持续打 LLM
         try:
             await SemanticCache.set_empty(req.query, cache_ctx=cache_ctx, ttl=30)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"穿透占位写入失败（TTL 自愈）: {e}")
         yield sse("answer_complete", DEEPSEEK_FALLBACK_MESSAGE) + "data: [DONE]\n\n"

@@ -186,21 +186,13 @@ _CHANNEL_REGISTRY = {
     "simulated_wxpay": SimulatedWechatChannel(),
 }
 
+# 充值允许的渠道白名单（P0 修复）：balance 渠道是"用余额支付"，若允许用于充值 =
+# 无任何外部资金动作直接给钱包加钱（无限铸币），故充值仅开放两个模拟外部渠道
+RECHARGE_ALLOWED_CHANNELS = ("simulated_alipay", "simulated_wxpay")
+
 
 def get_channel(channel_code: str) -> ChannelInterface:
     channel = _CHANNEL_REGISTRY.get(channel_code)
     if not channel:
         raise ValueError(f"不支持的支付渠道: {channel_code}")
     return channel
-
-
-def get_available_channels() -> list:
-    """获取所有可用渠道列表"""
-    return [
-        {
-            "channel_code": code,
-            "channel_name": ch.__class__.__name__.replace("Channel", ""),
-            "is_active": True,
-        }
-        for code, ch in _CHANNEL_REGISTRY.items()
-    ]

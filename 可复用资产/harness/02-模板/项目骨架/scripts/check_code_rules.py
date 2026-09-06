@@ -8,7 +8,7 @@
   4. except: pass 静默吞异常（无注释）
 
 用法：
-    python scripts/check_code_rules.py [路径...]   # 默认检查 app/ mcp_assets/ scripts/
+    python scripts/check_code_rules.py [路径...]   # 默认检查 app/（可用路径参数扩展）
     python scripts/check_code_rules.py --skip-files v2.py,service.py   # 豁免历史债文件（路径子串匹配）
     python scripts/check_code_rules.py --no-silent                     # 跳过静默 except 检查（CI 默认启用）
 退出码：有违规返回 1（可接入 CI）

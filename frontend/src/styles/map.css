@@ -1,0 +1,549 @@
+/* 地图页样式——平移自旧 map.css，作用域化到 .map-page（避免污染聊天页） */
+.map-page {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  background: var(--bg-sidebar);
+  height: 100vh;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+/* 地图页样式 — 从 map.html 抽出（2026-09-05 前端拆分，行为等价） */
+
+.map-page * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+.map-page body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg-sidebar);
+      overflow: hidden;
+      height: 100vh;
+    }
+
+.map-page .map-container {
+      width: 100vw;
+      height: 100vh;
+      background: #f3f5f2;
+    }
+
+.map-page .toolbar {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      right: 20px;
+      display: flex;
+      justify-content: space-between;
+      z-index: 50;
+      pointer-events: none;
+    }
+
+.map-page .toolbar > * {
+      pointer-events: auto;
+    }
+
+.map-page .back-btn,
+.map-page .history-btn {
+      background: rgba(255, 255, 255, 0.9);
+      border: none;
+      border-radius: 30px;
+      padding: 10px 20px;
+      font-size: 14px;
+      cursor: pointer;
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+      transition: 0.2s;
+      backdrop-filter: blur(4px);
+    }
+
+.map-page .back-btn:hover,
+.map-page .history-btn:hover {
+      background: #fff;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+    }
+
+.map-page .right-tools {
+      display: flex;
+      gap: 12px;
+    }
+
+.map-page .bubble {
+      position: absolute;
+      background: rgba(255, 255, 255, 0.96);
+      border-radius: 20px;
+      padding: 24px 28px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15);
+      max-width: 400px;
+      width: 90%;
+      display: none;
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.4);
+      z-index: 100;
+      pointer-events: auto;
+      transition: opacity 0.2s;
+      max-height: 80vh;
+      overflow-y: auto;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+    }
+
+.map-page .bubble .city-name {
+      font-size: 24px;
+      font-weight: 700;
+      color: #1a2e1a;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+.map-page .bubble .city-name .fav-star {
+      cursor: pointer;
+      font-size: 22px;
+      transition: 0.2s;
+    }
+
+.map-page .bubble .city-name .fav-star:hover {
+      transform: scale(1.2);
+    }
+
+.map-page .bubble .weather {
+      font-size: 15px;
+      color: var(--text-secondary);
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px dashed #d0e0d0;
+    }
+
+.map-page .bubble .section {
+      margin: 10px 0;
+      font-size: 14px;
+      line-height: 1.6;
+      color: #2d4a2d;
+    }
+
+.map-page .bubble .section strong {
+      color: #1a4a1a;
+      display: block;
+      font-size: 15px;
+      margin-bottom: 4px;
+    }
+
+.map-page .bubble .section .items {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+.map-page .bubble .section .items span {
+      background: #edf5ed;
+      padding: 4px 14px;
+      border-radius: 20px;
+      font-size: 13px;
+      color: #1a3a1a;
+    }
+
+.map-page .bubble .actions {
+      display: flex;
+      gap: 12px;
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px solid #e0eee0;
+      justify-content: center;
+    }
+
+.map-page .bubble .actions button {
+      background: var(--primary, #3d7a5c);
+      border: none;
+      color: #fff;
+      padding: 8px 20px;
+      border-radius: 30px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: 0.2s;
+      font-weight: 500;
+    }
+
+.map-page .bubble .actions button:hover {
+      background: #1b6b3a;
+      transform: scale(0.97);
+    }
+
+.map-page .bubble .actions button.secondary {
+      background: #e8f0e8;
+      color: #2d4a2d;
+    }
+
+.map-page .bubble .actions button.secondary:hover {
+      background: #d0e0d0;
+    }
+
+.map-page .bubble .close-hint {
+      text-align: center;
+      font-size: 12px;
+      color: #aaa;
+      margin-top: 12px;
+      border-top: 1px solid #eee;
+      padding-top: 10px;
+    }
+
+.map-page .loading {
+      text-align: center;
+      color: #888;
+      padding: 20px 0;
+    }
+
+.map-page .history-panel {
+      position: fixed;
+      right: 0;
+      top: 0;
+      width: 320px;
+      height: 100vh;
+      background: rgba(255, 255, 255, 0.97);
+      box-shadow: -4px 0 20px rgba(0, 0, 0, 0.05);
+      transform: translateX(100%);
+      transition: transform 0.3s ease;
+      z-index: 200;
+      padding: 24px 20px;
+      overflow-y: auto;
+      backdrop-filter: blur(8px);
+    }
+
+.map-page .history-panel.open {
+      transform: translateX(0);
+    }
+
+.map-page .history-panel .panel-title {
+      font-size: 18px;
+      font-weight: 700;
+      color: #1a2e1a;
+      margin-bottom: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+.map-page .history-panel .panel-title button {
+      background: none;
+      border: none;
+      font-size: 24px;
+      cursor: pointer;
+      color: #888;
+    }
+
+.map-page .history-panel .history-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 0;
+      border-bottom: 1px solid #f0f5f0;
+      font-size: 14px;
+      color: #2d4a2d;
+    }
+
+.map-page .history-panel .history-item .fav-icon {
+      cursor: pointer;
+      font-size: 18px;
+      transition: 0.2s;
+    }
+
+.map-page .history-panel .history-item .fav-icon:hover {
+      transform: scale(1.2);
+    }
+
+.map-page .history-empty {
+      color: #aaa;
+      text-align: center;
+      margin-top: 40px;
+      font-size: 14px;
+    }
+
+.map-page .overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.2);
+      z-index: 150;
+      display: none;
+    }
+
+.map-page .overlay.show {
+      display: block;
+    }
+/* ---------- 缩放控件 ---------- */
+
+.map-page .zoom-controls {
+      position: absolute;
+      right: 16px;
+      bottom: 80px;
+      z-index: 50;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      pointer-events: none;
+    }
+
+.map-page .zoom-controls > * {
+      pointer-events: auto;
+    }
+
+.map-page .zoom-btn {
+      width: 44px;
+      height: 44px;
+      background: rgba(255,255,255,0.92);
+      backdrop-filter: blur(6px);
+      border: 1px solid var(--border-color, #c8dcc8);
+      border-radius: 50%;
+      font-size: 22px;
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-secondary);
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+      transition: 0.15s;
+      user-select: none;
+    }
+
+.map-page .zoom-btn:active { transform: scale(0.92); background: #e8f3e8; }
+
+.map-page .zoom-slider-container {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(255,255,255,0.88);
+      backdrop-filter: blur(6px);
+      border: 1px solid var(--border-color, #c8dcc8);
+      border-radius: 30px;
+      padding: 6px 14px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+      margin-top: 2px;
+    }
+
+.map-page .zoom-slider {
+      width: 120px;
+      height: 4px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: #d0e0d0;
+      border-radius: 4px;
+      outline: none;
+      cursor: pointer;
+    }
+
+.map-page .zoom-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--primary, #3d7a5c);
+      cursor: pointer;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+    }
+
+.map-page .zoom-slider::-moz-range-thumb {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--primary, #3d7a5c);
+      cursor: pointer;
+      border: none;
+    }
+
+.map-page .zoom-label {
+      font-size: 12px;
+      color: var(--text-secondary);
+      min-width: 32px;
+      text-align: center;
+      font-weight: 600;
+    }
+
+@media (max-width: 600px) {
+.map-page .bubble {
+        width: 95%;
+        padding: 18px 16px;
+        max-width: 95%;
+      }
+.map-page .history-panel {
+        width: 100%;
+      }
+    }
+/* ---------- 移动端菜单 ---------- */
+
+.map-page .hamburger-btn {
+      display: none;
+      background: rgba(255,255,255,0.92);
+      border: 1px solid #c8dcc8;
+      border-radius: 30px;
+      padding: 8px 14px;
+      font-size: 18px;
+      cursor: pointer;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+      backdrop-filter: blur(4px);
+      transition: 0.2s;
+    }
+
+.map-page .hamburger-btn:active { background: #e8f3e8; }
+
+.map-page .mobile-dropdown {
+      display: none;
+      position: fixed;
+      top: 70px;
+      right: 16px;
+      z-index: 55;
+      background: rgba(255,255,255,0.97);
+      backdrop-filter: blur(12px);
+      border: 1px solid #d0e0d0;
+      border-radius: 16px;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.12);
+      overflow: hidden;
+      min-width: 160px;
+    }
+
+.map-page .mobile-dropdown.show { display: block; }
+
+.map-page .mobile-dropdown button {
+      display: block;
+      width: 100%;
+      padding: 14px 20px;
+      border: none;
+      background: none;
+      font-size: 15px;
+      color: #2d4a2d;
+      text-align: left;
+      cursor: pointer;
+      transition: 0.15s;
+      border-bottom: 1px solid #f0f5f0;
+    }
+
+.map-page .mobile-dropdown button:last-child { border-bottom: none; }
+
+.map-page .mobile-dropdown button:hover { background: #f0f8f0; }
+
+@media (max-width: 768px) {
+      .desktop-only { display: none !important; }
+      .hamburger-btn { display: inline-block; }
+    }
+
+/* ---------- Vue 版气泡显示覆盖（v-if 控制存在性；覆盖旧版 display:none 与 ID 选择器样式） ---------- */
+.map-page .bubble {
+  display: block !important;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  max-width: 360px;
+}
+.map-page .bubble .city-name {
+  font-size: 18px;
+  font-weight: 700;
+  color: #2d4a2d;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.map-page .bubble .fav-star {
+  cursor: pointer;
+  color: #f5a623;
+  font-size: 18px;
+  margin-left: auto;
+}
+.map-page .bubble .weather {
+  color: #2b6cb0;
+  font-size: 14px;
+  margin: 6px 0 10px;
+}
+.map-page .bubble .section {
+  margin: 10px 0;
+}
+.map-page .bubble .section strong {
+  font-size: 13px;
+  color: #2d4a2d;
+}
+.map-page .bubble .items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.map-page .bubble .items span {
+  background: #f3f5f2;
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 13px;
+}
+.map-page .bubble .actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+}
+.map-page .bubble .actions button {
+  flex: 1;
+  padding: 9px 0;
+  border: 0;
+  border-radius: 8px;
+  background: var(--primary, #3d7a5c);
+  color: #fff;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+.map-page .bubble .actions button:hover {
+  background: var(--primary-dark, #1b6b3a);
+}
+.map-page .bubble .actions button.secondary {
+  background: #f0f0f0;
+  color: #666;
+}
+
+/* 返回聊天按钮（绿色实心，区别于右上工具组） */
+.map-page .back-chat {
+  background: var(--primary, #3d7a5c);
+  color: #fff;
+  border-color: var(--primary, #3d7a5c);
+}
+.map-page .back-chat:hover {
+  background: var(--primary-dark, #1b6b3a);
+  color: #fff;
+}
+
+/* ---------- 移动端工具栏（≤768px）：按钮防竖排 + 紧凑化，标题让位 ---------- */
+.map-page .back-btn,
+.map-page .history-btn {
+  white-space: nowrap;
+}
+
+@media (max-width: 768px) {
+  .map-page .toolbar {
+    top: 12px;
+    left: 12px;
+    right: 12px;
+  }
+  /* 标题在窄屏隐藏：省出整行宽度给按钮（地图内容自明） */
+  .map-page .toolbar-title {
+    display: none;
+  }
+  .map-page .back-btn,
+  .map-page .history-btn {
+    padding: 8px 12px;
+    font-size: 12px;
+  }
+  .map-page .left-tools,
+  .map-page .right-tools {
+    gap: 8px;
+  }
+  .map-page .zoom-controls {
+    right: 10px;
+    bottom: 70px;
+  }
+  .map-page .zoom-slider {
+    width: 80px;
+  }
+  /* 定位 toast 顶部居中防出屏 */
+  .map-page .locate-toast {
+    top: 64px;
+    max-width: 86vw;
+    text-align: center;
+  }
+}

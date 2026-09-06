@@ -11,10 +11,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from ..middleware.auth import get_current_user
 from ..core.logging import setup_logging
 from . import router
-from .models import (
-    RechargeRequest, PayRequest, RefundRequest,
-    TransferRequest, OrderQueryParams,
-)
+from .models import RechargeRequest, RefundRequest
 from .service import (
     get_wallet,
     create_recharge_order,
@@ -116,7 +113,8 @@ async def api_process_refund(
         result = await process_refund(
             order_no=req.order_no,
             user_id=user_id,
-            amount=Decimal(str(req.amount)) if req.amount else None,
+            # 注意 is not None 判断：Decimal("0") 为 falsy，truthiness 会把 0 元退款误变全额退款
+            amount=Decimal(str(req.amount)) if req.amount is not None else None,
             reason=req.reason,
         )
         return result

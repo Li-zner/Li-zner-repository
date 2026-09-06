@@ -4,12 +4,9 @@
 """
 import os
 import io
-import json
 import zipfile
 import asyncio
 import threading
-from pathlib import Path
-from typing import Optional
 from ..core.logging import setup_logging
 
 logger = setup_logging()
@@ -19,8 +16,6 @@ _OCR_LOCK = threading.Lock()
 
 # ============================================================
 # 图片 OCR 引擎（RapidOCR 优先，Tesseract 降级）
-# ============================================================
-# 图片 OCR 引擎
 # ============================================================
 # PIL 必须优先导入（被 RapidOCR / Tesseract / _ocr_image_bytes 共用）
 try:
@@ -47,7 +42,8 @@ if _HAS_PIL:
         import pytesseract
         _HAS_TESSERACT = True
     except ImportError:
-        pass
+        # 可选依赖：未安装则保持 False，OCR 走 RapidOCR 或返回引擎未安装提示
+        _HAS_TESSERACT = False
 
 def _ocr_image(img: Image.Image, label: str = "") -> str:
     """对 PIL Image 执行 OCR，RapidOCR 优先"""
@@ -104,6 +100,22 @@ except ImportError:
     _HAS_PDF = False
     logger.warning("PyMuPDF 未安装，PDF 解析不可用")
 
+def _render_pages_ocr(filepath: str) -> str:
+    """整页渲染 + 逐页 OCR（纯扫描件兜底）。
+
+    旧实现把 PDF 路径直接丢给图片 OCR 引擎（RapidOCR/Tesseract 都打不开 PDF），必然失败；
+    这里用 fitz 把每页渲染成位图再走统一的 OCR 通道。
+    """
+    parts = []
+    with fitz.open(filepath) as doc:
+        for page_num, page in enumerate(doc):
+            pix = page.get_pixmap(dpi=150)
+            ocr_text = _ocr_image_bytes(pix.tobytes("png"), "png", f"第{page_num+1}页")
+            if ocr_text and ocr_text.strip():
+                parts.append(ocr_text)
+    return "\n".join(parts)
+
+
 async def parse_pdf(filepath: str) -> str:
     """解析 PDF：先提取文本，再提取内嵌图片进行 OCR，合并返回"""
     if not _HAS_PDF:
@@ -130,17 +142,18 @@ async def parse_pdf(filepath: str) -> str:
                         ocr_text = _ocr_image(pil_img, f"第{page_num+1}页-图{img_idx+1}")
                         if ocr_text and ocr_text.strip():
                             text_parts.append(ocr_text)
-                    except Exception:
-                        pass
+                    except Exception as img_err:
+                        # 单张内嵌图片损坏不该废掉整份文档，跳过并留排查日志（P2 修复：不再裸 pass）
+                        logger.debug(f"跳过无法解析的内嵌图片(第{page_num+1}页-图{img_idx+1}): {img_err}")
 
         return "\n\n".join(text_parts) if text_parts else ""
 
     try:
         text = await loop.run_in_executor(None, _extract_all)
         if not text.strip():
-            # 纯扫描件 → 全页图片 OCR
-            logger.info("PDF 无直接文本且无内嵌图片，尝试全页 OCR...")
-            text = await parse_image(filepath, dpi=300)
+            # 纯扫描件（无文本层且无内嵌图片）→ fitz 整页渲染后 OCR
+            logger.info("PDF 无直接文本且无内嵌图片，尝试整页渲染 OCR...")
+            text = await loop.run_in_executor(None, _render_pages_ocr, filepath)
         return text[:150000]  # 放宽到 15 万字
     except Exception as e:
         logger.warning(f"PDF 解析失败: {e}")
@@ -150,7 +163,7 @@ async def parse_pdf(filepath: str) -> str:
 # ============================================================
 # 图片 OCR（pytesseract）— 独立图片文件
 # （pytesseract/PIL 已在顶部导入，_HAS_TESSERACT 可用）
-async def parse_image(filepath: str, dpi: int = 200) -> str:
+async def parse_image(filepath: str) -> str:
     """对独立图片文件进行 OCR（RapidOCR 优先）"""
     if not _HAS_RAPID and not _HAS_TESSERACT:
         return "[OCR 引擎未安装]"
@@ -224,12 +237,14 @@ async def parse_docx(filepath: str) -> str:
         ocr_results = []
         try:
             with zipfile.ZipFile(filepath, 'r') as z:
-                # Zip Slip 防护（P0 #4）：仅读取 word/media/ 下无路径穿越的成员
+                # Zip Slip 防护（P0 #4）：仅读取 word/media/ 下无路径穿越的成员。
+                # 关键：必须用 RAW 成员名判断 — os.path.normpath 会把 'word/media/../X'
+                # 折叠成 'word/X' 从而绕过 '..' 检查。ZIP 成员名恒用 '/' 分隔，按 '/' 切分即可。
                 media_files = [
                     f for f in z.namelist()
                     if f.startswith('word/media/')
                     and not f.startswith('/')
-                    and '..' not in os.path.normpath(f).split(os.sep)
+                    and '..' not in f.split('/')
                 ]
                 for idx, media_path in enumerate(sorted(media_files)):
                     img_bytes = z.read(media_path)
@@ -316,10 +331,19 @@ async def parse_document(filepath: str, filename: str) -> dict:
     else:
         return {"text": "", "format": ext, "success": False, "error": f"不支持的文件格式: {ext}"}
 
-    success = bool(text.strip()) and not text.startswith("[")
+    # 错误判定用显式标记而非 startswith("[")：正文以 "[" 开头的正常文档（如
+    # JSON 数组导出、引用块）曾被误判为解析失败
+    _ERROR_MARKERS = (
+        "[PDF 解析错误", "[PDF 解析引擎未安装]",
+        "[Word 解析错误", "[Word 解析引擎未安装]",
+        "[图片解析错误", "[OCR 引擎未安装]", "[OCR 识别失败",
+        "[文本解析错误", "[无法解码文件内容]",
+    )
+    is_error = any(text.startswith(m) for m in _ERROR_MARKERS)
+    success = bool(text.strip()) and not is_error
     return {
         "text": text,
         "format": SUPPORTED_EXTENSIONS.get(ext, ext),
         "success": success,
-        "error": None if success else text
+        "error": text if is_error else None
     }

@@ -76,9 +76,9 @@ class PersonaManager:
             except Exception as e:
                 logger.warning(f"加载人格 {pid} 失败: {e}")
 
-        # 默认选中 unified（综合助手），不存在则选第一个
+        # 默认选中 travel（旅行规划助手）；人格已分化（travel/civil_code/me），无混合人格
         if self._personas and not self._current:
-            self._current = "unified" if "unified" in self._personas else list(self._personas.keys())[0]
+            self._current = "travel" if "travel" in self._personas else list(self._personas.keys())[0]
         # 降级兜底：prompts 目录缺失或解析全失败时，注册内置默认人格，避免 LLM 无 system prompt（P1 #67）
         if not self._personas:
             self._personas["unified"] = Persona(
@@ -99,13 +99,25 @@ class PersonaManager:
         return self._current
 
     def switch(self, persona_id: str) -> bool:
-        """切换人格"""
+        """切换人格（全局默认值；仅 /api/persona/switch 显式调用）"""
         if persona_id in self._personas:
             self._current = persona_id
             logger.info(f"切换到人格: {self.current.icon} {self.current.name}")
             return True
         logger.warning(f"人格不存在: {persona_id}")
         return False
+
+    def get_effective(self, persona_id: Optional[str] = None) -> Optional[Persona]:
+        """按请求解析人格：显式 persona_id 优先，未指定/不存在时回落全局默认。
+
+        只读不改 _current——请求路径禁止调用 switch()（全局可变状态会被
+        并发请求互相覆盖，导致 A 用户拿到 B 用户的人格 system prompt）。
+        """
+        if persona_id:
+            p = self._personas.get(persona_id)
+            if p:
+                return p
+        return self.current
 
     def list_personas(self) -> list[dict]:
         """列出所有人格"""

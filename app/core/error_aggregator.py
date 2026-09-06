@@ -30,6 +30,7 @@ async def record_error(request, exc: Exception) -> str:
             f"{err_type}|{request.method} {request.url.path}|{str(exc)[:200]}",
         )
         await r.ltrim(_RECENT_KEY, 0, _RECENT_LIMIT - 1)
+        await r.expire(_RECENT_KEY, 7 * 86400)  # P3 修复：样本列表原先无 TTL
         await r.expire(key, 7 * 86400)  # 计数保留 7 天
     except Exception as e:
         logger.warning(f"异常聚合写入失败（不影响主流程）: {e}")

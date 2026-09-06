@@ -1,0 +1,60 @@
+# ============================================================
+# .dockerignore — 缩小构建上下文，避免把密钥/数据/备份送进镜像
+# ============================================================
+
+# 密钥与配置
+.env
+.env.*
+*.env
+etc/
+login*.json
+*.pem
+*.key
+
+# 数据与备份
+backups/
+*.sql
+*.sql.gz
+*.dump
+*.tar.gz
+*.tgz
+*.db
+*.sqlite
+*.sqlite3
+tempo_data/
+uploads/
+backup.log
+*.log
+
+# 版本控制与 IDE
+.git
+.gitignore
+.vscode/
+.idea/
+.wiki/
+.pytest_cache/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 命令产物
+
+# 文档（镜像内不需要）
+docs/
+scripts/
+*.md
+test_*.py
+tests/eval_cache.json
+
+# 前端构建（镜像内由多阶段 Dockerfile 自行构建）
+frontend/node_modules/
+frontend/dist/
+
+# 运行时产物
+cdc_journal/
+logs/
+data/
+mcp_assets/

@@ -4,7 +4,7 @@ import os
 import asyncio
 import httpx
 from ..core.logging import setup_logging
-from ..core.config import DEEPSEEK_API_BASE, DEEPSEEK_MODEL, HTTP_TIMEOUT_MEDIUM
+from ..core.config import DEEPSEEK_MODEL, HTTP_TIMEOUT_MEDIUM, llm_endpoint
 from ..core.jfast import loads as jloads
 
 logger = setup_logging()
@@ -26,7 +26,7 @@ def _extract_json(text: str) -> dict:
     try:
         return jloads(text)
     except json.JSONDecodeError:
-        pass
+        logger.debug("JSON 直接解析失败，尝试 markdown 代码块提取")
 
     # 尝试提取 markdown 代码块
     block_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
@@ -34,7 +34,7 @@ def _extract_json(text: str) -> dict:
         try:
             return jloads(block_match.group(1).strip())
         except json.JSONDecodeError:
-            pass
+            logger.debug("代码块解析失败，尝试首尾大括号提取")
 
     # 尝试提取第一个 { } 包裹的内容
     brace_match = re.search(r'\{.*\}', text, re.DOTALL)
@@ -42,10 +42,11 @@ def _extract_json(text: str) -> dict:
         try:
             return jloads(brace_match.group(0))
         except json.JSONDecodeError:
-            pass
+            logger.debug("大括号提取失败，尝试修复未引用的 key 后重解")
 
-    # 最后尝试：修复常见问题（未引用的 key）
-    fixed = re.sub(r'(?<!")(\b\w+\b)(?=\s*:)', r'"\1"', text)
+    # 最后尝试：修复常见问题（未引用的 key）。正则锚定 { 或 , 之后的键位，
+    # 不再全局扫 "word:"——旧写法会把字符串值里的 URL（http://）撕成 "http"://
+    fixed = re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', text)
     try:
         return jloads(fixed)
     except (json.JSONDecodeError, TypeError, ValueError):  # P2 #23：覆盖 jloads 可能的异常类型
@@ -91,7 +92,9 @@ SUB_AGENT_PROMPTS = {
 
 async def call_sub_agent(agent_name: str, args: dict, user_query: str, retry: bool = True):
     """调用子Agent，如果返回非法JSON则自动重试一次"""
-    api_key = os.getenv("DEEPSEEK_API_KEY")
+    # 与主链路同款取 Key 逻辑（统一走 chat_support，杜绝多 Key 白名单不一致的 400）
+    from ..services.chat_support import get_deepseek_key
+    api_key = await get_deepseek_key()
     if not api_key:
         return {"error": "Missing DeepSeek Key"}
 
@@ -105,15 +108,16 @@ async def call_sub_agent(agent_name: str, args: dict, user_query: str, retry: bo
     ]
     
     async def _call():
+        # 主力模型可能是 qwen（百炼端点），按模型名路由端点与密钥
+        base_url, api_key = llm_endpoint(DEEPSEEK_MODEL, api_key)
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
             resp = await client.post(
-                f"{DEEPSEEK_API_BASE}/chat/completions",
+                f"{base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                # payload 最小化：response_format/temperature 部分网关会 400（对齐主链路成功形态）
                 json={
                     "model": DEEPSEEK_MODEL,
                     "messages": messages,
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0.1
                 }
             )
             resp.raise_for_status()
@@ -135,11 +139,12 @@ async def call_sub_agent(agent_name: str, args: dict, user_query: str, retry: bo
     
     try:
         return await _call()
-    except (json.JSONDecodeError, TypeError, ValueError) as e:
+    except (json.JSONDecodeError, TypeError, ValueError, httpx.HTTPError) as e:
+        # httpx.HTTPError 一并进重试：网络抖动/限流首调失败直接重试一次，而不是炸穿调用方
         if retry:
             # 重试前加退避（P1 #34：防 API 限流时立即重试加剧压力）
             await asyncio.sleep(0.5)
-            logger.warning(f"子Agent {agent_name} 首次返回非法JSON，自动重试")
+            logger.warning(f"子Agent {agent_name} 首次调用失败，自动重试")
             messages[0]["content"] = system_prompt + "\n【重要】只输出纯JSON，不要添加任何解释。"
             try:
                 return await _call()

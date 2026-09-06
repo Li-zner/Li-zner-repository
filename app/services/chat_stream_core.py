@@ -65,6 +65,9 @@ async def civil_route_gate(ctx: ChatStreamCtx) -> AsyncIterator[str]:
         if _route.action == "reject":
             logger.info(f"路由裁决: reject → {_route.domain} ({_route.match_type})")
             yield sse("answer_complete", _route.message) + "data: [DONE]\n\n"
+            # 拒答也要收尾入历史：与 law_mapping_gate 同一标准，问答不丢上下文
+            await finalize_answer(ctx, _route.message)
+            ctx.saved_normally = True
             ctx.finished = True
             return
         if _route.action == "pass" and _route.mapped_query:
@@ -118,6 +121,13 @@ async def rebuild_lock_gate(ctx: ChatStreamCtx) -> AsyncIterator[str]:
                 ctx.finished = True
                 return
             if _cached_retry and not await SemanticCache.is_empty(_cached_retry):
+                # 与 serve_from_cache 同一标准：缓存内容过 DFA 再返回
+                # （修复前入库的旧缓存可能含未过滤内容）
+                from ..core.safety_filter import get_filter
+                _sf = get_filter()
+                if _sf.contains_sensitive(_cached_retry):
+                    logger.warning("DFA 拦截语义缓存（重读路径）")
+                    _cached_retry = _sf.safe_message
                 yield sse("answer_chunk", _cached_retry)
                 yield sse("answer_complete", _cached_retry) + "data: [DONE]\n\n"
                 ctx.finished = True
@@ -144,15 +154,9 @@ async def law_mapping_gate(ctx: ChatStreamCtx) -> AsyncIterator[str]:
     """法律依据纠正映射表检查（优先于 LLM 调用；仅非强制白名单查询）"""
     if ctx.persona_id != "civil_code":
         return
-    _skip_law_mapping = False
-    try:
-        from ..agents.routing_table import route_query as _rt_check
-        _rt_result = _rt_check(ctx.user_query)
-        _skip_law_mapping = bool(getattr(_rt_result, "match_type", "") == "forced_whitelist")
-        logger.info(f"法律映射表前置检查: match={getattr(_rt_result, 'match_type', 'N/A')}, skip={_skip_law_mapping}")
-    except Exception as _rt_err:
-        logger.warning(f"法律映射表前置检查异常: {_rt_err}")
-    if _skip_law_mapping:
+    # route_query 已由 civil_route_gate 执行并存入 ctx.civil_route_match，不再重复跑一遍
+    if ctx.civil_route_match == "forced_whitelist":
+        logger.info("法律映射表跳过：强制白名单命中")
         return
     try:
         from ..agents.law_mapping import check_query as _check_law

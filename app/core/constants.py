@@ -80,3 +80,12 @@ def get_all_persona_ids() -> List[str]:
 def clear_persona_cache():
     """清空人格缓存（用于热加载）"""
     _PERSONA_CACHE.clear()
+
+
+def today_cn() -> str:
+    """中文当前日期（含星期），供各处 system prompt 的 {today} 注入统一使用。
+    strftime %A 会输出英文星期，中文助手场景统一为周X。"""
+    from datetime import datetime
+    weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    now = datetime.now()
+    return f"{now.year}年{now.month:02d}月{now.day:02d}日 {weekdays[now.weekday()]}"

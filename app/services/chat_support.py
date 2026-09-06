@@ -11,12 +11,15 @@ from ..core.logging import setup_logging
 logger = setup_logging()
 
 
-def lang_instruction(req) -> str:
+def lang_instruction(lang: str = "zh") -> str:
     """根据界面语言生成 LLM 输出语言指令（追加到 system prompt）
 
     附加"请勿使用 emoji"以抑制模型原生 emoji 输出（产品要求专业、去表情）。
+    lang 传语言代码（zh/en）；调用方传 req 对象时取 req.lang（历史兼容）。
     """
-    lang = getattr(req, 'lang', 'zh') or 'zh'
+    if not isinstance(lang, str):
+        # 兼容旧调用：传入带 .lang 属性的 req 对象
+        lang = getattr(lang, "lang", "zh") or "zh"
     if lang == 'en':
         return (
             "\n\n【Output Language Requirement】\n"
@@ -58,12 +61,9 @@ def hide_reasoning(persona_id: str, persona) -> bool:
 
 # ---------- DeepSeek API Key 轮询（Round Robin + 连续失败剔除）----------
 # 模块加载时缓存 Key 列表，避免每次请求重复 os.getenv（P1 #12 消除 3 次系统调用）
+# 2026-09-05 用户决策：只保留主 Key（KEY_2/KEY_3 与主 Key 上游白名单不同，混用导致 400）
 _DEEPSEEK_KEYS = [
-    k for k in (
-        os.getenv("DEEPSEEK_API_KEY", ""),
-        os.getenv("DEEPSEEK_API_KEY_2", ""),
-        os.getenv("DEEPSEEK_API_KEY_3", ""),
-    ) if k
+    k for k in (os.getenv("DEEPSEEK_API_KEY", ""),) if k
 ]
 _key_fail_count: Dict[str, int] = {}   # key -> 连续失败次数
 _key_round_index = 0                   # 轮询游标
@@ -93,3 +93,39 @@ async def mark_key_result(key: str, ok: bool) -> None:
             _key_fail_count.pop(key, None)
         else:
             _key_fail_count[key] = _key_fail_count.get(key, 0) + 1
+
+# ---------- 公共非流式 LLM 调用（带 Flash 降级） ----------
+# 场景：地图推荐 / 子代理等非流式调用。DEEPSEEK_MODEL 若与上游白名单不匹配（400），
+# 自动用 DEEPSEEK_FLASH_MODEL 重试——与主链路 model_try_list 降级语义一致。
+async def post_chat_completion(payload: dict, timeout: float) -> tuple[bool, dict]:
+    """非流式 /chat/completions 公共原语：llm_endpoint 按模型路由端点，
+    主模型失败时自动用 DEEPSEEK_FLASH_MODEL（走 DeepSeek 端点）重试。
+    返回 (ok, data)；失败时 data 为 {"status":..., "body":...} 诊断信息。
+    """
+    import httpx
+    from ..core.config import DEEPSEEK_FLASH_MODEL, DEEPSEEK_MODEL, llm_endpoint
+    models = [payload.get("model") or DEEPSEEK_MODEL, DEEPSEEK_FLASH_MODEL]
+    seen: set = set()
+    last = {"status": None, "body": ""}
+    for model in models:
+        if model in seen:
+            continue
+        seen.add(model)
+        base_url, api_key = llm_endpoint(model, os.getenv("DEEPSEEK_API_KEY", ""))
+        body = dict(payload, model=model)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    f"{base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json=body,
+                )
+            if resp.status_code == 200:
+                await mark_key_result(api_key, True)
+                return True, resp.json()
+            last = {"status": resp.status_code, "body": resp.text[:200]}
+            await mark_key_result(api_key, False)
+        except Exception as e:
+            last = {"status": None, "body": str(e)[:200]}
+            await mark_key_result(api_key, False)
+    return False, last

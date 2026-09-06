@@ -48,6 +48,16 @@ _REASONING_LEAK_PATTERNS = [
     "## 核心原则", "## 可用工具", "## 默认值",
     "防幻觉", "最小工具调用", "路由识别",
     "【输出格式】", "只输出JSON",
+    # ---- 注入指令复述（system/user 注入段的标志性短语被思考复述 → 泄露）----
+    "请以用户最新的消息为准", "用户上传了以下文件", "【提示：", "引用要求",
+    "共享上下文",
+    # ---- 约束复述（2026-09-05 实测泄露：模型逐条复述输出约束/文件模板规则）----
+    "emoji", "中文（简体）", "约束检查", "特定模板", "文件上传场景",
+    "重申身份", "身份设定", "意图识别", "功能定位", "语言风格",
+    # ---- 供应商/基础设施指纹（2026-09 qwen 切换：模型身份与端点不得外露）----
+    "qwen", "deepseek", "通义", "千问", "百炼",
+    "dashscope", "aliyuncs", "compatible-mode",
+    "enable_thinking", "reasoning_content", "api_key", "api_base",
 ]
 
 # 整段抑制：即使正常思考也可能提到工具名，但这些是确凿的系统设定引用
@@ -65,7 +75,18 @@ _REASONING_SUPPRESS_PATTERNS = [
     "工具调用失败", "调用失败", "工具执行失败", "工具超时", "工具报错",
     "tool call failed", "tool failed", "tool execution failed", "tool timeout",
     "重试失败", "重试仍失败",
+    # ---- 注入指令复述（同上，强指纹）----
+    "请以用户最新的消息为准", "用户上传了以下文件", "【提示：", "引用要求",
+    "共享上下文",
+    # ---- 供应商/基础设施指纹（模型身份/端点/配置项，出现即认为思考被污染）----
+    "qwen", "deepseek", "通义", "千问", "百炼",
+    "dashscope", "aliyuncs", "compatible-mode",
+    "enable_thinking", "reasoning_content", "api_key", "api_base",
 ]
+
+# Key 形状（DeepSeek/百炼/OpenRouter 等均为 sk- 前缀）：思考里出现即视为泄露
+# 注：不能用 \b——中文汉字在 Python re 里算 \w，"是sk-xxx" 会因无词边界漏检
+_KEY_SHAPE_RE = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{8,}")
 
 # 预编译正则：流式思考每 Chunk 上百次过滤，避免逐模式 in 扫描（P1 #14）
 _REASONING_LEAK_RE = re.compile(
@@ -77,10 +98,10 @@ _REASONING_SUPPRESS_RE = re.compile(
 
 
 def reasoning_leaked(text: str) -> bool:
-    """检测思考内容是否泄露了系统设定/负面信号（整段抑制）"""
+    """检测思考内容是否泄露了系统设定/负面信号/模型身份/Key（整段抑制）"""
     if not text:
         return False
-    return _REASONING_SUPPRESS_RE.search(text) is not None
+    return _REASONING_SUPPRESS_RE.search(text) is not None or _KEY_SHAPE_RE.search(text) is not None
 
 
 def sanitize_reasoning(text: str, persona_id: str = "") -> str:
@@ -110,3 +131,32 @@ def sanitize_reasoning(text: str, persona_id: str = "") -> str:
             continue
         kept.append(line)
     return "\n".join(kept).strip()
+
+
+class ReasoningStreamGuard:
+    """流式思考过滤（跨块安全）：强指纹命中即整流抑制，其余逐块行过滤
+
+    ponytail: 跨块检测靠 _OVERLAP 字符尾部重叠拼接，可捕获 ≤(重叠+1) 字符指纹的
+    任意两块切分（现有最长指纹约 22 字符）；分成 3 块以上的极端长指纹理论可绕过，
+    升级路径是整段缓冲按行送检。
+    """
+    _OVERLAP = 24
+
+    def __init__(self, persona_id: str = ""):
+        self._persona_id = persona_id
+        self._carry = ""   # 上一块未参与拼接检测的原始尾部（用于跨块指纹拼接）
+        self._dead = False  # 强指纹命中后的整流抑制开关
+
+    def feed(self, chunk: str) -> str:
+        """输入一个思考增量，返回可安全展示的文本（可能为空串）"""
+        if self._dead or not chunk:
+            return ""
+        if self._persona_id == "me":
+            return chunk  # 求职助手不过滤（与 sanitize_reasoning 豁免一致）
+        scan = self._carry + chunk
+        if _REASONING_SUPPRESS_RE.search(scan) or _KEY_SHAPE_RE.search(scan):
+            self._dead = True
+            logger.warning("思考内容命中强泄露指纹（含跨块拼接），后续思考整流抑制")
+            return ""
+        self._carry = scan[-self._OVERLAP:]
+        return sanitize_reasoning(chunk, self._persona_id)

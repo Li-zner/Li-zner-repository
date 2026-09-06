@@ -12,6 +12,7 @@ from ..core.stream_utils import stream_llm
 from ..core.semantic_cache import SemanticCache
 from ..core.safety_filter import get_filter
 from .chat_support import mark_key_result
+from .reasoning_guard import ReasoningStreamGuard
 from .chat_stream_ctx import ChatStreamCtx
 
 logger = setup_logging()
@@ -25,7 +26,8 @@ async def stream_llm_throttled(
     """调用 stream_llm 并按「首块立即 + ≥40字符/≥100ms + 尾冲刷」节流产出事件
 
     产出 (kind, payload)：
-      - ("reasoning", text)  思考文本（未过滤，由调用方做 sanitize/hide）
+      - ("reasoning", text)  思考文本（已经 ReasoningStreamGuard 过滤：系统词/模型
+                             身份/Key 指纹不外露，跨块拼接检测，强指纹整流抑制）
       - ("answer", chunk)    节流后的回答块
       - ("usage", dict)      token 用量
       - ("tool_calls", {"delta": [..]})  工具调用增量
@@ -33,6 +35,7 @@ async def stream_llm_throttled(
     _stream_buffer = ""
     _first_chunk_time = None
     _last_chunk_time = None
+    _reason_guard = None  # 惰性创建：仅出现思考增量的流才需要
     async for _ev in stream_llm(
         api_key, model_try, llm_messages,
         tools=tools, tool_choice=tool_choice, username=username,
@@ -41,7 +44,11 @@ async def stream_llm_throttled(
         if _ev["type"] == "usage":
             yield ("usage", {"prompt_tokens": _ev["prompt_tokens"], "completion_tokens": _ev["completion_tokens"]})
         elif _ev["type"] == "reasoning":
-            yield ("reasoning", _ev["text"])
+            if _reason_guard is None:
+                _reason_guard = ReasoningStreamGuard(getattr(ctx, "persona_id", ""))
+            _safe_text = _reason_guard.feed(_ev["text"])
+            if _safe_text:
+                yield ("reasoning", _safe_text)
         elif _ev["type"] == "content":
             _chunk = _ev["text"]
             _stream_buffer += _chunk
@@ -90,7 +97,7 @@ async def answer_via_models(ctx: ChatStreamCtx, llm_messages: List[Dict], tag: s
     # 全部模型失败：交由调用方 ensure_answer 兜底
 
 
-async def ensure_answer(ctx: ChatStreamCtx, result_text: str, fallback_msg: str, write_cache: bool = False) -> str:
+async def ensure_answer(ctx: ChatStreamCtx, result_text: str, fallback_msg: str) -> str:
     """空回复兜底 + 穿透占位；返回最终答案文本"""
     if not result_text:
         result_text = DEEPSEEK_FALLBACK_MESSAGE

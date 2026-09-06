@@ -1,0 +1,8 @@
+# Shell 脚本与关键配置强制 LF（CRLF 会导致 bash/脚本 sed 出错）
+*.sh text eol=lf
+*.bash text eol=lf
+nginx.conf text eol=lf
+start_all.sh text eol=lf
+
+# 其余文本文件按 Git 默认规则处理
+* text=auto

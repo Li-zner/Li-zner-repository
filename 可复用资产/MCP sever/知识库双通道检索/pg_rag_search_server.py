@@ -1,7 +1,7 @@
 """
 MCP 资产 002 — 知识库双通道检索 Server（stdio 传输）
 
-从 agent_gateway 民法典 RAG（mcp_assets/civil-code-rag + 踩坑清单 #28/#29）泛化：
+从 agent_gateway 民法典 RAG 实战泛化（对应 harness 踩坑清单 #28/#29）：
 对任意 PostgreSQL 知识表做「pg_trgm 关键词 + 向量语义」双通道召回，表结构可配置。
 
 召回逻辑（求全）：

@@ -1,0 +1,39 @@
+# ===== 密钥与配置（必须排除）=====
+.env
+.env.*
+!.env.example
+login*.json
+*.pem
+*.key
+id_rsa*
+secrets/
+
+# ===== 数据库备份 =====
+backups/
+*.sql
+*.dump
+
+# ===== 临时/产物 =====
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+node_modules/
+dist/
+build/
+*.log
+.DS_Store
+Thumbs.db
+
+# ===== 数据目录（如适用）=====
+uploads/
+tempo_data/
+data/
+*.db
+*.sqlite3
+
+# ===== 本地工具 =====
+.vscode/
+.idea/

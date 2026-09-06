@@ -16,10 +16,6 @@
 - [docs/](docs/) —— 架构文档与学习笔记
 - [app/](app/) —— 后端核心代码（FastAPI 分层：routes / services / agents / payment / core）
 - [frontend/](frontend/) —— 前端 v2 源码（Vue3 + TypeScript + Vite）
-- [tests/](tests/) —— 单测与检索评测（pytest + vitest + 自建召回评测集）
-- [scripts/](scripts/) —— 工程化脚本（编码规范门禁 / 迁移 / 种子数据）
-- [alembic/](alembic/) —— 数据库版本化迁移
-- [deploy/](deploy/) —— 精简版一键部署（2C1G 实机验证）
 - [可复用资产/](可复用资产/) —— 跨项目可复用资产（AI 应用资产 / 前端资产 / harness 模板 / MCP / skill）
 - [可复用代码/](可复用代码/) —— 独立机制实现（分布式锁 / 熔断器 / 单飞幂等 / LRU+TTL / 限流器）
 

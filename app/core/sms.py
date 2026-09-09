@@ -97,7 +97,9 @@ async def send_sms(phone: str, code: str, ttl_minutes: int = 5) -> bool:
             "SignatureNonce": str(uuid.uuid4()),
             "SignatureVersion": "1.0",
             "TemplateCode": SMS_TEMPLATE_CODE,
-            "TemplateParam": json.dumps({"code": code, "min": "5"}, ensure_ascii=False),
+            # 验证码有效期分钟数透传（2026-09-07 审查 P2：形参原先被忽略，硬编码 "5"）
+            "TemplateParam": json.dumps(
+                {"code": code, "min": str(ttl_minutes)}, ensure_ascii=False),
             "Timestamp": timestamp,
             "Version": "2017-05-25",
         }

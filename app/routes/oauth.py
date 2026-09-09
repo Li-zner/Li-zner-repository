@@ -38,12 +38,15 @@ async def _resolve_github_user(pool, github_user: dict, gh_id: str, user_email: 
 
     旧实现按 username 查到人即登录：任何人与已有用户同名的 GitHub 账号都能接管该账号。
     新设计（手机号为主用户名）：
-      1) github_id 命中 -> 老用户回访（username 可能已改绑为 phone_{手机号}）；
+      1) github_id 命中 -> 老用户回访（username 可能已改绑为手机号）；
       2) 用户名被本地账号占用 -> 拒绝登录，要求绑定手机号后使用（返回 conflict 标记）；
       3) 均未命中 -> 以 login 为 username 新建（带 github_id），后续可改绑。
     返回 (user, conflict)：conflict=True 时调用方直接重定向，user 为 None。
     """
-    username = github_user['login']
+    # 用户名策略（2026-09-09 主人定稿）：用 GitHub 登录名做用户名（无 phone_ 前缀）；
+    # 授权信息缺 login 时随机生成短 ID 兜底。GitHub 用户名不允许纯数字，
+    # 与手机号用户名天然不冲突。
+    username = github_user.get('login') or f"gh{secrets.token_hex(4)}"
     if gh_id:
         # 短连接查询 github_id 身份（用户名已改绑的场景只能靠它找回）
         async with pool.acquire() as conn:
@@ -108,7 +111,10 @@ async def auth_github_callback(request: Request):
                 user_email = next((e['email'] for e in emails if e['primary']), None)
                 if not user_email:
                     user_email = github_user['login'] + '@github.com'
-        username = github_user['login']
+        # 用户名策略（2026-09-09 主人定稿）：用 GitHub 登录名做用户名（无 phone_ 前缀）；
+        # 授权信息缺 login 时随机生成短 ID 兜底。GitHub 用户名不允许纯数字，
+        # 与手机号用户名天然不冲突。
+        username = github_user.get('login') or f"gh{secrets.token_hex(4)}"
         gh_id = str(github_user.get('id') or '')
         from ..core.audit import audit
         pool = await get_pool()
@@ -121,7 +127,7 @@ async def auth_github_callback(request: Request):
         if user and user.get("role") == "admin" and not user.get("email"):
             return RedirectResponse(url=f"{GATEWAY_PUBLIC_URL}/?error=admin_login_via_github_denied")
         # 仅普通用户且未绑定手机号 → 标记试用受限；已绑手机用户再次登录不再受限（幂等）
-        # 注意用 user["username"]：改绑过手机号的回访用户，username 已是 phone_{手机号}
+        # 注意用 user["username"]：改绑过手机号的回访用户，username 已是手机号本身
         qp = ""
         if user and user.get("role") != "admin" and not user.get("phone"):
             pool = await get_pool()
@@ -140,5 +146,8 @@ async def auth_github_callback(request: Request):
             redirect_url = f"{GATEWAY_PUBLIC_URL}/?token={access_token}&refresh_token={refresh_token}{qp}"
             return RedirectResponse(url=redirect_url)
         return RedirectResponse(url=f"{GATEWAY_PUBLIC_URL}/?error=github_user_creation_failed")
-    except Exception as e:
-        return RedirectResponse(url=f"{GATEWAY_PUBLIC_URL}/?error={str(e)}")
+    except Exception:
+        # 固定错误码（2026-09-07 审查 P2）：str(e) 可能含上游错误细节/URL，
+        # 拼进重定向 URL 会反射给前端；细节只进日志
+        logger.exception("GitHub OAuth 回调失败")
+        return RedirectResponse(url=f"{GATEWAY_PUBLIC_URL}/?error=github_callback_failed")

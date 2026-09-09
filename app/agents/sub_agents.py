@@ -90,8 +90,12 @@ SUB_AGENT_PROMPTS = {
 【约束】只输出JSON。''',
 }
 
-async def call_sub_agent(agent_name: str, args: dict, user_query: str, retry: bool = True):
-    """调用子Agent，如果返回非法JSON则自动重试一次"""
+async def call_sub_agent(agent_name: str, args: dict, user_query: str, retry: bool = True,
+                         username: str = ""):
+    """调用子Agent，如果返回非法JSON则自动重试一次
+
+    username 供扣费（2026-09-09 主人拍板：内部 LLM 调用计入计费）。
+    """
     # 与主链路同款取 Key 逻辑（统一走 chat_support，杜绝多 Key 白名单不一致的 400）
     from ..services.chat_support import get_deepseek_key
     api_key = await get_deepseek_key()
@@ -134,6 +138,11 @@ async def call_sub_agent(agent_name: str, args: dict, user_query: str, retry: bo
             llm_tokens_detail.labels(model=DEEPSEEK_MODEL, endpoint='sub_agent', type='input').inc(prompt_tk)
             llm_tokens_detail.labels(model=DEEPSEEK_MODEL, endpoint='sub_agent', type='output').inc(completion_tk)
             llm_requests_total.labels(model=DEEPSEEK_MODEL, endpoint='sub_agent', status='success').inc()
+            # 计入计费（2026-09-09 主人拍板）：指标已打点，复用不含指标的扣费入口
+            if username:
+                from ..services.llm_streaming import bill_token_usage
+                bill_token_usage(usage, username, "",
+                                 remark=f"子Agent[{agent_name}]消耗 {prompt_tk + completion_tk} tokens")
 
             return _extract_json(content)
     

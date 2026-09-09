@@ -4,6 +4,8 @@ import httpx
 import os
 import json
 import re
+from datetime import datetime
+import time
 from ..middleware.auth import get_current_user
 from ..core.config import HTTP_TIMEOUT_MEDIUM, MAP_API_TIMEOUT
 from ..core.logging import setup_logging
@@ -15,6 +17,54 @@ class RouteRequest(BaseModel):
     destination: str
 
 router = APIRouter(prefix="/api/map", tags=["map"])
+
+
+# ===== 高频城市缓存（2026-09-10 主人定稿）=====
+# 点击计数按日（zset，两天 TTL）；当日点击 Top-N 的城市才写入缓存：
+#   天气：TTL 1 天（每日惰性刷新；高德免费接口无逐小时数据，8-22 点"最长天气段"
+#         无法计算，按主人指示维持实况原样——即缓存写入时刻的实况）
+#   美食景点：TTL 15 天（短期内不会变，无需频繁重生成）
+# force=1（刷新按钮）：跳过读缓存重新生成，且无视 Top-N 一律覆盖写入。
+# Top-N 只是"多少城市享受缓存秒出"的产品策略，单条 ~1-2KB，Top200 亦无压力；
+# 可用 CITY_CACHE_TOP_N 环境变量调整。
+CITY_HIT_ZSET = "map:city_hits:{date}"
+CITY_CACHE_PREFIX = "map:city_cache:"
+CITY_TOP_N = int(os.getenv("CITY_CACHE_TOP_N", "200"))
+WEATHER_TTL_SECONDS = 86400        # 天气：每天刷新一次
+RECOMMEND_TTL_SECONDS = 15 * 86400  # 美食景点：15 天刷新一次
+# recommend 失败兜底数据（模块级单例：handler 用同一性判断"是兜底就不写缓存"）
+_DEFAULT_REC = {"foods": ["当地特色小吃", "地道家常菜", "招牌美食"],
+                "spots": ["城市地标", "历史文化街区", "自然公园"]}
+
+
+async def _city_cache_get(city: str, kind: str):
+    from ..core.redis import get_redis
+    r = await get_redis()
+    raw = await r.get(f"{CITY_CACHE_PREFIX}{kind}:{city[:64]}")
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
+async def _city_cache_put(city: str, kind: str, payload, force: bool = False) -> None:
+    """点击计数（按日 zset）+ 当日 Top-N（或 force 刷新）才写缓存。
+    TTL：天气 1 天 / 美食景点 15 天（2026-09-10 主人定稿）"""
+    from ..core.redis import get_redis
+    r = await get_redis()
+    member = f"{kind}:{city[:64]}"
+    zkey = CITY_HIT_ZSET.format(date=datetime.now().strftime("%Y%m%d"))
+    await r.zincrby(zkey, 1, member)
+    await r.expire(zkey, 172800)  # 两天，跨自然日仍能判定"当日 Top-N"
+    if not force:
+        rank = await r.zrevrank(zkey, member)
+        if rank is None or rank >= CITY_TOP_N:
+            return  # 不在当日 Top-N：不写，保持既有缓存（若有）继续服役
+    ttl = WEATHER_TTL_SECONDS if kind == "weather" else RECOMMEND_TTL_SECONDS
+    await r.set(f"{CITY_CACHE_PREFIX}{member}",
+                json.dumps(payload, ensure_ascii=False), ex=ttl)
 
 
 @router.get("/regeo")
@@ -147,9 +197,24 @@ async def _resolve_adcode(amap_key: str, name: str, client):
     return None
 
 @router.get("/weather")
-async def get_weather(city: str, current_user: dict = Depends(get_current_user)):
+async def get_weather(city: str, force: int = 0, current_user: dict = Depends(get_current_user)):
+    import time as _time
+    _t0 = _time.perf_counter()
+    result = await _weather_impl(city, force)
+    logger.info(f"[map-perf] weather city={city} total={_time.perf_counter() - _t0:.2f}s")
+    return result
+
+
+async def _weather_impl(city: str, force: int):
+    # 天气走高德预报（extensions=all）：出行查的是今天/明天/后天的白天天气，
+    # 不是当下实况（2026-09-10 主人定稿）。高频城市当日缓存同前。
+    if not force:
+        cached = await _city_cache_get(city, "weather")
+        if cached is not None:
+            logger.info(f"[map-perf] weather city={city} cache=hit")
+            return cached
     amap_key = os.getenv("AMAP_API_KEY")
-    fallback = {"status": "1", "lives": [{"city": city, "weather": "暂无数据", "temperature": "--", "winddirection": "", "windpower": ""}]}
+    fallback = {"status": "1", "days": []}
     if not amap_key:
         return fallback
 
@@ -174,28 +239,28 @@ async def get_weather(city: str, current_user: dict = Depends(get_current_user))
                     continue
                 resp = await client.get(
                     "https://restapi.amap.com/v3/weather/weatherInfo",
-                    params={"city": cand, "key": amap_key, "extensions": "base"}
+                    params={"city": cand, "key": amap_key, "extensions": "all"}
                 )
                 if resp.status_code == 200:
                     data = resp.json()
-                    if data.get("status") == "1" and data.get("lives"):
-                        if note:
-                            data["_note"] = note
-                        return data
+                    out = _format_forecast(data, note)
+                    if out is not None:
+                        await _city_cache_put(city, "weather", out, force=bool(force))
+                        return out
 
             # 2) 兜底：地理编码解析 adcode 后再查一次
             adcode = await _resolve_adcode(amap_key, city, client)
             if adcode:
                 resp = await client.get(
                     "https://restapi.amap.com/v3/weather/weatherInfo",
-                    params={"city": adcode, "key": amap_key, "extensions": "base"}
+                    params={"city": adcode, "key": amap_key, "extensions": "all"}
                 )
                 if resp.status_code == 200:
                     data = resp.json()
-                    if data.get("status") == "1" and data.get("lives"):
-                        if note:
-                            data["_note"] = note
-                        return data
+                    out = _format_forecast(data, note)
+                    if out is not None:
+                        await _city_cache_put(city, "weather", out, force=bool(force))
+                        return out
     except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError):
         # 网络超时或无法连接时返回兜底数据
         return fallback
@@ -204,18 +269,72 @@ async def get_weather(city: str, current_user: dict = Depends(get_current_user))
     # 全部失败 → 兜底数据（不抛 502，前端可正常展示美食/景点）
     return fallback
 
-@router.post("/recommend")
-async def get_recommend(city: str, current_user: dict = Depends(get_current_user)):
-    # 与主链路同款 Key 轮询（统一 chat_support 取 Key，杜绝多 Key 白名单不一致的 400）
-    from ..services.chat_support import get_deepseek_key
-    deepseek_key = await get_deepseek_key()
 
-    # ===== 通用兜底数据（API不可用时返回）=====
-    _default_rec = {"foods": ["当地特色小吃", "地道家常菜", "招牌美食"], "spots": ["城市地标", "历史文化街区", "自然公园"]}
+def _format_forecast(data: dict, note: str):
+    """把高德预报（extensions=all）压成 今天/明天/后天 三天白天天气；无有效预报返回 None"""
+    if not (data.get("status") == "1" and data.get("forecasts")):
+        return None
+    casts = (data["forecasts"][0].get("casts") or [])[:3]
+    if not casts:
+        return None
+    labels = ["今天", "明天", "后天"]
+    days = []
+    for i, c in enumerate(casts):
+        days.append({
+            "label": labels[i] if i < len(labels) else c.get("date", f"第{i+1}天"),
+            "weather": c.get("dayweather") or c.get("nightweather") or "--",
+            "temp": f"{c.get('nighttemp', '--')}~{c.get('daytemp', '--')}℃",
+        })
+    out = {"status": "1", "days": days}
+    if note:
+        out["_note"] = note
+    return out
+
+@router.post("/recommend")
+async def get_recommend(city: str, force: int = 0, current_user: dict = Depends(get_current_user)):
+    import time as _time
+    _t0 = _time.perf_counter()
+    # 高频城市当日缓存：命中直接返回（不走 LLM 也不计费）；force=1 强制重新生成并覆盖
+    if not force:
+        cached = await _city_cache_get(city, "recommend")
+        if cached is not None:
+            logger.info(f"[map-perf] recommend city={city} cache=hit")
+            return cached
+    # 配额门禁（2026-09-07 审查 P1）：原先完全绕过 ensure_chat_allowed/日 token 限额，
+    # 登录用户可刷 LLM 配额；LLM 调用期间占用并发槽位，finally 释放
+    from ..services.chat_stream_ctx import ensure_chat_allowed
+    from ..middleware.rate_limit import release_concurrent
+    await ensure_chat_allowed(current_user)
+    try:
+        result = await _recommend_llm(city, username=current_user["username"])
+        if result is not _DEFAULT_REC:
+            await _city_cache_put(city, "recommend", result, force=bool(force))
+        logger.info(f"[map-perf] recommend city={city} total={_time.perf_counter() - _t0:.2f}s cache=generate")
+        return result
+    finally:
+        await release_concurrent(current_user["username"])
+
+
+async def _recommend_llm(city: str, username: str = "") -> dict:
+    """推荐正文（LLM 调用与解析），由 /recommend 在配额门禁内调用
+
+    username 供计量扣费（2026-09-09 审查 P1：原先只过门禁不扣费不计日 token）。
+    """
+    # 与主链路同款 Key 轮询（统一 chat_support 取 Key，杜绝多 Key 白名单不一致的 400）
+    import time
+    from ..services.chat_support import get_deepseek_key
+    _t0 = time.perf_counter()
+    deepseek_key = await get_deepseek_key()
+    _t_key = time.perf_counter()
+
+    # ===== 通用兜底数据（API不可用时返回；模块级单例 _DEFAULT_REC，handler 靠同一性判断是否写缓存）=====
 
     if not deepseek_key:
-        return _default_rec
+        return _DEFAULT_REC
 
+    import random
+    # 随机即可（2026-09-10 主人定稿）：不强制风格差异，用 temperature 抖动自然变化；
+    # temperature 仅 DeepSeek 侧携带（qwen 兜底时由 post_chat_completion 剥离防 400）
     prompt = f"""
 你是一个本地美食和旅游专家。请为「{city}」推荐 3 道特色美食和 3 个必去景点。
 要求：
@@ -223,41 +342,65 @@ async def get_recommend(city: str, current_user: dict = Depends(get_current_user
 2. 只返回 JSON 格式，不要有其他文字。
 格式：{{"foods":["美食1","美食2","美食3"], "spots":["景点1","景点2","景点3"]}}
 """
-    from ..core.config import DEEPSEEK_API_BASE, DEEPSEEK_MODEL
-    url = f"{DEEPSEEK_API_BASE}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {deepseek_key}",
-        "Content-Type": "application/json"
-    }
-    # payload 对齐主链路成功形态：无 temperature/max_tokens（部分网关拒绝这些参数返回 400）
+    from ..core.config import DEEPSEEK_MODEL
+    # payload 对齐主链路成功形态：无 max_tokens（部分网关拒绝这些参数返回 400）
     payload = {
         "model": DEEPSEEK_MODEL,
+        "temperature": round(random.uniform(0.9, 1.3), 2),
         "messages": [{"role": "user", "content": prompt}],
     }
-    # 带主/备模型降级（qwen 主模型 400 时自动用 deepseek-v4-flash 重试）
+    # 带降级（flash 优先：轻量结构化任务生成快 3 倍+，主模型兜底——2026-09-09 埋点结论）
     from ..services.chat_support import post_chat_completion
     try:
-        ok, data = await post_chat_completion(payload, timeout=HTTP_TIMEOUT_MEDIUM)
+        ok, data = await post_chat_completion(payload, timeout=HTTP_TIMEOUT_MEDIUM,
+                                              prefer_flash=True, preferred_timeout=8)
+        _t_llm = time.perf_counter()
         if not ok:
-            logger.warning(f"recommend 上游失败: {data}")
-            return _default_rec
+            logger.warning(f"[map-perf] recommend city={city} 上游失败 耗时={_t_llm - _t0:.2f}s (key={_t_key - _t0:.2f}s)")
+            return _DEFAULT_REC
         content = data["choices"][0]["message"]["content"]
+        # 计量扣费（2026-09-09 审查 P1）：/recommend 原先只过配额门禁，不扣费不计日 token
+        _usage = data.get("usage") or {}
+        if username and (_usage.get("prompt_tokens") or _usage.get("completion_tokens")):
+            from ..services.llm_streaming import record_token_usage
+            record_token_usage(_usage, username, "")
         # LLM 可能返回 ```json 包裹：走 _extract_json 容错解析
         from ..agents.sub_agents import _extract_json
-        return _extract_json(content)
+        result = _extract_json(content)
+        logger.info(
+            f"[map-perf] recommend city={city} total={time.perf_counter() - _t0:.2f}s "
+            f"(key={_t_key - _t0:.2f}s llm={_t_llm - _t_key:.2f}s parse={time.perf_counter() - _t_llm:.2f}s) "
+            f"model={data.get('model', '?')} tokens={(_usage.get('total_tokens') or 0)}")
+        return result
     except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError, httpx.HTTPStatusError):
-        return _default_rec
+        logger.warning(f"[map-perf] recommend city={city} 上游异常，返回兜底")
+        return _DEFAULT_REC
     except Exception as e:
-        logger.warning(f"recommend 解析失败（返回兜底）: {str(e)[:120]} | 原始内容: {str(data)[:120] if data else ''}")
-        return _default_rec
+        logger.warning(f"recommend 解析失败（返回兜底）: {str(e)[:120]}")
+        return _DEFAULT_REC
 
 
 @router.post("/route")
 async def plan_route(req: RouteRequest, current_user: dict = Depends(get_current_user)):
     """规划多段路线（支持高铁/飞机/火车/公交组合），返回每段的模式、起止城市、耗时"""
-    departure = req.departure
-    destination = req.destination
-    deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+    # 配额门禁（2026-09-07 审查 P1）：同 /recommend，原先绕过全部限额直烧 LLM token
+    from ..services.chat_stream_ctx import ensure_chat_allowed
+    from ..middleware.rate_limit import release_concurrent
+    await ensure_chat_allowed(current_user)
+    try:
+        return await _plan_route_llm(req.departure, req.destination, username=current_user["username"])
+    finally:
+        await release_concurrent(current_user["username"])
+
+
+async def _plan_route_llm(departure: str, destination: str, username: str = "") -> dict:
+    """路线规划正文（LLM 调用与解析），由 /route 在配额门禁内调用
+
+    username 供计量扣费（2026-09-09 审查 P1：原先只过门禁不扣费不计日 token）。
+    """
+    # Key 取法统一（2026-09-07 审查 P2）：与 /recommend 一致走池化轮询，不再裸读 env
+    from ..services.chat_support import get_deepseek_key
+    deepseek_key = await get_deepseek_key()
     if not deepseek_key:
         raise HTTPException(503, "路线规划服务暂不可用")
     prompt = f"""你是交通路线规划专家。请为从「{departure}」到「{destination}」规划合理的交通路线。
@@ -292,11 +435,16 @@ async def plan_route(req: RouteRequest, current_user: dict = Depends(get_current
         if resp.status_code != 200:
             raise HTTPException(502, "DeepSeek API error")
         data = resp.json()
+        # 计量扣费（2026-09-09 审查 P1）：/route 原先只过配额门禁，不扣费不计日 token
+        _usage = data.get("usage") or {}
+        if username and (_usage.get("prompt_tokens") or _usage.get("completion_tokens")):
+            from ..services.llm_streaming import record_token_usage
+            record_token_usage(_usage, username, "")
         try:
-            content = data["choices"][0]["message"]["content"]
             import json as _json
+            content = data["choices"][0]["message"]["content"]
             return _json.loads(content)
-        except:
+        except Exception:  # noqa: BLE001 — 解析失败回退直答路线（不泄露内部错误）
             return {"legs": [{"from": departure, "to": destination, "mode": "高铁", "duration_min": 120, "distance_km": 500}], "total_duration_min": 120, "total_distance_km": 500, "recommendation": f"从{departure}到{destination}建议乘坐高铁"}
 
 
@@ -311,7 +459,8 @@ async def amap_route(req: RouteRequest, current_user: dict = Depends(get_current
     dest = req.destination
 
     # 1. 先通过高德地理编码获取起终点经纬度
-    async with httpx.AsyncClient() as client:
+    # 显式超时（2026-09-07 审查 P2）：默认 5s×5 次连外重试，无超时上限
+    async with httpx.AsyncClient(timeout=MAP_API_TIMEOUT) as client:
         # 地理编码（地点→坐标）
         geo_dep_resp = await client.get("https://restapi.amap.com/v3/geocode/geo", params={
             "key": amap_key, "address": dep, "city": dep
@@ -362,11 +511,12 @@ async def amap_route(req: RouteRequest, current_user: dict = Depends(get_current
     # 驾车路线
     if driving_data.get("status") == "1" and driving_data.get("route", {}).get("paths"):
         path = driving_data["route"]["paths"][0]
+        # steps 为空数组时 [0] 会 IndexError（2026-09-07 审查 P2），or 兜底空对象
         result["driving"] = {
             "distance_km": round(int(path.get("distance", 0)) / 1000, 1),
             "duration_min": round(int(path.get("duration", 0)) / 60),
             "tolls": path.get("tolls", "0"),
-            "polyline": path.get("steps", [{}])[0].get("polyline", "")
+            "polyline": (path.get("steps") or [{}])[0].get("polyline", "")
         }
 
     # 公交/火车路线
@@ -441,7 +591,7 @@ async def get_geojson(adcode: str = "100000", current_user: dict = Depends(get_c
         url = "https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json"
     else:
         url = f"https://geo.datav.aliyun.com/areas_v3/bound/{adcode}_full.json"
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=MAP_API_TIMEOUT) as client:
         resp = await client.get(url, headers={"User-Agent": "AgentGateway/1.0"})
         if resp.status_code != 200:
             raise HTTPException(502, f"GeoJSON data fetch failed (HTTP {resp.status_code})")

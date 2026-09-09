@@ -151,9 +151,10 @@ async def dispatch_tool(name: str, args: dict, user_query: str = "",
         return await fetch_weather_async(
             args.get("city") or extract_destination(user_query) or user_query)
     if name in ("query_hotel", "query_route", "query_food"):
-        return await call_sub_agent(name, args, user_query)
+        return await call_sub_agent(name, args, user_query, username=username)
     if name == "search_knowledge":
-        return await search_knowledge(args.get("query") or user_query, permissions=permissions)
+        return await search_knowledge(args.get("query") or user_query, permissions=permissions,
+                                      username=username)
     if name == "web_search":
         # query 缺省时回退用户原话：LLM 漏传参不该搜出空查询
         return await web_search(args.get("query") or user_query, user_key=username)
@@ -169,7 +170,10 @@ async def build_file_context(req, username: str = "") -> str | None:
     username：属主校验（P2 修复 IDOR 形状）——meta.uploaded_by 不匹配即跳过该文件；
     与 get_user_file 的"仅上传者可读"同一语义。
     """
-    file_ids = getattr(req, "file_ids", None)
+    # 数量上限（2026-09-07 审查 P2）：每个 id 2 次 Redis GET，恶意超长列表可放大
+    # Redis 往返；与 models/schemas 的 file_ids 约束同值，schema 是源头、此处兜底
+    MAX_FILE_IDS = 5
+    file_ids = list(getattr(req, "file_ids", None) or [])[:MAX_FILE_IDS]
     if not file_ids:
         return None
     r = await get_redis()

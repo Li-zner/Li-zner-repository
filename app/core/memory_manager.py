@@ -6,6 +6,7 @@ from ..core.redis import get_redis
 from ..core.db import get_pool
 from ..core.logging import setup_logging
 from ..core.config import HISTORY_LIMIT, HISTORY_TTL, HISTORY_SUMMARY_TTL
+from ..core.concurrency import spawn
 from ..agents.memory import generate_summary
 
 logger = setup_logging()
@@ -24,8 +25,11 @@ class MemoryManager:
     def __init__(self, user_id: str, conv_id: str):
         self.user_id = user_id
         self.conv_id = conv_id
-        self._history_key = f"conv:{self.conv_id}"
-        self._summary_key = f"conv_summary:{self.conv_id}"
+        # Redis 键含 user_id（2026-09-09 审查 P0 IDOR 修复）：键只含 conv_id 时，
+        # 知道他人会话 ID 即可读其历史（注入 LLM 上下文）、写其热缓存（跨用户提示注入）；
+        # PG 回源本就按 user_id 过滤，热缓存同口径对齐（旧键随 TTL 自然过期）
+        self._history_key = f"conv:{self.user_id}:{self.conv_id}"
+        self._summary_key = f"conv_summary:{self.user_id}:{self.conv_id}"
 
     # ---------- 读路径：L1(Redis) -> L2(PG) 回填 ----------
     async def get_context(self, limit: int = HISTORY_LIMIT, offset: int = 0) -> List[Dict]:
@@ -47,14 +51,25 @@ class MemoryManager:
         # L1 缺失：从 PG 分页加载，回填 Redis
         pg_messages = await self._fetch_from_pg(limit, offset)
         if pg_messages and offset == 0:
-            # 仅首页回填 Redis 热缓存
-            pipe = redis.pipeline()
-            for msg in pg_messages:
-                pipe.rpush(self._history_key, json.dumps(msg))
-            pipe.expire(self._history_key, HISTORY_TTL)
-            await pipe.execute()
+            # 仅首页回填 Redis 热缓存。
+            # 原子回填（2026-09-07 审查 P1）：裸 pipeline 逐条 RPUSH 时，同会话并发冷启动
+            # 会把同一批消息写两遍（LLM 上下文重复，trim 只裁条数不去重）。
+            # Lua 内"列表为空才整批写入"原子完成，败者自动跳过，不重不丢。
+            await redis.eval(
+                self._BACKFILL_LUA, 1, self._history_key,
+                HISTORY_TTL, *[json.dumps(m) for m in pg_messages],
+            )
             pg_messages = await self._inject_summary(redis, pg_messages)
         return pg_messages
+
+    # 原子回填脚本：KEYS[1]=历史列表，ARGV[1]=TTL，ARGV[2:]=消息 JSON。
+    # 列表已存在（含并发回填/新消息先到）即放弃，杜绝重复回填。
+    _BACKFILL_LUA = """
+if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+for i = 2, #ARGV do redis.call('RPUSH', KEYS[1], ARGV[i]) end
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+return 1
+"""
 
     async def _inject_summary(self, redis, msgs: List[Dict]) -> List[Dict]:
         """把滚动压缩摘要注入为第一条（system），供 LLM 理解更早上下文"""
@@ -106,7 +121,8 @@ class MemoryManager:
         await redis.expire(self._history_key, HISTORY_TTL)
         await self._trim_and_compress(redis)
 
-        asyncio.create_task(self._save_to_pg(user_msg, assistant_msg))
+        # spawn 持强引用：裸 create_task 的后台任务可被 GC 中途回收（2026-09-07 审查 P2）
+        spawn(self._save_to_pg(user_msg, assistant_msg), name=f"save_pg:{self.conv_id}")
 
     # ---------- 条数限制 + 滚动压缩摘要 ----------
     # 原子裁剪：LLEN/LRANGE/LTRIM 三步合一。拆开执行时并发 append 会挤动下标，
@@ -125,7 +141,7 @@ return overflow
         try:
             overflow = await redis.eval(self._TRIM_LUA, 1, self._history_key, HISTORY_LIMIT)
             if overflow:
-                asyncio.create_task(self._compress_overflow(overflow))
+                spawn(self._compress_overflow(overflow), name=f"compress:{self.conv_id}")
         except Exception as e:
             logger.warning(f"对话历史条数裁剪失败: {e}")
 
@@ -139,7 +155,7 @@ return overflow
             if old_text and old_text.strip():
                 combined.append({"role": "system", "content": f"此前摘要：{old_text}"})
             combined.extend(json.loads(m) for m in overflow_msgs)
-            new_summary = await generate_summary(combined)
+            new_summary = await generate_summary(combined, username=self.user_id)
             if new_summary and new_summary.strip():
                 await redis.set(self._summary_key, new_summary, ex=HISTORY_SUMMARY_TTL)
         except Exception as e:

@@ -7,9 +7,11 @@
 import asyncio
 import json
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from ..core.db import get_pool
+from ..core.redis import get_redis
 from ..core.logging import setup_logging
 
 logger = setup_logging()
@@ -95,6 +97,10 @@ async def _compress_one_conversation(conn, row, cutoff) -> int:
         ORDER BY created_at ASC, id ASC
     """, row["user_id"], row["conversation_id"], cutoff)
 
+    # 空行守卫（2026-09-09 审查 P1）：分组查询与明细查询之间无锁，并发维护/另一实例
+    # 已压缩时明细可为 0 行，msg_rows[0] 直接 IndexError 并中断当日全部后续维护
+    if not msg_rows:
+        return 0
     msg_count = len(msg_rows)
     first_time = msg_rows[0]["created_at"].strftime("%Y-%m-%d %H:%M")
     last_time = msg_rows[-1]["created_at"].strftime("%Y-%m-%d %H:%M")
@@ -175,15 +181,9 @@ async def run_maintenance():
         await compress_old_conversations()
         await clean_expired_profiles()
         await clean_stale_cache()
-        # Bug #3：恢复超时卡死的 processing 支付订单（渠道调用期间进程崩溃/重启后
-        # 订单永不复原）。独立 try/except：支付表缺失或异常不影响其他维护任务。
-        try:
-            from ..payment.service import recover_stale_processing
-            await recover_stale_processing(age_seconds=300)
-        except Exception as e:
-            logger.warning(f"支付订单恢复跳过（不影响其他维护）: {e}")
         # 2026-09-05：补偿结算"钱包繁忙转待结算"的扣费单（见 payment/deferred.py），
-        # 独立 try/except 同上。
+        # 独立 try/except 同上。（原 recover_stale_processing 调用已随死代码删除：
+        # 全仓无路径会把订单写成 processing，2026-09-07 审查）
         try:
             from ..payment.deferred import settle_pending_deductions
             settled = await settle_pending_deductions()
@@ -197,8 +197,28 @@ async def run_maintenance():
 
 
 async def maintenance_loop(interval_hours: int = 24):
-    """定时维护循环"""
+    """定时维护循环
+
+    2026-09-09 审查 P1：多实例拓扑下每个实例的 lifespan 都起本循环，原先并发维护
+    既会重复压缩（双份摘要）又会互触发 IndexError。Redis NX 锁对齐 slow_query_watch
+    模式：拿不到锁的实例本轮跳过。
+    ponytail: 锁 TTL 1 小时为维护时长上界且无续期；超 1h 的极端维护可能被另一实例
+    并发进入，后果只是重复压缩（幂等），不丢数据——升级路径是 token 续期锁。
+    """
     while True:
-        await run_maintenance()
+        redis = await get_redis()
+        token = uuid.uuid4().hex
+        if await redis.set("lock:db_maintenance", token, nx=True, ex=3600):
+            try:
+                await run_maintenance()
+            finally:
+                # 仅持有者可释放（Lua 比对 token），防误删他人锁
+                await redis.eval(
+                    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                    "return redis.call('del', KEYS[1]) else return 0 end",
+                    1, "lock:db_maintenance", token,
+                )
+        else:
+            logger.info("本轮维护由其他实例执行，跳过")
         logger.info(f"下次维护在 {interval_hours} 小时后")
         await asyncio.sleep(interval_hours * 3600)

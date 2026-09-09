@@ -98,12 +98,16 @@ async def _consume_llm_stream(task_id: str, api_key: str, messages: list, tools:
 
 
 async def _run_discussion(user_query: str,
-                          tool_calls_list: list, tool_results: list, intent) -> str:
-    """多 Agent 圆桌讨论（只用匹配到的 Agent），返回讨论摘要；异常返回空串不中断任务。"""
+                          tool_calls_list: list, tool_results: list, intent,
+                          username: str = "") -> str:
+    """多 Agent 圆桌讨论（只用匹配到的 Agent），返回讨论摘要；异常返回空串不中断任务。
+
+    username 透传给编排器供圆桌 LLM 计费（2026-09-09 主人拍板）。
+    """
     try:
         from .orchestrator import AgentOrchestrator
         from .router import get_agent_names_for_orchestrator
-        orch = AgentOrchestrator(user_query)
+        orch = AgentOrchestrator(user_query, username=username)
         matched_agents = intent.get("agents", []) if intent else []
         agent_names = get_agent_names_for_orchestrator(matched_agents)
         if not agent_names:
@@ -156,7 +160,7 @@ async def _handle_tool_step(task_id: str, username: str, user_query: str,
         return "timeout"
 
     discussion_summary = await _run_discussion(
-        user_query, tool_calls_list, tool_results, intent)
+        user_query, tool_calls_list, tool_results, intent, username=username)
 
     # 工具结果喂回模型：错误工具换成友好兜底文案，不把原始报错透给用户
     tool_msgs = []
@@ -171,10 +175,14 @@ async def _handle_tool_step(task_id: str, username: str, user_query: str,
             elif "超时" in err:
                 fb = "查询超时，请稍后再试"
             result = {"error": err, "fallback_message": fb, "success": False}
+        # 外部内容消毒（2026-09-09 审查 P1）：web_search 等工具结果含外部网页
+        # title/body，原样进 tool 消息可携带提示词注入；复用 orchestrator 既有
+        # _sanitize_context（圆桌路径已用），不新写
+        from .orchestrator import _sanitize_context
         tool_msgs.append({
             "role": "tool",
             "tool_call_id": tool_calls_list[idx]["id"],
-            "content": json.dumps(result, ensure_ascii=False)
+            "content": _sanitize_context(json.dumps(result, ensure_ascii=False))
         })
 
     messages.append({
@@ -222,26 +230,48 @@ async def _fallback_flash(user_query: str, username: str):
         return
     from ..core.safety_filter import get_filter
     sf = get_filter()
+    _usage = None  # include_usage 尾块用量（2026-09-09 计费收口）
+    _full = ""     # 断连估算用已产出累积（2026-09-09 P1）
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_LONG) as client:
         async with client.stream(
             "POST", f"{DEEPSEEK_API_BASE}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": DEEPSEEK_FLASH_MODEL, "messages": [{"role": "user", "content": user_query}], "max_tokens": 1024},
+            json={"model": DEEPSEEK_FLASH_MODEL, "messages": [{"role": "user", "content": user_query}],
+                  "stream_options": {"include_usage": True}, "max_tokens": 1024},
         ) as resp:
             resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if line.startswith("data:"):
-                    data_str = line[5:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(data_str)
-                        chunk = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                        if chunk:
-                            result = sf.check_stream(chunk)
-                            if not result['safe']:
-                                yield sf.safe_message
-                                return
-                            yield chunk
-                    except json.JSONDecodeError:
-                        continue  # 非数据行/残包：跳过继续读流（P2 修复：不再裸 pass）
+            try:
+                async for line in resp.aiter_lines():
+                    if line.startswith("data:"):
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                            # include_usage 尾块 choices 为空，取值须容忍（同 chat_fallback 修复）
+                            if data.get("usage"):
+                                _usage = data["usage"]
+                            choices = data.get("choices") or [{}]
+                            chunk = choices[0].get("delta", {}).get("content", "")
+                            if chunk:
+                                _full += chunk
+                                result = sf.check_stream(chunk)
+                                if not result['safe']:
+                                    yield sf.safe_message
+                                    return
+                                yield chunk
+                        except json.JSONDecodeError:
+                            continue  # 非数据行/残包：跳过继续读流（P2 修复：不再裸 pass）
+            except (GeneratorExit, asyncio.CancelledError):
+                # 断连/取消估算计费（2026-09-09 审查 P1）：直连 httpx 无法安全排空，
+                # 退化按已产出文本估算（正常完成路径已在下方按真实 usage 计费）
+                from ..services.llm_streaming import _estimate_tokens, record_token_usage
+                if username and _full:
+                    record_token_usage(
+                        {"prompt_tokens": 0, "completion_tokens": _estimate_tokens(_full)},
+                        username, "",
+                        remark=f"断连估算补计费（任务降级 {_estimate_tokens(_full)} tokens）")
+                raise
+            # 计入计费（2026-09-09 主人拍板）：任务降级路径原先零计量
+            if _usage:
+                record_token_usage(_usage, username, "")

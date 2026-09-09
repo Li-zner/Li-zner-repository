@@ -1,10 +1,14 @@
 import os
+import asyncio
 import redis.asyncio as aioredis
 from urllib.parse import urlparse
 from .logging import setup_logging
 
 logger = setup_logging()
 redis_client = None
+# 并发首调双检锁（2026-09-07 审查 P2）：lifespan 先启概率低，但直调 get_redis 的
+# 脚本/测试路径可能并发首调，无锁会双初始化连接池
+_init_lock = asyncio.Lock()
 
 # Redis 连接池上限（默认 20，可从环境变量覆盖；P0 去掉硬编码）
 REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "20"))
@@ -55,10 +59,12 @@ async def init_redis():
 
 
 async def get_redis():
-    """获取 Redis 客户端（首次调用时自动初始化）"""
+    """获取 Redis 客户端（首次调用时自动初始化，双检锁防并发双初始化）"""
     global redis_client
     if redis_client is None:
-        await init_redis()
+        async with _init_lock:
+            if redis_client is None:
+                await init_redis()
     return redis_client
 
 

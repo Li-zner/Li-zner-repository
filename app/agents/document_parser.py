@@ -4,6 +4,7 @@
 """
 import os
 import io
+import time
 import zipfile
 import asyncio
 import threading
@@ -13,6 +14,16 @@ logger = setup_logging()
 
 # OCR 引擎串行化锁：RapidOCR 内部 ONNX Runtime 不支持并发调用（P1 #43）
 _OCR_LOCK = threading.Lock()
+
+# ---------- 解析资源上限（2026-09-07 审查 P1）----------
+# 20MB 大小限制约束不了页数/内嵌图数：1MB PDF 可含上万页/图，每页渲染 150dpi+
+# OCR（全局锁串行）→ 单个恶意上传可占住 OCR 通道小时级并占满执行线程池。
+# 超限截断并注明，不整体失败——正常文档远低于此阈值。
+_MAX_PDF_PAGES = 200        # PDF 最大处理页数
+_MAX_OCR_IMAGES = 50        # 单文档最大 OCR 图片数（内嵌图/整页渲染共用）
+_PARSE_DEADLINE_S = 60.0    # 单文档解析 wall-clock 预算
+# ponytail: deadline 是协作式检查（页/图粒度），单次 OCR 无法抢占，
+# 实际耗时最多超出预算一次单页 OCR；如需硬中断改子进程隔离。
 
 # ============================================================
 # 图片 OCR 引擎（RapidOCR 优先，Tesseract 降级）
@@ -100,15 +111,29 @@ except ImportError:
     _HAS_PDF = False
     logger.warning("PyMuPDF 未安装，PDF 解析不可用")
 
+def _truncation_note(pages: int, images: int, seconds: float, reason: str) -> str:
+    """截断标注（拼在文本尾部，让上层与用户知道内容不完整）"""
+    return (f"\n\n[文档过大已截断：处理了 {pages} 页 / {images} 张图 / {seconds:.0f} 秒，"
+            f"原因：{reason}；其余内容未解析]")
+
+
 def _render_pages_ocr(filepath: str) -> str:
     """整页渲染 + 逐页 OCR（纯扫描件兜底）。
 
     旧实现把 PDF 路径直接丢给图片 OCR 引擎（RapidOCR/Tesseract 都打不开 PDF），必然失败；
     这里用 fitz 把每页渲染成位图再走统一的 OCR 通道。
+    受页数上限与 deadline 约束（2026-09-07 审查 P1）。
     """
     parts = []
+    started = time.monotonic()
     with fitz.open(filepath) as doc:
         for page_num, page in enumerate(doc):
+            if page_num + 1 > _MAX_PDF_PAGES:
+                parts.append(_truncation_note(_MAX_PDF_PAGES, 0, time.monotonic() - started, "页数超限"))
+                break
+            if time.monotonic() - started > _PARSE_DEADLINE_S:
+                parts.append(_truncation_note(page_num, 0, time.monotonic() - started, "解析超时"))
+                break
             pix = page.get_pixmap(dpi=150)
             ocr_text = _ocr_image_bytes(pix.tobytes("png"), "png", f"第{page_num+1}页")
             if ocr_text and ocr_text.strip():
@@ -124,16 +149,32 @@ async def parse_pdf(filepath: str) -> str:
 
     def _extract_all():
         text_parts = []
+        started = time.monotonic()
+        page_count = 0
+        img_count = 0
+        stop_reason = ""
         with fitz.open(filepath) as doc:
             for page_num, page in enumerate(doc):
+                page_count += 1
+                if page_count > _MAX_PDF_PAGES:
+                    stop_reason = "页数超限"
+                    page_count = _MAX_PDF_PAGES
+                    break
+                if time.monotonic() - started > _PARSE_DEADLINE_S:
+                    stop_reason = "解析超时"
+                    break
                 # 1. 提取文本
                 text = page.get_text()
                 if text.strip():
                     text_parts.append(f"--- 第 {page_num+1} 页 ---\n{text}")
 
-                # 2. 提取本页内嵌图片做 OCR
+                # 2. 提取本页内嵌图片做 OCR（受图片总数上限约束）
                 images_on_page = page.get_images(full=True)
                 for img_idx, img_ref in enumerate(images_on_page):
+                    img_count += 1
+                    if img_count > _MAX_OCR_IMAGES:
+                        stop_reason = "内嵌图片数超限"
+                        break
                     xref = img_ref[0]  # 图片引用编号
                     try:
                         img_dict = doc.extract_image(xref)
@@ -145,7 +186,14 @@ async def parse_pdf(filepath: str) -> str:
                     except Exception as img_err:
                         # 单张内嵌图片损坏不该废掉整份文档，跳过并留排查日志（P2 修复：不再裸 pass）
                         logger.debug(f"跳过无法解析的内嵌图片(第{page_num+1}页-图{img_idx+1}): {img_err}")
+                if img_count > _MAX_OCR_IMAGES:
+                    break
 
+        if stop_reason:
+            # 超限截断如实标注（内容不完整必须让调用方知道，2026-09-07 审查 P1）
+            text_parts.append(_truncation_note(
+                page_count, min(img_count, _MAX_OCR_IMAGES),
+                time.monotonic() - started, stop_reason))
         return "\n\n".join(text_parts) if text_parts else ""
 
     try:
@@ -232,9 +280,10 @@ async def parse_docx(filepath: str) -> str:
         if tables_text:
             parts.append("【表格内容】\n" + "\n".join(tables_text))
 
-        # 3. 提取内嵌图片做 OCR
+        # 3. 提取内嵌图片做 OCR（受图片数上限与 deadline 约束，2026-09-07 审查 P1）
         # .docx 本质是 ZIP，图片在 word/media/ 下
         ocr_results = []
+        started = time.monotonic()
         try:
             with zipfile.ZipFile(filepath, 'r') as z:
                 # Zip Slip 防护（P0 #4）：仅读取 word/media/ 下无路径穿越的成员。
@@ -247,6 +296,12 @@ async def parse_docx(filepath: str) -> str:
                     and '..' not in f.split('/')
                 ]
                 for idx, media_path in enumerate(sorted(media_files)):
+                    if idx + 1 > _MAX_OCR_IMAGES:
+                        ocr_results.append(f"[截断：内嵌图片超过 {_MAX_OCR_IMAGES} 张，其余未解析]")
+                        break
+                    if time.monotonic() - started > _PARSE_DEADLINE_S:
+                        ocr_results.append("[截断：图片 OCR 超时，其余未解析]")
+                        break
                     img_bytes = z.read(media_path)
                     ext = os.path.splitext(media_path)[1].lstrip('.')
                     label = f"文档插图{idx+1}"

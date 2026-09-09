@@ -113,6 +113,8 @@
       color: var(--text-secondary);
       margin-bottom: 16px;
       padding-bottom: 12px;
+      white-space: pre-line;
+      line-height: 1.6;
       border-bottom: 1px dashed #d0e0d0;
     }
 
@@ -453,6 +455,8 @@
   color: #2b6cb0;
   font-size: 14px;
   margin: 6px 0 10px;
+  white-space: pre-line;
+  line-height: 1.6;
 }
 .map-page .bubble .section {
   margin: 10px 0;

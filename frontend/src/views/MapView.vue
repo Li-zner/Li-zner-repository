@@ -50,6 +50,13 @@ const favorites = ref<string[]>(loadList(StorageKey.MapFavorites))
 const history = ref<string[]>(loadList(StorageKey.MapHistory))
 const historyOpen = ref(false)
 const zoomPercent = ref(100)
+/** 手机端缩放基准：≤768px 视口小，全国视野放大 1.7 倍作为 100% 基准；50%–500% 硬限
+ *  由 geo.scaleLimit 原生执行（丝滑连续），事件处理只同步读数不再 setOption 干预手势 */
+const zoomFactor = ref(1)
+function updateZoomFactor(): void {
+  zoomFactor.value = window.innerWidth <= 768 ? 1.7 : 1
+}
+let lastGeoZoom = 1
 /** 点击保护：刷新定位 10s / 随机城市 5s，防连点造成定位与地图重绘卡顿 */
 const locateCd = ref(0)
 const randomCd = ref(0)
@@ -92,21 +99,23 @@ async function showCityInfo(city: string, adcode?: string | number | null) {
   weather.value = t('map_loading')
   foods.value = []
   spots.value = []
-  const [weatherRes, recRes] = await Promise.allSettled([
-    getWeather(city, adcode ?? undefined),
-    getRecommendations(city),
-  ])
-  // 期间用户已切到别的城市：整体丢弃，防止过期数据回写
-  if (seq !== infoSeq) return
-  if (weatherRes.status === 'fulfilled') weather.value = weatherRes.value
-  else weather.value = t('map_no_data')
-  if (recRes.status === 'fulfilled') {
-    foods.value = recRes.value.foods
-    spots.value = recRes.value.spots
-  } else {
+  // 先到先显：天气（亚秒级）不被推荐（LLM，秒级~十几秒）拖住，各自就绪各自上屏；
+  // seq 守卫防止期间切换城市的过期数据回写
+  getWeather(city, adcode ?? undefined).then((w) => {
+    if (seq !== infoSeq) return
+    weather.value = w
+  }).catch(() => {
+    if (seq === infoSeq) weather.value = t('map_no_data')
+  })
+  getRecommendations(city).then((r) => {
+    if (seq !== infoSeq) return
+    foods.value = r.foods
+    spots.value = r.spots
+  }).catch(() => {
+    if (seq !== infoSeq) return
     foods.value = [t('map_no_recommend')]
     spots.value = [t('map_no_recommend')]
-  }
+  })
   history.value = [city, ...history.value.filter((c) => c !== city)].slice(0, 30)
   saveList(StorageKey.MapHistory, history.value)
 }
@@ -115,7 +124,7 @@ async function refreshRecommendations() {
   const city = currentCity
   if (!city) return
   const seq = infoSeq
-  const [recRes] = await Promise.allSettled([getRecommendations(city)])
+  const [recRes] = await Promise.allSettled([getRecommendations(city, true)])
   if (seq !== infoSeq || city !== currentCity) return
   if (recRes.status === 'fulfilled') {
     foods.value = recRes.value.foods
@@ -163,23 +172,45 @@ function computeProvinceCenter(geo: GeoJson): [number, number] | undefined {
 function renderGeo(geo: GeoJson, mapName: string, initZoom: number, center?: [number, number]): void {
   if (!chart) return
   echarts.registerMap(mapName, geo as Parameters<typeof echarts.registerMap>[1])
+  zoomPercent.value = Math.round(initZoom * 100)
+  lastGeoZoom = initZoom * zoomFactor.value
   chart.setOption({
     geo: {
-      map: mapName, roam: true, zoom: initZoom, center: center ?? undefined,
+      map: mapName, roam: true, zoom: initZoom * zoomFactor.value, center: center ?? undefined,
+      // 50%–500% 硬边界交给 echarts 原生手势内执行：连续丝滑、松手不回弹
+      scaleLimit: { min: 0.5 * zoomFactor.value, max: 5 * zoomFactor.value },
       label: { show: false },
       itemStyle: { borderColor: '#b0c8b0', borderWidth: 1 },
       emphasis: { label: { show: false } },
     },
-    series: [{
-      type: 'scatter', coordinateSystem: 'geo',
-      data: computeCenters(geo.features), symbolSize: 0,
-      label: { show: true, color: '#2d4a2d', fontSize: 11, formatter: '{b}' },
-      tooltip: { show: false }, silent: true, z: 2,
-    }],
+    series: [
+      {
+        type: 'scatter', coordinateSystem: 'geo',
+        data: computeCenters(geo.features), symbolSize: 0,
+        label: { show: true, color: '#2d4a2d', fontSize: 11, formatter: '{b}' },
+        tooltip: { show: false }, silent: true, z: 2,
+      },
+      // 港澳点击热区（仅省视图）：领土太小移动端难点中，标记落近海一侧扩一点
+      // 有效范围——不压深圳/珠海，也不会点不到；透明符号只做点击承接
+      ...(mapName === 'china' ? [{
+        type: 'scatter', coordinateSystem: 'geo', silent: false, z: 3,
+        symbolSize: 34, itemStyle: { color: 'transparent' },
+        label: { show: false }, tooltip: { show: false }, emphasis: { disabled: true },
+        data: [
+          { name: '香港', value: [114.26, 22.08] },
+          { name: '澳门', value: [113.55, 22.03] },
+        ],
+      }] : []),
+    ],
   })
   chart.off('click')
   chart.on('click', (params) => {
-    if (!params.name || params.componentType !== 'geo') { closeBubble(); return }
+    const name = params.name
+    if (!name) { closeBubble(); return }
+    // 两类有效点击：geo 区域本体 + 港澳近海热区标记（scatter）
+    const geoClick = params.componentType === 'geo'
+    const markerClick = params.seriesType === 'scatter' && (name === '香港' || name === '澳门')
+    if (!geoClick && !markerClick) { closeBubble(); return }
     if (currentLevel === 'province') {
       const MUNI = ['北京', '天津', '上海', '重庆', '香港', '澳门']
       if (MUNI.some((kw) => params.name!.startsWith(kw))) {
@@ -192,12 +223,15 @@ function renderGeo(geo: GeoJson, mapName: string, initZoom: number, center?: [nu
       showCityInfo(displayName(params.name!), findAdcode(geo, params.name!))
     }
   })
-  // 滚轮/拖拽漫游：同步右下角缩放比例
+  // 滚轮/捏合漫游：echarts 原生连续缩放（scaleLimit 兜底硬边界），这里只同步读数，
+  // 不再 setOption 干预手势——逐事件 setOption 与手势内部状态互殴正是"松手回弹"的根源
   chart.off('georoam')
   chart.on('georoam', () => {
     const opt = chart?.getOption() as { geo?: { zoom?: number }[] } | undefined
     const z = opt?.geo?.[0]?.zoom
-    if (z) zoomPercent.value = Math.round(z * 100)
+    if (!z) return
+    lastGeoZoom = z
+    zoomPercent.value = Math.round((z / zoomFactor.value) * 100)
   })
 }
 
@@ -306,14 +340,21 @@ function randomCity(): void {
 
 function setZoom(percent: number): void {
   if (!chart) return
-  const v = Math.max(50, Math.min(300, percent))
-  chart.setOption({ geo: { zoom: v / 100 } })
+  const v = Math.max(50, Math.min(500, percent))
+  lastGeoZoom = (v / 100) * zoomFactor.value
+  chart.setOption({ geo: { zoom: lastGeoZoom } })
   zoomPercent.value = v
 }
 
-function resize(): void { chart?.resize() }
+function resize(): void {
+  updateZoomFactor()
+  chart?.resize()
+  // 视口跨 768px 后基准变了，scaleLimit 硬边界同步跟随
+  chart?.setOption({ geo: { scaleLimit: { min: 0.5 * zoomFactor.value, max: 5 * zoomFactor.value } } })
+}
 
 onMounted(async () => {
+  updateZoomFactor()
   window.addEventListener('resize', resize)
   await loadProvinceMap()
   const loc = await locate(false)
@@ -367,7 +408,7 @@ onBeforeUnmount(() => {
           type="range"
           class="zoom-slider"
           min="50"
-          max="300"
+          max="500"
           :value="zoomPercent"
           @input="setZoom(Number(($event.target as HTMLInputElement).value))"
         >
@@ -414,7 +455,7 @@ onBeforeUnmount(() => {
         <button @click="historyOpen = false">✕</button>
       </div>
       <template v-if="favorites.length">
-        <p class="label">⭐ {{ t('map_favorites') }}</p>
+        <p class="label">收藏</p>
         <div class="fav-chips">
           <span
             v-for="c in favorites"
@@ -428,7 +469,7 @@ onBeforeUnmount(() => {
         </div>
       </template>
 
-      <p class="label" style="margin-top: 10px;">📖 最近浏览</p>
+      <p class="label" style="margin-top: 10px;">历史</p>
       <div
         v-for="c in history"
         :key="'h-' + c"

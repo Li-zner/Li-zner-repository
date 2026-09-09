@@ -15,6 +15,7 @@ import json
 import os
 import time
 import asyncio
+import uuid
 import httpx
 from typing import List, Dict, Optional
 from ..core.logging import setup_logging
@@ -140,7 +141,7 @@ def classify_by_keywords(query: str) -> Dict:
     }
 
 
-async def classify_by_llm(query: str) -> Dict:
+async def classify_by_llm(query: str, username: str = "") -> Dict:
     """
     基于 LLM 的轻量意图分类（用于关键词无法判断的边界情况）
     只做分类，不生成回答，token 消耗极小。
@@ -195,6 +196,12 @@ async def classify_by_llm(query: str) -> Dict:
             content = data["choices"][0]["message"]["content"]
             result = json.loads(content)
             result["method"] = "llm"
+            # 计入计费（2026-09-09 主人拍板）：意图分类属用户请求触发（当前两调用方
+            # 均 use_llm=False，本路径为预留；口径先对齐，启用即计费）
+            _usage = data.get("usage") or {}
+            if username and (_usage.get("prompt_tokens") or _usage.get("completion_tokens")):
+                from ..services.llm_streaming import record_token_usage
+                record_token_usage(_usage, username, "")
             # 确保 is_recommend 字段存在
             if "is_recommend" not in result:
                 result["is_recommend"] = False
@@ -206,7 +213,7 @@ async def classify_by_llm(query: str) -> Dict:
         return kw_result
 
 
-async def classify_intent(query: str, use_llm: bool = False) -> Dict:
+async def classify_intent(query: str, use_llm: bool = False, username: str = "") -> Dict:
     """
     统一的意图分类入口
 
@@ -218,7 +225,7 @@ async def classify_intent(query: str, use_llm: bool = False) -> Dict:
         {"agents": [...], "is_simple": bool, "is_recommend": bool, "method": str}
     """
     if use_llm:
-        return await classify_by_llm(query)
+        return await classify_by_llm(query, username=username)
     return classify_by_keywords(query)
 
 
@@ -283,10 +290,12 @@ async def _call_simple_tool(agent_name: str, user_query: str,
     return {"error": f"未知工具: {agent_name}"}
 
 
-async def _format_via_llm(api_key: str, system: str, user_query: str) -> Optional[str]:
+async def _format_via_llm(api_key: str, system: str, user_query: str,
+                          username: str = "") -> Optional[str]:
     """简单任务第 2 步：单次 LLM 格式化（带 token 计量）。
 
     失败返回 None，调用方降级用工具原始结果，不让任务报错。
+    username 供扣费（2026-09-09 审查 P0 收口：简单任务原先与 runner 同款只打指标）。
     """
     from ..core.config import DEEPSEEK_MODEL, llm_endpoint
     from ..core.metrics import llm_tokens_total, llm_tokens_detail, llm_requests_total
@@ -321,6 +330,12 @@ async def _format_via_llm(api_key: str, system: str, user_query: str) -> Optiona
                 llm_tokens_detail.labels(model=DEEPSEEK_MODEL, endpoint='simple_task', type='input').inc(pt)
                 llm_tokens_detail.labels(model=DEEPSEEK_MODEL, endpoint='simple_task', type='output').inc(ct)
             llm_requests_total.labels(model=DEEPSEEK_MODEL, endpoint='simple_task', status='success').inc()
+            # 扣费收口（2026-09-09 审查 P0）：指标已由上方 simple_task 打点，
+            # 复用不含指标的 bill_token_usage 补钱包扣费与日 token 计数
+            if username and (pt or ct):
+                from ..services.llm_streaming import bill_token_usage
+                bill_token_usage(usage, username, "",
+                                 remark=f"Agent任务消耗 {pt + ct} tokens（输入 {pt} + 输出 {ct}）")
             return content
     except Exception as e:
         logger.warning(f"简单任务 LLM 格式化失败: {e}")
@@ -337,14 +352,15 @@ async def handle_simple_task(
     file_ids: Optional[List[str]] = None,
     cache_ctx: str = "",
     lang: str = "zh",
-    # 知识库检索权限：默认仅公开（fail-closed）；None=不过滤只能由 admin 显式传入（P0 修复）
-    user_perms: list | None = [],
+    # 知识库检索权限：默认仅公开（fail-closed）；None=不过滤只能由 admin 显式传入（P0 修复）。
+    # 默认 () 而非 None/[]：理由见 runner.run_agent_task 同名参数（2026-09-07 审查 P2）
+    user_perms: list | tuple | None = (),
 ):
     """简单任务处理（不走圆桌）：调单工具 → 单次 LLM 格式化 → 分块写 Redis → 存记忆/缓存"""
     from ..core.task_manager import update_status, append_result, cleanup_event
     from ..core.memory_manager import MemoryManager
 
-    conv_id = conversation_id or f"conv_{username}_{int(time.time())}"
+    conv_id = conversation_id or f"conv_{username}_{uuid.uuid4().hex[:12]}"
     mm = MemoryManager(username, conv_id)
 
     try:
@@ -377,7 +393,7 @@ async def handle_simple_task(
             if file_ctx:
                 prompt["system"] += f"\n\n{file_ctx}"
 
-        answer = await _format_via_llm(api_key, prompt["system"], user_query)
+        answer = await _format_via_llm(api_key, prompt["system"], user_query, username=username)
         # LLM 格式化失败 → 降级直接返回工具原始结果
         final_answer = answer if answer is not None else json.dumps(tool_result, ensure_ascii=False)
 
@@ -460,13 +476,16 @@ def _build_simple_prompt(query: str, agent_name: str, tool_result: dict,
     system += lang_instruction(lang)
 
     # 注入工具结果
+    # 外部内容消毒（2026-09-09 审查 P1）：web_search 结果原样进 system prompt 可携带
+    # 提示词注入；复用 orchestrator 既有 _sanitize_context（圆桌路径已用），不新写
+    from .orchestrator import _sanitize_context
     system += (
         f"\n\n你使用工具 [{agent_name}] 查询到了以下结果。\n\n"
         f"## 核心规则（必须遵守）\n"
         f"1. **禁止编造**：只能基于工具返回的数据回答，不能编造任何具体数据（价格、距离、气温、评分等）\n"
         f"2. **先推荐再追问**：如果用户是求推荐，第一句就直接给推荐方案，不要反问\n"
         f"3. **数据不足时**：明确告诉用户哪些信息是工具提供的，哪些是估算的\n\n"
-        f"工具返回的数据：\n{json.dumps(tool_result, ensure_ascii=False, indent=2)}"
+        f"工具返回的数据：\n{_sanitize_context(json.dumps(tool_result, ensure_ascii=False, indent=2))}"
     )
 
     return {

@@ -9,6 +9,7 @@ Agent 后台任务运行器 — 编排层（2026-09-05 重构：步骤原语拆�
 import asyncio
 import os
 import time
+import uuid
 
 from ..core.logging import setup_logging
 from ..core.quota import inc_used_questions
@@ -20,6 +21,7 @@ from ..core.task_manager import (
     get_cancel_event
 )
 from ..core.semantic_cache import SemanticCache, safe_set
+from ..core.concurrency import spawn
 from .router import classify_intent, handle_simple_task
 from .react_steps import (
     _consume_llm_stream, _handle_tool_step, _stream_fallback, _finish_cancelled,
@@ -130,7 +132,7 @@ async def _maybe_simple_task(task_id: str, username: str, conversation_id: str,
     (False, intent) 继续主流程；路由异常降级为复杂任务不中断（intent=None）。
     """
     try:
-        intent = await classify_intent(user_query, use_llm=False)
+        intent = await classify_intent(user_query, use_llm=False, username=username)
         logger.info(f"意图分类: agents={intent['agents']}, simple={intent['is_simple']}, method={intent.get('method','?')}")
 
         if intent["is_simple"] and intent["agents"]:
@@ -219,6 +221,12 @@ async def _run_react_loop(task_id: str, username: str, user_query: str,
             llm_tokens_detail.labels(model=DEEPSEEK_MODEL, endpoint='v2_task', type='input').inc(pt)
             llm_tokens_detail.labels(model=DEEPSEEK_MODEL, endpoint='v2_task', type='output').inc(ct)
         llm_requests_total.labels(model=DEEPSEEK_MODEL, endpoint='v2_task', status='success').inc()
+        # 2026-09-09 审查 P0：任务路径原先只打指标，从不扣费也不计日 token
+        # （"旁路漏扣费"历史教训同类）；指标已由上方 v2_task 打点，复用不含指标的
+        # bill_token_usage 补齐钱包扣费与日 token 计数，避免双计
+        from ..services.llm_streaming import bill_token_usage
+        bill_token_usage(state["usage"], username, task_id,
+                         remark=f"Agent任务消耗 {pt + ct} tokens（输入 {pt} + 输出 {ct}）")
 
         # 检查是否有工具调用（内容被 DFA 拦截时不进入工具分支，直接走完成路径）
         if state["has_tool_calls"] and state["tool_calls_index"] and not state["blocked"]:
@@ -263,16 +271,19 @@ async def run_agent_task(
     persona_id: str = "",
     file_ids=None,
     lang: str = "zh",
-    # 知识库检索权限：默认仅公开（fail-closed）；None=不过滤只能由 admin 显式传入（P0 修复）
-    user_perms: list | None = [],
+    # 知识库检索权限：默认仅公开（fail-closed）；None=不过滤只能由 admin 显式传入（P0 修复）。
+    # 默认用不可变 () 而非 None/[]：[] 可变默认参是隐患，None 在 search_knowledge
+    # 语义是"不过滤"（fail-open），省略调用会变成宽权限（2026-09-07 审查 P2，按语义修正）
+    user_perms: list | tuple | None = (),
 ):
     """后台运行 Agent，逐步写入 Redis；前端轮询 /v2/chat/tasks/{task_id}/result 获取进度。
     编排：语义缓存/重建锁 → 意图路由 → 构建消息 → ReAct 主循环；步骤原语见 react_steps.py。"""
     cancel_ev = get_cancel_event(task_id)
-    conv_id = conversation_id or f"conv_{username}_{int(time.time())}"
+    # uuid 后缀（与 chat_stream_ctx 同一修复）：秒级时间戳同秒并发任务共用会话
+    conv_id = conversation_id or f"conv_{username}_{uuid.uuid4().hex[:12]}"
     mm = MemoryManager(username, conv_id)
-    # 任务也算一次提问（GitHub 试用额度全局共享，所有助手）；异步失败不静默（P1 #35）
-    _ = asyncio.create_task(_safe_inc_used_questions(username))
+    # 任务也算一次提问（GitHub 试用额度全局共享，所有助手）；spawn 持引用+异常记日志
+    spawn(_safe_inc_used_questions(username), name=f"inc-q:{task_id}")
     _cache_ctx = await _build_cache_ctx(mm, persona_id)
 
     rebuild_lock_token, renew_task = None, None
@@ -324,16 +335,27 @@ async def run_agent_task(
         from ..core.safety_filter import sanitize_error_text
         # 异常 str 可能带完整 URL/Key，剥指纹后再进任务状态（前端原样展示）
         await update_status(task_id, "error", sanitize_error_text(str(e)))
-        cleanup_event(task_id)
     finally:
-        # 取消续期协程；释放重建锁（仅持有者释放；失败由 TTL 自愈，P0 #1）
-        if renew_task:
-            renew_task.cancel()
-        if rebuild_lock_token:
-            try:
-                await SemanticCache.release_rebuild_lock(user_query, rebuild_lock_token, cache_ctx=_cache_ctx)
-            except Exception as _rel_err:
-                logger.warning(f"重建锁释放失败（由 TTL 自愈，不影响任务结果）: {_rel_err}")
+        await _release_task_resources(task_id, renew_task, rebuild_lock_token, user_query, _cache_ctx)
+
+
+async def _release_task_resources(task_id: str, renew_task, rebuild_lock_token,
+                                  user_query: str, cache_ctx: str) -> None:
+    """任务收尾统一清理：取消事件 + 续期协程 + 重建锁。
+
+    取消事件统一在此清理（2026-09-07 审查 P2，对应 core/task_manager _cancel_events
+    慢性泄漏项）：此前散落在各路径，异常/早退路径漏清会慢性泄漏（task_id 为 uuid
+    不复用）；pop 幂等，与散落调用并存无害。
+    """
+    cleanup_event(task_id)
+    # 取消续期协程；释放重建锁（仅持有者释放；失败由 TTL 自愈，P0 #1）
+    if renew_task:
+        renew_task.cancel()
+    if rebuild_lock_token:
+        try:
+            await SemanticCache.release_rebuild_lock(user_query, rebuild_lock_token, cache_ctx=cache_ctx)
+        except Exception as _rel_err:
+            logger.warning(f"重建锁释放失败（由 TTL 自愈，不影响任务结果）: {_rel_err}")
 
 
 async def _build_task_messages(mm, username: str, user_query: str,

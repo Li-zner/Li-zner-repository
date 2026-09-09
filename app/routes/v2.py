@@ -4,13 +4,14 @@
 （chat_stream_core / chat_fast_paths / chat_react / file_upload / agent_tasks 等）。
 行为等价，公开契约不变：router（main.py 引用）与 /v2/* HTTP 端点。
 """
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from ..middleware.auth import get_current_user
 from ..models.schemas import ChatRequest, CreateTaskRequest
 from ..core.task_manager import get_task
+from ..core.quota import is_quota_exhausted
 from ..services.agent_tasks import (
     cancel_agent_task, create_agent_task, ensure_task_access, resume_agent_task, wait_task_result,
     task_user_perms,
@@ -109,7 +110,9 @@ async def get_task_result(
     task = await get_task(task_id)
     if not task:
         return JSONResponse({"error": "task not found"}, status_code=404)
-    ensure_task_access(task, current_user)
+    # P0 修复（2026-09-07 审查）：ensure_task_access 是 (task, username, role) 三参定义，
+    # 原两参调用运行时 TypeError，/result /cancel /resume 三端点全部 500
+    ensure_task_access(task, current_user["username"], current_user["role"])
     return await wait_task_result(task_id, task, wait)
 
 
@@ -122,7 +125,7 @@ async def cancel_task(
     task = await get_task(task_id)
     if not task:
         return JSONResponse({"error": "task not found"}, status_code=404)
-    ensure_task_access(task, current_user)
+    ensure_task_access(task, current_user["username"], current_user["role"])
     return await cancel_agent_task(task_id, task)
 
 
@@ -135,6 +138,12 @@ async def resume_task(
     task = await get_task(task_id)
     if not task:
         return JSONResponse({"error": "task not found"}, status_code=404)
-    ensure_task_access(task, current_user)
+    ensure_task_access(task, current_user["username"], current_user["role"])
+    # 试用额度复查（2026-09-09 审查 P1）：与 create_agent_task 对齐——服务层注释
+    # 声称"resume 也复查"，实际 _task_quota_gate 只查日配额，额度耗尽用户可借
+    # resume 无限重跑 LLM 任务绕过试用上限
+    if current_user.get("role") != "admin" and is_quota_exhausted(current_user):
+        raise HTTPException(status_code=402, detail="免费额度已用完，请绑定手机号后继续使用")
     return await resume_agent_task(task_id, task, current_user["username"],
-                                   task_user_perms(current_user))
+                                   task_user_perms(current_user),
+                                   role=current_user["role"])

@@ -4,7 +4,9 @@
 /health 为存活探针、/ready 为就绪探针（供 K8s 滚动分流），均做 PG+Redis 深度依赖检查；
 /metrics 供 Prometheus 抓取；/test-otel 用于 OTEL 链路自测（不可用时降级返回）。
 """
-from fastapi import APIRouter
+import os
+
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
@@ -18,6 +20,25 @@ from ..core.logging import setup_logging
 logger = setup_logging()
 
 router = APIRouter()
+
+
+def _check_metrics_token(request: Request) -> JSONResponse | None:
+    """/metrics /test-otel 门禁（2026-09-07 审查 P2）：应用层原先完全无鉴权，
+    lite 部署靠 nginx 404 兜底，直连容器端口即绕过。
+
+    规则：METRICS_TOKEN 未配置 → fail closed（返回 403 与配置提示，杜绝裸奔）；
+    已配置 → 仅接受 Authorization: Bearer <METRICS_TOKEN>（Prometheus 抓取配置
+    authorization credentials 即可）。匹配返回 None 放行。
+    """
+    expected = os.getenv("METRICS_TOKEN", "")
+    got = request.headers.get("authorization", "")
+    if expected and got == f"Bearer {expected}":
+        return None
+    return JSONResponse(
+        {"detail": "metrics endpoint requires METRICS_TOKEN"
+                   "（在网关环境变量配置 METRICS_TOKEN，Prometheus 抓取时携带同值 Bearer Token）"},
+        status_code=403,
+    )
 
 
 @router.get("/favicon.ico")
@@ -69,14 +90,20 @@ async def ready():
 
 
 @router.get("/metrics")
-async def prometheus_metrics():
+async def prometheus_metrics(request: Request):
+    unauthorized = _check_metrics_token(request)
+    if unauthorized:
+        return unauthorized
     # 顶部已导入（P2 #15：避免每次抓取重复导入）
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @router.get("/test-otel")
-async def test_otel():
-    """测试 OTEL 链路（OTEL 不可用时返回提示，不报 500）"""
+async def test_otel(request: Request):
+    """测试 OTEL 链路（OTEL 不可用时返回提示，不报 500）；与 /metrics 同门禁"""
+    unauthorized = _check_metrics_token(request)
+    if unauthorized:
+        return unauthorized
     if not OTEL_AVAILABLE:
         return {"status": "otel unavailable"}
     from opentelemetry import trace

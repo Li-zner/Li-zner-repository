@@ -177,6 +177,12 @@ class SemanticCache:
         if str(response).strip() == DEEPSEEK_FALLBACK_MESSAGE:
             logger.info(f"缓存写入跳过（兜底回复）: {query[:30]}...")
             return
+        # DFA 拦截的安全文案不写入（2026-09-09 审查 P1）：一次误伤即把该 query 钉成
+        # 固定安全文案 60 天（命中计数累加还会躲过 clean_stale_cache），五处调用点在此单点收口
+        from .safety_filter import get_filter
+        if str(response).strip() == get_filter().safe_message:
+            logger.info(f"缓存写入跳过（安全拦截文案）: {query[:30]}...")
+            return
 
         # 先写入 L0（随机过期防雪崩）
         _hot_cache.set(_cache_l0_key(query, cache_ctx), response, ttl=ttl or _hot_ttl())

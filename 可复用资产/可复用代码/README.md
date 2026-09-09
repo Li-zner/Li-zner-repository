@@ -54,3 +54,39 @@
 - 本目录机制的生产封装：[[MCP sever/README|MCP sever]]（分布式锁与限流 / 语义缓存）
 - 上线前对照：[[skill/生产机制自查/SKILL|生产机制自查 24 项]]、[[skill/面试手写八段训练/SKILL|面试手写八段训练]]
 - 相邻主题：[[图谱/MOC-MCP生态|MOC-MCP 生态]]、[[图谱/MOC-安全与密钥|MOC-安全与密钥]]（HMAC 验签）、[[图谱/MOC-总览|MOC-总览]]
+
+
+## Import 用法（2026-09-06 import 化完成）
+
+已重命名为英文 snake_case 模块并新增 `__init__.py`，本目录现在是一个**可直接 import 的包**：
+
+```python
+import sys; sys.path.insert(0, "可复用资产/可复用代码")
+from circuit_breaker import CircuitBreaker   # 熔断器
+from distributed_lock import DistributedLock # 分布式锁
+from snowflake_id import Snowflake           # 雪花ID
+from lru_ttl_cache import LRUTTLCache        # LRU+TTL 缓存
+```
+
+### 中文对照表（旧名 → 现模块名）
+
+| 旧中文名 | 现模块 | 主类 |
+|---|---|---|
+| 熔断器 | `circuit_breaker.py` | CircuitBreaker |
+| 分布式锁+lua | `distributed_lock.py` | DistributedLock |
+| 分布式限流器+lua | `rate_limiter_lua.py` | LUA 脚本集 |
+| singleflight+幂等 | `singleflight.py` | singleflight 原语 |
+| LRU+TTL缓存 | `lru_ttl_cache.py` | LRUTTLCache |
+| 原子扣减-防超卖 | `atomic_stock.py` | StockHolder / LUA |
+| HMAC签名+防重放 | `hmac_replay_guard.py` | SignatureVerifier |
+| Token预算守卫 | `token_budget.py` | TokenBudget |
+| 重试+退避+降级 | `retry_backoff.py` | 重试原语 |
+| 雪花ID | `snowflake_id.py` | Snowflake |
+| 状态机 | `state_machine.py` | StateMachine |
+
+依赖：标准库为主；`distributed_lock` / `rate_limiter_lua` 需 redis-py。
+冒烟：`python -c "import sys; sys.path.insert(0,'.'); from circuit_breaker import CircuitBreaker"`。
+
+## 接线范本（examples/）
+
+- `examples/demo_gateway.py`——把本库模块接成完整后端的最小网关：门禁序（QPS/槽位→语义缓存→防击穿锁）→ 业务（熔断器包裹）→ 计量 → finally 清理。运行自检：`python examples/demo_gateway.py selfcheck`。**新项目先读它再动手**，结构照抄、业务替换。

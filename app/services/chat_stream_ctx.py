@@ -8,7 +8,7 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from fastapi import HTTPException
@@ -27,6 +27,7 @@ from ..core.quota import is_quota_exhausted
 from ..core.semantic_cache import SemanticCache, safe_set
 from ..core.stream_utils import build_file_context
 from ..core.redis import get_redis
+from ..core.concurrency import spawn
 from ..middleware.rate_limit import check_qps, check_concurrent, get_daily_usage, release_concurrent
 from ..agents.memory import compress_message_history
 from ..agents.orchestrator import build_shared_context
@@ -83,7 +84,9 @@ async def ensure_chat_allowed(current_user: dict) -> str:
     """
     username = current_user["username"]
     user_role = current_user.get("role", "user")
-    today = datetime.now().strftime("%Y-%m-%d")
+    # UTC 日期（2026-09-07 审查 P2）：daily_* 键的 TTL 对齐 UTC 日切（rate_limit P3 #39），
+    # 本地 now() 在容器时区非 UTC 时切日错位
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     if not await check_qps(username, user_role):
         gateway_requests_total.labels(method='POST', endpoint='/v2/chat/stream', status='429').inc()
@@ -172,7 +175,9 @@ async def build_stream_ctx(req: ChatRequest, current_user: dict, today: str) -> 
 
     lang_instr = lang_instruction(req)
     today_str = today_cn()
-    conv_id = req.conversation_id or f"conv_{username}_{int(time.time())}"
+    # 无会话 id 时用 uuid 后缀（2026-09-07 审查 P2）：秒级时间戳同秒并发会共用
+    # 会话导致历史互相污染
+    conv_id = req.conversation_id or f"conv_{username}_{uuid.uuid4().hex[:12]}"
     mm = MemoryManager(username, conv_id)
     try:
         user_profile = await mm.get_profile()
@@ -217,6 +222,6 @@ async def finalize_answer(ctx: ChatStreamCtx, answer: str, write_cache: bool = T
     )
     if write_cache:
         # safe_set 兜底：后台任务异常不能无人认领（与 runner/router 同一封装）
-        asyncio.create_task(safe_set(ctx.req.query, answer, cache_ctx=ctx.cache_ctx))
+        spawn(safe_set(ctx.req.query, answer, cache_ctx=ctx.cache_ctx), name="semantic-cache-set")
     await update_daily_usage(ctx.username, ctx.today, inc_request=1, inc_token=0)
-    asyncio.create_task(inc_used_questions(ctx.username))
+    spawn(inc_used_questions(ctx.username), name="inc-used-questions")

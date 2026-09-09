@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /** 聊天主界面：旧版 .app 骨架。默认旅游人格；顶部求职/民法典按钮切换人格 */
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '../stores/auth'
@@ -31,6 +31,25 @@ const txOpen = ref(false)
 const drawerOpen = ref(false)
 /** 顶部栏收起/展开（小三角切换） */
 const headerCollapsed = ref(false)
+/** 手机端人格下拉 */
+const ddOpen = ref(false)
+const personaOptions = [
+  { value: 'unified', label: t('travel_mode') },
+  { value: 'me', label: t('me_mode') },
+  { value: 'civil_code', label: t('civil_mode') },
+]
+const personaLabel = computed(() =>
+  personaOptions.find((o) => o.value === chat.currentPersonaId)?.label ?? t('travel_mode'))
+
+function pickPersona(value: string) {
+  ddOpen.value = false
+  if (value !== chat.currentPersonaId) switchPersona(value)
+}
+
+/** 点外部关闭下拉 */
+function onDocClick() {
+  ddOpen.value = false
+}
 
 // ---------- 滚动跟随：流式时贴底自动滚，用户上翻则停手 + 悬浮"回到底部" ----------
 const messagesEl = ref<HTMLElement | null>(null)
@@ -79,6 +98,10 @@ function autoGrow() {
   el.style.height = Math.min(el.scrollHeight, 132) + 'px'
 }
 
+onMounted(() => {
+  document.addEventListener('click', onDocClick)
+})
+onUnmounted(() => document.removeEventListener('click', onDocClick))
 onMounted(async () => {
   if (!auth.profileLoaded) auth.loadProfile().catch(() => router.push('/login'))
   // 会话列表必须先加载完成，autoPrompt 才有 currentSession 可发（否则 send 静默返回 → 无输出）
@@ -175,7 +198,6 @@ async function submitRate(star: number) {
 // ---------- 人格切换（顶部按钮：求职 / 民法典） ----------
 const isMePersona = computed(() => chat.currentPersonaId === 'me')
 const isCivilPersona = computed(() => chat.currentPersonaId === 'civil_code')
-const isTravelPersona = computed(() => !isMePersona.value && !isCivilPersona.value)
 
 function switchPersona(id: string) {
   if (chat.streaming) return
@@ -273,22 +295,25 @@ async function send(q: string) {
         <div class="header-actions">
           <router-link to="/map" class="map-btn">{{ t('map') }}</router-link>
           <button
-            class="mode-btn"
-            :class="{ active: isTravelPersona }"
-            @click="switchPersona('unified')"
-          >{{ t('travel_mode') }}</button>
-          <button
-            class="mode-btn"
-            :class="{ active: isMePersona }"
-            @click="switchPersona('me')"
-          >{{ t('me_mode') }}</button>
-          <button
-            class="mode-btn"
-            :class="{ active: isCivilPersona }"
-            @click="switchPersona('civil_code')"
-          >{{ t('civil_mode') }}</button>
+            class="mode-btn mode-dd-trigger"
+            @click.stop="ddOpen = !ddOpen"
+          >{{ personaLabel }}<span class="dd-caret">▾</span></button>
           <button class="logout-btn" @click="doLogout">{{ t('nav_logout') }}</button>
         </div>
+      </div>
+      <!-- 人格下拉：挂 zone 层（chat-header 的 overflow:hidden 会裁剪菜单致手机端点不到） -->
+      <div class="mode-dropdown" @click.stop>
+        <transition name="fadeup">
+          <div v-if="ddOpen" class="dd-menu">
+            <button
+              v-for="opt in personaOptions"
+              :key="opt.value"
+              class="dd-item"
+              :class="{ current: opt.value === chat.currentPersonaId }"
+              @click="pickPersona(opt.value)"
+            >{{ opt.label }}</button>
+          </div>
+        </transition>
       </div>
       <!-- 展开态 ▴=点击收起；收起态 ▾=点击下拉。骑缝定位在 header 下缘中部 -->
       <button
@@ -541,5 +566,49 @@ async function send(q: string) {
 }
 .header-toggle:hover {
   color: var(--primary);
+}
+
+/* 人格自绘下拉（全端）：三按钮已移除，统一用下拉；菜单挂 zone 层避开 header 裁剪 */
+.mode-dropdown {
+  position: absolute;
+  top: 100%;
+  right: 16px;
+  z-index: 60;
+}
+.mode-dd-trigger .dd-caret {
+  font-size: 10px;
+  margin-left: 4px;
+  opacity: 0.7;
+}
+.dd-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 108px;
+  background: var(--header-bg, #fff);
+  border: 1px solid var(--border-color);
+  border-radius: 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  padding: 6px;
+  z-index: 60;
+}
+.dd-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 10px;
+  background: none;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.dd-item:hover { background: var(--bg-body); color: var(--primary); }
+.dd-item.current {
+  background: var(--primary);
+  color: #fff;
 }
 </style>

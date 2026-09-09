@@ -60,8 +60,9 @@ async def delete_conversation(
     # 3. 清除 Redis 缓存（历史 + 滚动摘要一并清，防删除后同会话 ID 读到旧摘要，P3 修复）
     try:
         r = await get_redis()
-        await r.delete(f"conv:{conversation_id}", f"conv_summary:{conversation_id}")
-        logger.info(f"已清除 Redis 缓存: conv:{conversation_id}")
+        # 键含 user_id（2026-09-09 审查 P0 IDOR 修复）：与 MemoryManager 新键格式对齐
+        await r.delete(f"conv:{username}:{conversation_id}", f"conv_summary:{username}:{conversation_id}")
+        logger.info(f"已清除 Redis 缓存: conv:{username}:{conversation_id}")
     except Exception as e:
         logger.warning(f"Redis 缓存清除失败（不影响主流程）: {e}")
 

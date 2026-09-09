@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Optional, Dict
 from ..core.redis import get_redis as _get_redis
 from ..core.config import TASK_TTL_SECONDS, TASK_TIMEOUT
+from ..core.concurrency import spawn
 
 from ..core.logging import setup_logging
 
@@ -235,6 +236,7 @@ def save_idempotent(session_id: str, msg: str, task_id: str):
     """记录幂等映射（10 秒 TTL，Redis 存储；保持同步签名，调用方无需改）"""
     key = _idempotent_key(session_id, msg)
     try:
-        asyncio.get_running_loop().create_task(_persist_idempotent(key, task_id))
+        # spawn 持强引用：裸 create_task 的后台任务可被 GC 中途回收（2026-09-07 审查 P2）
+        spawn(_persist_idempotent(key, task_id), name="idempotent-persist")
     except RuntimeError:  # noqa: silent-except 豁免：无运行循环为预期路径
         pass  # 无运行循环（非 async 上下文）时静默跳过，幂等写入尽力而为

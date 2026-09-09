@@ -54,8 +54,11 @@ def compress_message_history(messages: list, max_messages: int = 6) -> list:
     return compacted
 
 
-async def generate_summary(messages: list, max_tokens: int = 300) -> str:
-    """使用 DeepSeek 生成对话摘要（带指数退避重试，防网络抖动导致压缩静默失效）"""
+async def generate_summary(messages: list, max_tokens: int = 300, username: str = "") -> str:
+    """使用 DeepSeek 生成对话摘要（带指数退避重试，防网络抖动导致压缩静默失效）
+
+    username 供扣费（2026-09-09 主人拍板：内部 LLM 调用计入计费）。
+    """
     if not messages:
         return ""
     recent = messages[-50:] if len(messages) > 50 else messages
@@ -93,6 +96,11 @@ async def generate_summary(messages: list, max_tokens: int = 300) -> str:
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                # 计入计费（2026-09-09 主人拍板）：记忆压缩属用户请求触发的 LLM 消耗
+                _usage = data.get("usage") or {}
+                if username and (_usage.get("prompt_tokens") or _usage.get("completion_tokens")):
+                    from ..services.llm_streaming import record_token_usage
+                    record_token_usage(_usage, username, "")
                 summary = data["choices"][0]["message"]["content"].strip()
                 if summary:
                     return summary

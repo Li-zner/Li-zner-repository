@@ -7,6 +7,7 @@
 from ..core.redis import get_redis
 from ..core.metrics import app_exceptions_total
 from ..core.logging import setup_logging
+from ..core.safety_filter import sanitize_error_text
 
 logger = setup_logging()
 
@@ -25,9 +26,12 @@ async def record_error(request, exc: Exception) -> str:
         r = await get_redis()
         key = f"{_COUNT_PREFIX}{err_type}"
         await r.incr(key)
+        # 原文 str(exc) 可能带完整 URL（高德 key 在参数里），入 Redis 前统一脱敏
+        # （与任务状态/tool_result 的出口同一sanitize；2026-09-07 审查 P2）
+        detail = sanitize_error_text(str(exc), fallback="(详情已脱敏)")[:200]
         await r.lpush(
             _RECENT_KEY,
-            f"{err_type}|{request.method} {request.url.path}|{str(exc)[:200]}",
+            f"{err_type}|{request.method} {request.url.path}|{detail}",
         )
         await r.ltrim(_RECENT_KEY, 0, _RECENT_LIMIT - 1)
         await r.expire(_RECENT_KEY, 7 * 86400)  # P3 修复：样本列表原先无 TTL

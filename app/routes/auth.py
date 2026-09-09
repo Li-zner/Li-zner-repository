@@ -25,12 +25,17 @@ _LOGIN_LOCK_SECONDS = 900
 
 
 def _client_ip(request: Request) -> str:
-    """取真实客户端 IP（CF-Connecting-IP > X-Forwarded-For 首个 > 直连 IP），供失败计数键使用"""
-    ip = (request.headers.get("cf-connecting-ip")
-          or request.headers.get("x-forwarded-for")
+    """取可信客户端 IP（X-Forwarded-For 末跳 > 直连 IP），供失败计数键使用
+
+    2026-09-09 审查 P1 修复：nginx 用 $proxy_add_x_forwarded_for 追加真实 IP，
+    首跳是客户端可伪造的前缀——取首跳时防爆破锁既可被绕过（每次换伪造 IP）也可
+    反向陷害（伪造受害者 IP 连错 5 次锁 15 分钟）；末跳才是我方 nginx 追加的可信值。
+    CF-Connecting-IP 不在部署链路（nginx 直连），不采信。
+    """
+    ip = (request.headers.get("x-forwarded-for")
           or (request.client.host if request.client else ""))
     if ip and "," in ip:
-        ip = ip.split(",")[0].strip()
+        ip = ip.split(",")[-1].strip()
     return ip or "unknown"
 
 
@@ -75,7 +80,8 @@ class ChangePasswordRequest(BaseModel):
 
 
 async def resolve_login_username(username: str) -> str:
-    """把手机号解析为内部 username（phone_{phone}）；非手机号原样返回"""
+    """登录名归一：裸手机号按 users.phone 查到 username（新版=手机号本身，旧版
+    phone_ 前缀行兼容解析）；非手机号原样返回（GitHub 登录名直登）"""
     import re
     if username.startswith("phone_") or not re.match(r'^1\d{10}$', username):
         return username
@@ -93,9 +99,11 @@ async def login(payload: LoginRequest, request: Request):
     username = payload.username
     password = payload.password
     client_ip = _client_ip(request)
+    # 先解析再落锁（2026-09-07 审查 P1）：原实现检查用原始输入（手机号）、
+    # 失败记账用解析后 username，两者键不一致 → 手机号登录可无限试密码
+    username = await resolve_login_username(username)
     await _check_login_lock(client_ip, username)
     # 支持手机号作为账号登录（账号即手机号）
-    username = await resolve_login_username(username)
     user = await authenticate_user(username, password)
     if not user:
         await _record_login_failure(client_ip, username)
@@ -154,5 +162,15 @@ async def change_password(payload: ChangePasswordRequest, current_user: dict = D
             "UPDATE users SET hashed_password=$1 WHERE username=$2",
             new_hashed, username
         )
+    # 改密吊销存量会话（2026-09-07 审查 P2）：记录改密时刻，refresh 流程发现
+    # token 签发早于该时刻即拒绝——旧 refresh token 最长 30 天有效的窗口被关闭
+    import time
+    from ..core.redis import get_redis
+    from ..core.config import REFRESH_TOKEN_EXPIRE_DAYS
+    r = await get_redis()
+    await r.set(
+        f"auth:pwd_changed:{username}", str(int(time.time())),
+        ex=REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+    )
     logger.info(f"密码已修改: username={username}")
     return {"message": "密码修改成功"}

@@ -8,46 +8,16 @@ from typing import AsyncIterator, Dict, List, Optional
 
 from ..core.config import DEEPSEEK_MODEL, TOOL_TIMEOUT
 from ..core.logging import setup_logging
-from ..core.metrics import llm_tokens_total, llm_tokens_detail, llm_requests_total
 from ..core.stream_utils import dispatch_tool, sse
 from ..core.safety_filter import get_filter
-from ..payment.service import deduct_token_cost
 from .chat_stream_ctx import ChatStreamCtx, finalize_answer
 from .chat_support import hide_reasoning, mark_key_result
 from .reasoning_guard import sanitize_reasoning
-from .llm_streaming import stream_llm_throttled
+from .llm_streaming import _spawn_drain_bill, record_token_usage, stream_llm_throttled
 from .chat_fallback import fallback_chain
 
 logger = setup_logging()
 MAX_STEPS = 3
-
-
-def _log_deduct_task_error(task: asyncio.Task) -> None:
-    """扣费后台任务的异常认领：记 warning，不打断对话，也不留未认领的 Task 异常"""
-    if not task.cancelled() and task.exception():
-        logger.warning(f"Token扣费后台任务失败（不影响对话）: {task.exception()}")
-
-
-def record_token_usage(_stream_usage: dict, username: str, conv_id: str):
-    """Token 精细计量 + 扣费（10元/万token，模拟模式）
-
-    Prometheus 指标 + 异步扣费；扣费失败经 done_callback 记 warning，不影响对话主流程。
-    """
-    from ..core.config import DEEPSEEK_MODEL as _dm
-    prompt_tk = _stream_usage.get("prompt_tokens", 0)
-    completion_tk = _stream_usage.get("completion_tokens", 0)
-    if prompt_tk or completion_tk:
-        llm_tokens_total.labels(type='input').inc(prompt_tk)
-        llm_tokens_total.labels(type='output').inc(completion_tk)
-        llm_tokens_detail.labels(model=_dm, endpoint='v2_chat', type='input').inc(prompt_tk)
-        llm_tokens_detail.labels(model=_dm, endpoint='v2_chat', type='output').inc(completion_tk)
-    llm_requests_total.labels(model=_dm, endpoint='v2_chat', status='success').inc()
-    if prompt_tk or completion_tk:
-        total_tk = prompt_tk + completion_tk
-        asyncio.create_task(deduct_token_cost(
-            user_id=username, token_count=total_tk, session_id=conv_id or "",
-            remark=f"AI对话消耗 {total_tk} tokens（输入 {prompt_tk} + 输出 {completion_tk}）",
-        )).add_done_callback(_log_deduct_task_error)
 
 
 def _accumulate_tool_calls(tool_calls_index: Dict, delta: List[dict]) -> Dict:
@@ -90,11 +60,12 @@ async def _stream_react(ctx: ChatStreamCtx, model_try: str, frame: Dict) -> Asyn
     sf = get_filter()
     tool_calls_index: Dict = {}
     usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    _agen = stream_llm_throttled(
+        ctx, ctx.api_key, model_try, ctx.messages,
+        username=ctx.username, tools=ctx.tools, tool_choice="auto",
+    )
     try:
-        async for kind, payload in stream_llm_throttled(
-            ctx, ctx.api_key, model_try, ctx.messages,
-            username=ctx.username, tools=ctx.tools, tool_choice="auto",
-        ):
+        async for kind, payload in _agen:
             if kind == "usage":
                 usage.update(payload)
             elif kind == "reasoning":
@@ -130,6 +101,13 @@ async def _stream_react(ctx: ChatStreamCtx, model_try: str, frame: Dict) -> Asyn
         ctx.finished = True
         frame["fallback"] = True
         return
+    except (GeneratorExit, asyncio.CancelledError):
+        # 客户端断连排空计费（2026-09-09 审查 P1 修复：断连漏扣费）：此刻上游流未关闭，
+        # 排空任务接管消费拿真实 usage 补计费；不走上方 fallback（客户端已断开），
+        # 原样上抛不吞取消
+        _spawn_drain_bill(_agen, ctx.username, ctx.conv_id, "react-step",
+                          fallback_text=full_content)
+        raise
     frame["full_reasoning"] = full_reasoning
     frame["full_content"] = full_content
     frame["content_blocked"] = content_blocked
@@ -163,7 +141,9 @@ async def _execute_react_tools(ctx: ChatStreamCtx, tool_calls: List[dict], frame
         if args is None:
             tasks.append(_tool_arg_error(func_name))
         else:
-            tasks.append(dispatch_tool(func_name, args, ctx.req.query, ctx.user_perms, ctx.username))
+            # 兜底查询统一用改写后的 user_query（与 chat_fast_paths:175 同一口径，
+            # 2026-09-07 审查 P2：原先一个用 req.query 一个用 user_query，语义不一致）
+            tasks.append(dispatch_tool(func_name, args, ctx.user_query, ctx.user_perms, ctx.username))
     _tool_task_list = [asyncio.create_task(coro) for coro in tasks]
     try:
         tool_results = await asyncio.wait_for(

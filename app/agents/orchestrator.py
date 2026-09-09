@@ -19,6 +19,7 @@ import asyncio
 from typing import List, Dict, Optional
 from ..core.logging import setup_logging
 from ..core.config import DEEPSEEK_MODEL, HTTP_TIMEOUT_MEDIUM, llm_endpoint
+from ..core.concurrency import llm_semaphore
 from ..core.metrics import llm_tokens_total, llm_tokens_detail, llm_requests_total
 
 logger = setup_logging()
@@ -274,9 +275,10 @@ async def _call_deepseek_think(
     context: str,
     temperature: float = 0.3,
     agent_id: str = "unknown",
-    phase: str = "think"
+    phase: str = "think",
+    username: str = ""
 ) -> dict:
-    """调用 DeepSeek 让 Agent '思考' 并返回 JSON"""
+    """调用 DeepSeek 让 Agent '思考' 并返回 JSON（username 供扣费，主人拍板 09-09）"""
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
         return {"error": "Missing DeepSeek Key"}
@@ -293,19 +295,22 @@ async def _call_deepseek_think(
     # 主力模型可能是 qwen（百炼端点），按模型名路由端点与密钥
     base_url, api_key = llm_endpoint(DEEPSEEK_MODEL, api_key)
     try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
-            resp = await client.post(
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": DEEPSEEK_MODEL,
-                    "messages": messages,
-                    "response_format": {"type": "json_object"},
-                    "temperature": temperature
-                }
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        # 纳入全局 LLM 并发控制（2026-09-07 审查 P2）：Phase1/Phase2 并行 N 路调用
+        # 原先绕过 llm_semaphore，圆桌讨论可瞬间占满全部 LLM 并发额度
+        async with llm_semaphore:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
+                resp = await client.post(
+                    f"{base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": DEEPSEEK_MODEL,
+                        "messages": messages,
+                        "response_format": {"type": "json_object"},
+                        "temperature": temperature
+                    }
+                )
+                resp.raise_for_status()
+                data = resp.json()
             content = data["choices"][0]["message"]["content"]
 
             # Token 计量
@@ -318,6 +323,11 @@ async def _call_deepseek_think(
             llm_tokens_detail.labels(model=DEEPSEEK_MODEL, endpoint=f'orchestrator_{phase}', type='input').inc(prompt_tk)
             llm_tokens_detail.labels(model=DEEPSEEK_MODEL, endpoint=f'orchestrator_{phase}', type='output').inc(completion_tk)
             llm_requests_total.labels(model=DEEPSEEK_MODEL, endpoint=f'orchestrator_{phase}', status='success').inc()
+            # 计入计费（2026-09-09 主人拍板）：指标已打点，复用不含指标的扣费入口
+            if username:
+                from ..services.llm_streaming import bill_token_usage
+                bill_token_usage(usage, username, "",
+                                 remark=f"圆桌[{agent_id}.{phase}]消耗 {prompt_tk + completion_tk} tokens")
 
             return json.loads(content)
     except json.JSONDecodeError as e:
@@ -346,8 +356,10 @@ class AgentOrchestrator:
         summary = await orch.run()
     """
 
-    def __init__(self, user_query: str):
+    def __init__(self, user_query: str, username: str = ""):
         self.board = DiscussionBoard(user_query)
+        # 计入计费（2026-09-09 主人拍板）：圆桌各 Phase 的 LLM 消耗记到发起用户
+        self.username = username
 
     def add_tool_result(self, agent_id: str, result: dict, error: str = ""):
         if error:
@@ -376,7 +388,8 @@ class AgentOrchestrator:
                 focus=profile.get("focus", "")
             )
             tasks.append(
-                _call_deepseek_think(system_prompt, context, agent_id=agent_id, phase="phase1")
+                _call_deepseek_think(system_prompt, context, agent_id=agent_id, phase="phase1",
+                                     username=self.username)
             )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -421,7 +434,8 @@ class AgentOrchestrator:
                 discussion=json.dumps(discussion_json, ensure_ascii=False, indent=2)
             )
             tasks.append(
-                _call_deepseek_think(review_prompt, context, temperature=0.2, agent_id=agent_id, phase="phase2")
+                _call_deepseek_think(review_prompt, context, temperature=0.2, agent_id=agent_id, phase="phase2",
+                                     username=self.username)
             )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)

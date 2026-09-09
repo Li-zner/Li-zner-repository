@@ -1,6 +1,5 @@
 import os
 import json
-import time
 import asyncio
 import httpx
 from ..core.logging import setup_logging
@@ -35,9 +34,18 @@ async def fetch_weather_async(city: str):
             weather_data = weather_resp.json()
             if weather_data["status"] != "1":
                 return {"error": "天气查询失败"}
-            live = weather_data["lives"][0]
+            lives = weather_data.get("lives") or []
+            if not lives:
+                # lives 为空数组（2026-09-07 审查 P2）：原先 [0] IndexError 落
+                # "天气查询失败"，实际语义是"该地区无天气数据"
+                return {"error": f"{city} 暂无天气数据"}
+            live = lives[0]
+            # 港澳台：高德无天气数据（lives 缺字段）；geo 解析会落邻城（港→深/澳→珠），
+            # 此时如实标注数据来源城市，由访客自行参考
+            if not live.get("weather") or not live.get("temperature"):
+                return {"error": f"{city} 暂无天气数据"}
             return {
-                "city": city,
+                "city": live.get("city", city),
                 "temperature": live["temperature"],
                 "weather": live["weather"],
                 "wind": live["winddirection"]
@@ -221,14 +229,17 @@ async def _keyword_fill(conn, query: str, recall_limit: int, candidates: list,
     for kw in query.replace("?", "").replace("，", " ").replace("？", " ").split():
         if len(kw) < 2:
             continue
-        args = [f"%{kw}%", recall_limit - len(candidates)]
+        # ILIKE 通配符转义（2026-09-07 审查 P2）：用户关键词含 %/_ 时原样拼进
+        # 模式可构造成全表模糊匹配（性能面）；ESCAPE 声明转义字符
+        kw_esc = kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        args = [f"%{kw_esc}%", recall_limit - len(candidates)]
         if permissions:
             args.append(permissions)
         more = await conn.fetch(
             "SELECT chunk_key, source, heading, content, 0.5 as sim "
             "FROM knowledge_chunks WHERE source = 'civil_code' "
             + _perm_clause(permissions) +
-            "AND content ILIKE $1 LIMIT $2",
+            "AND content ILIKE $1 ESCAPE '\\' LIMIT $2",
             *args,
         )
         for r in more:
@@ -241,6 +252,13 @@ async def _keyword_fill(conn, query: str, recall_limit: int, candidates: list,
 # 过大过贵——LLM rerank 曾 100% 超时，每查询白等 30s）
 RECALL_LIMIT = 15
 RERANK_TOP = 5
+
+# 触发式改写重试阈值（2026-09-07 决策：不默认全量开 LLM 查询改写，仅双路召回都低置信时
+# 触发一次改写重试，延迟只付给失败的查询）。
+# ponytail: 阈值未经标注集标定（经验初值），上线后用 tests/run_retrieval_eval.py 在标注集上
+# 校准触发率与改写收益；KB_REWRITE_* 环境变量可无码调整。
+REWRITE_TRIGGER_TRGM_SIM = float(os.getenv("KB_REWRITE_TRGM_SIM", "0.45"))
+REWRITE_TRIGGER_VEC_SIM = float(os.getenv("KB_REWRITE_VEC_SIM", "0.50"))
 
 # 本地重排器单例（sentence-transformers CrossEncoder；镜像内 torch 已预装）
 _RERANKER = None
@@ -295,36 +313,128 @@ async def _rerank_local(query: str, candidates: list) -> list:
     return sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
 
 
-async def _search_two_legs(conn, query: str, search_query: str,
-                           top_k: int, permissions: list | None) -> dict:
-    """双路召回（trgm + 向量）→ RRF 融合 → 本地重排 RRF 前 5。
+def _is_low_confidence(max_trgm_sim: float, max_vec_sim: float) -> bool:
+    """双路召回最高分均低于阈值 → 低置信（触发式改写重试的门禁，2026-09-07 决策）。
 
-    原实现的"口语映射后重试"是逻辑死代码（重试查询与首次完全相同，结果恒等），
-    随本次重写移除；口语映射已在进入本函数前完成。
+    语义：任一路"强命中"即不打扰——trgm 词面强命中或向量语义强命中任一存在，
+    就没必要花一次 LLM 调用改写；严格小于阈值（等于阈值视为有信号）。
     """
-    recall_limit = max(RECALL_LIMIT, top_k)
+    return (max_trgm_sim < REWRITE_TRIGGER_TRGM_SIM
+            and max_vec_sim < REWRITE_TRIGGER_VEC_SIM)
+
+
+def _clean_rewrite(text: str, original: str) -> str:
+    """清洗 LLM 改写输出：取首行、剥引号与"改写："类前缀、限长 64 字。
+
+    空串/与原查询等价/过短 → 返回空串（调用方不重试）。
+    """
+    if not text:
+        return ""
+    line = text.strip().splitlines()[0].strip()
+    line = line.strip('"“”\'「」《》')
+    for prefix in ("改写：", "改写:", "查询：", "检索："):
+        if line.startswith(prefix):
+            line = line[len(prefix):].strip()
+    line = line.rstrip("。").strip('"“”')
+    if not line or line == original or len(line) < 2:
+        return ""
+    return line[:64]
+
+
+async def _rewrite_query_for_recall(query: str, username: str = "") -> str:
+    """低置信时的一次 LLM 查询改写（口语 → 条文术语风格检索表述），失败一律返回空串。
+
+    改写只用于召回重试；重排仍用用户原话（cross-encoder 需要真实问题语义）。
+    post_chat_completion 自带主/备模型降级；任何失败 fail-open，检索主流程不受影响。
+    username 供扣费（2026-09-09 主人拍板：内部 LLM 调用计入计费）。
+    """
+    try:
+        from ..services.chat_support import post_chat_completion
+        from ..core.config import HTTP_TIMEOUT_SHORT
+        ok, data = await post_chat_completion(
+            {"model": None,
+             "messages": [{"role": "user", "content":
+                           "把用户的口语问题改写成《民法典》条文术语风格的检索查询，"
+                           "只输出改写后的查询本身，不要解释、不要引号。\n"
+                           f"用户问题：{query}"}],
+             "temperature": 0, "max_tokens": 80},
+            timeout=HTTP_TIMEOUT_SHORT)
+        if not ok:
+            logger.debug(f"检索改写上游失败（跳过重试）: {str(data)[:120]}")
+            return ""
+        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        # 计入计费（2026-09-09 主人拍板）：检索改写属用户请求触发，本路径无既有指标走全量入口
+        _usage = data.get("usage") or {}
+        if username and (_usage.get("prompt_tokens") or _usage.get("completion_tokens")):
+            from ..services.llm_streaming import record_token_usage
+            record_token_usage(_usage, username, "")
+        return _clean_rewrite(content, query)
+    except Exception as e:
+        logger.debug(f"检索改写异常（跳过重试）: {type(e).__name__}")
+        return ""
+
+
+async def _recall_two_ways(conn, search_query: str, recall_limit: int,
+                           permissions: list | None) -> tuple:
+    """双路召回：trgm（+ILIKE 关键词补充）与向量，返回 (trgm, vector, max_trgm_sim, max_vec_sim)。
+
+    max_trgm_sim 在关键词补充前取值：ILIKE 命中固定 similarity=0.5，混入会虚高
+    触发判断（词面命中是弱信号，不该被当成"高置信"压制改写重试）。
+    """
     trgm = await _recall_pg_trgm(conn, search_query, recall_limit, permissions)
+    max_trgm = max((c["similarity"] for c in trgm), default=0.0)
     await _keyword_fill(conn, search_query, recall_limit, trgm, permissions)
     embedding = await _generate_embedding(search_query)
     vector = await _recall_pg_vector(conn, embedding, recall_limit, permissions)
-    merged = _rrf_merge(trgm, vector)
-    if not merged:
-        return {"results": [], "method": "trgm+vector"}
+    max_vec = max((c["similarity"] for c in vector), default=0.0)
+    return trgm, vector, max_trgm, max_vec
 
+
+async def _search_two_legs(conn, query: str, search_query: str,
+                           top_k: int, permissions: list | None,
+                           username: str = "") -> dict:
+    """双路召回（trgm + 向量）→ RRF 融合 → 本地重排 RRF 前 5。
+
+    触发式改写重试（2026-09-07 决策）：双路召回都低置信时，才花一次 LLM 调用把口语
+    改写成条文术语风格重试一轮，四路结果重新 RRF 融合——延迟只付给失败查询，
+    不默认全量开。method 标签带 rewrite_retry，供评测统计触发率与改写收益。
+    """
+    recall_limit = max(RECALL_LIMIT, top_k)
+    trgm, vector, max_trgm, max_vec = await _recall_two_ways(
+        conn, search_query, recall_limit, permissions)
+    retried = False
+    if _is_low_confidence(max_trgm, max_vec):
+        rewritten = await _rewrite_query_for_recall(query, username=username)
+        if rewritten:
+            logger.info(f"检索低置信（trgm={max_trgm:.2f}, vec={max_vec:.2f}），触发改写重试: "
+                        f"{search_query[:40]}... → {rewritten[:40]}...")
+            trgm2, vec2, _, _ = await _recall_two_ways(
+                conn, rewritten, recall_limit, permissions)
+            merged = _rrf_merge(trgm, vector, trgm2, vec2)
+            retried = True
+        else:
+            merged = _rrf_merge(trgm, vector)
+    else:
+        merged = _rrf_merge(trgm, vector)
+    method = "trgm+vector" + ("+rewrite_retry" if retried else "")
+    if not merged:
+        return {"results": [], "method": method}
     top_candidates = merged[:RERANK_TOP]
     reranked = await _rerank_local(query, top_candidates)
     if reranked:
-        return {"results": reranked[:top_k], "method": "trgm+vector+rrf+local_rerank"}
-    return {"results": top_candidates[:top_k], "method": "trgm+vector+rrf"}
+        return {"results": reranked[:top_k], "method": method + "+rrf+local_rerank"}
+    return {"results": top_candidates[:top_k], "method": method + "+rrf"}
 
 
-async def search_knowledge(query: str, top_k: int = 5, permissions: list | None = None):
+async def search_knowledge(query: str, top_k: int = 5, permissions: list | None = None,
+                           username: str = ""):
     """语义搜索知识库：trgm + 向量双路召回 → RRF 融合 → 本地 bge-reranker 重排前 5。
 
     在检索前，先通过法律依据纠正映射表检查用户问题是否属于其他法律领域。
     如果命中映射表，直接返回纠正引导信息，不执行知识库搜索。
 
     permissions: None=不过滤（内部/admin）；[]=仅公开；['vip']=公开+vip 可检索。
+    username 透传供改写重试扣费（2026-09-09 主人拍板）。
     """
     # ===== 法律依据纠正映射表检查 =====
     mapping_result = _law_mapping_check(query)
@@ -340,109 +450,16 @@ async def search_knowledge(query: str, top_k: int = 5, permissions: list | None 
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        return await _search_two_legs(conn, query, _search_query, top_k, permissions)
+        return await _search_two_legs(conn, query, _search_query, top_k, permissions,
+                                      username=username)
 
 
-# web_search 本地限流（P1 #13/#40：防高频调用导致外部搜索 API 封 IP）
-# 按 user_key 独立计数（P1：改全局限流为用户级，避免多用户并发互相误伤）。
-_search_rate_lock = asyncio.Lock()
-_search_rate_state: dict = {}   # user_key -> (window_start, count)
-_SEARCH_WINDOW_SECONDS = 10.0
-_SEARCH_MAX_PER_WINDOW = 10
-# 计数字典键数上限：超过即触发惰性清扫（防每用户一个键无界增长，P2 修复）
-_SEARCH_STATE_MAX_KEYS = 512
-
-
-async def _check_search_rate(user_key: str = ""):
-    """web_search 本地限流：每 user_key 每 10 秒最多 10 次。
-
-    user_key 缺省为 ""（未透传用户时降到全局兜底），透传 username 后按用户隔离。
-    键数超阈值时惰性清扫已过窗口的旧计数（活跃用户的窗口未过期不受影响）。
-    """
-    key = user_key or "_global"
-    async with _search_rate_lock:
-        now = time.time()
-        if len(_search_rate_state) > _SEARCH_STATE_MAX_KEYS:
-            expired = [k for k, (ws, _c) in _search_rate_state.items()
-                       if now - ws > _SEARCH_WINDOW_SECONDS]
-            for k in expired:
-                del _search_rate_state[k]
-        window_start, count = _search_rate_state.get(key, (0.0, 0))
-        if now - window_start > _SEARCH_WINDOW_SECONDS:
-            window_start, count = now, 0
-        if count >= _SEARCH_MAX_PER_WINDOW:
-            raise RuntimeError("搜索过于频繁，请稍后再试")
-        _search_rate_state[key] = (window_start, count + 1)
-
-
-async def web_search(query: str, max_results: int = 5, user_key: str = ""):
-    """
-    联网搜索工具 — 当用户询问实时信息、营业时间、评价、排队情况等
-    现有工具无法覆盖的内容时调用。
-
-    主路径：duckduckgo_search 的 DDGS 是纯同步客户端（8.x 只导出 DDGS，
-    没有 AsyncDDGS/atext），阻塞调用放 asyncio.to_thread 执行；
-    未安装/无结果/异常时降级 httpx 直连 Instant Answer API。
-    user_key 为调用方用户名，用于按用户限流（缺省走全局兜底）。
-    """
-    await _check_search_rate(user_key)  # 本地限流（P1 #13/#40）
-    try:
-        from duckduckgo_search import DDGS
-
-        def _ddg_text() -> list:
-            # 同步阻塞搜索放线程池，避免卡住事件循环
-            with DDGS() as ddgs:
-                return ddgs.text(query, region='cn-zh', max_results=max_results) or []
-
-        raw = await asyncio.to_thread(_ddg_text)
-        results = [{
-            "title": r.get("title", ""),
-            "body": r.get("body", "")[:500],
-            "href": r.get("href", ""),
-        } for r in raw]
-        if results:
-            logger.info(f"联网搜索完成: query={query[:30]}, results={len(results)}")
-            return {"results": results, "total": len(results)}
-        logger.info("DDGS 无结果，降级 Instant Answer")
-    except ImportError:
-        logger.warning("duckduckgo_search 未安装，降级 Instant Answer")
-    except Exception as e:
-        logger.warning(f"DDGS 搜索失败，降级 Instant Answer: {e}")
-
-    return await _instant_answer(query)
-
-
-async def _instant_answer(query: str) -> dict:
-    """降级：DuckDuckGo Instant Answer API（通常只返回一条摘要，搜索能力弱于主路径）"""
-    try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
-            resp = await client.get(
-                "https://api.duckduckgo.com/",
-                params={"q": query, "format": "json", "no_html": "1"},
-            )
-            data = resp.json()
-        results = []
-        abstract = data.get("AbstractText", "")
-        if abstract:
-            results.append({
-                "title": data.get("Heading", "摘要"),
-                "body": abstract[:500],
-                "href": data.get("AbstractURL", ""),
-            })
-        for topic in data.get("RelatedTopics", [])[:3]:
-            if "Text" in topic:
-                results.append({
-                    "title": topic.get("Text", "")[:100],
-                    "body": topic.get("Text", "")[:500],
-                    "href": topic.get("FirstURL", ""),
-                })
-        return {"results": results, "total": len(results)}
-    except Exception as e:
-        # httpx 部分异常 str 为空，补类型名保证日志可排查
-        logger.error(f"联网搜索失败: {type(e).__name__}: {e}")
-        # 异常 str 可能带含 key 的完整 URL，前端只给类型名（细节已进日志）
-        return {"error": type(e).__name__, "results": [], "total": 0}
-
+# web_search 子系统已拆至 web_search.py（2026-09-07：tools.py 超 600 行硬限，按子系统边界拆分），
+# 此处 re-export 保持既有 import 路径兼容（stream_utils/dispatch_tool/历史测试）。
+from .web_search import (  # noqa: F401
+    _SEARCH_MAX_PER_WINDOW, _check_search_rate, _instant_answer,
+    _search_rate_state, web_search,
+)
 
 # ============================================================
 # 项目知识库搜索（求职场景用，Embedding 向量召回 + pg_trgm 兜底）
@@ -450,21 +467,23 @@ async def _instant_answer(query: str) -> dict:
 async def _generate_embedding(text: str):
     """调用 Ollama Embedding 生成向量。
 
-    localhost 优先：容器内 localhost 连接拒绝是即时的（随后试 host.docker.internal），
-    而反序在主机上会对 host.docker.internal 空等到连接超时（实测每查询白等 15s）。
+    URL 读配置 EMBEDDING_API_URL（2026-09-07 审查 P2：配置项原先存在但此路径
+    硬编码两个 URL 不用）；自动派生另一台主机名做兜底——容器内 localhost 连接
+    拒绝是即时的，主机上 host.docker.internal 会黑洞等超时，故配置值优先。
     超时收窄到 5s：正常嵌入 <1s，给慢机留裕量即可，不该拖住整条检索。
     """
     import httpx
-    urls = [
-        "http://localhost:11434/api/embeddings",
-        "http://host.docker.internal:11434/api/embeddings",
-    ]
+    from ..core.config import EMBEDDING_API_URL, EMBEDDING_MODEL
+    urls = [EMBEDDING_API_URL]
+    alt_url = EMBEDDING_API_URL.replace("localhost", "host.docker.internal")
+    if alt_url != EMBEDDING_API_URL:
+        urls.append(alt_url)
     for url in urls:
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
                 resp = await client.post(
                     url,
-                    json={"model": "shaw/dmeta-embedding-zh", "prompt": text[:512]}
+                    json={"model": EMBEDDING_MODEL, "prompt": text[:512]}
                 )
                 resp.raise_for_status()
                 return resp.json()["embedding"]

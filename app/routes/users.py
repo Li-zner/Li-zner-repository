@@ -110,8 +110,8 @@ async def rate_message(payload: RateMessageRequest, current_user: dict = Depends
 
 
 @router.get("/api/personas")
-async def list_personas():
-    """列出所有人格"""
+async def list_personas(current_user: dict = Depends(get_current_user)):
+    """列出所有人格（2026-09-07 审查 P2：原先匿名可调，暴露人格列表与配置）"""
     from ..core.persona_manager import get_persona_manager
     pm = get_persona_manager()
     return {
@@ -122,7 +122,14 @@ async def list_personas():
 
 @router.post("/api/persona/switch")
 async def switch_persona(payload: SwitchPersonaRequest, current_user: dict = Depends(get_current_user)):
-    """切换人格（A24）"""
+    """切换全局默认人格（A24）。
+
+    收敛 admin（2026-09-07 审查 P2）：switch 改的是全局默认人格，影响所有未显式
+    指定 persona 的请求，任何登录用户可改=全局 DoS。前端为本地切换（不调此端点），
+    收敛无破坏。
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(403, "仅管理员可切换全局默认人格")
     persona_id = payload.persona_id
     from ..core.persona_manager import get_persona_manager
     pm = get_persona_manager()

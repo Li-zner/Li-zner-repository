@@ -25,6 +25,10 @@ class _Settings(BaseSettings):
         case_sensitive=False,
     )
 
+    # ---------- 运行环境 ----------
+    # 测试环境标记（原裸 os.getenv("APP_ENV")，与 BaseSettings 双轨，2026-09-07 审查收编）
+    app_env: str = ""
+
     # ---------- 数据库 ----------
     database_url: str = ""
     timeout_seconds: float = 30.0
@@ -139,7 +143,7 @@ if not _settings.session_secret_key:
     raise RuntimeError("SESSION_SECRET_KEY 环境变量未设置！请在 .env 中配置一个强随机字符串。")
 if not _settings.jwt_secret:
     raise RuntimeError("JWT_SECRET 环境变量未设置！请在 .env 中配置一个强随机字符串。")
-if not _settings.admin_password and os.getenv("APP_ENV") != "test":
+if not _settings.admin_password and _settings.app_env != "test":
     raise RuntimeError("ADMIN_PASSWORD 环境变量未设置！admin 账户空密码是安全漏洞，请配置强随机字符串。")
 
 # CORS：逗号分隔转列表 + 逐项 trim；通配符与 allow_credentials=True 冲突时拒绝启动

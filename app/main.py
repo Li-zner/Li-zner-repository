@@ -20,6 +20,7 @@ from .core.config import (
 from .core.db import init_pool, close_pool, get_pool
 from .core.metrics import gateway_requests_total, gateway_request_duration_seconds
 from .core.password import hash_password
+from .core.concurrency import spawn
 from .routes.v2 import router as v2_router
 from .routes.map_api import router as map_api_router
 from .routes.admin_errors import admin_errors_router
@@ -139,7 +140,8 @@ async def _warmup_components():
     """预热：语义缓存 / DFA 过滤器 / 人格管理器（避免首个请求冷启动）"""
     try:
         from .core.cache_warmup import warmup_semantic_cache
-        asyncio.create_task(warmup_semantic_cache())
+        # spawn 持强引用：裸 create_task 的后台任务可被 GC 中途回收（2026-09-07 审查 P2）
+        spawn(warmup_semantic_cache(), name="cache-warmup")
         logger.info("语义缓存预热任务已启动（后台异步）")
     except Exception as e:
         logger.warning(f"语义缓存预热跳过: {e}")
@@ -227,13 +229,17 @@ async def lifespan(app: FastAPI):
             )
             resource = Resource(attributes={SERVICE_NAME: "agent-gateway"})
             provider = TracerProvider(resource=resource)
-            processor = BatchSpanProcessor(
-                OTLPSpanExporter(endpoint="http://tempo:4318/v1/traces")
-            )
-            provider.add_span_processor(processor)
-            trace.set_tracer_provider(provider)
-            FastAPIInstrumentor.instrument_app(app)
-            logger.info("OpenTelemetry 追踪已启用 (Tempo HTTP: http://tempo:4318)")
+            # 端点走环境变量（2026-09-07 审查 P2）：lite 部署无 tempo 时硬编码端点
+            # 会让 exporter 后台静默重试；OTEL 不需要时置 OTEL_EXPORTER_OTLP_ENDPOINT 为空跳过
+            otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://tempo:4318").rstrip("/")
+            if otlp_endpoint:
+                processor = BatchSpanProcessor(
+                    OTLPSpanExporter(endpoint=f"{otlp_endpoint}/v1/traces")
+                )
+                provider.add_span_processor(processor)
+                trace.set_tracer_provider(provider)
+                FastAPIInstrumentor.instrument_app(app)
+                logger.info(f"OpenTelemetry 追踪已启用 (OTLP HTTP: {otlp_endpoint})")
         except Exception as e:
             logger.warning(f"OpenTelemetry 初始化失败（不影响路由）: {e}")
 

@@ -1,9 +1,15 @@
 /** 地图相关 API（/api/map 系列，后端代理高德/DeepSeek） */
 import { get, post } from './http'
 
+export interface WeatherDay {
+  label: string   // 今天 / 明天 / 后天
+  weather: string // 白天天气状况
+  temp: string    // 夜温~日温，如 24~28℃
+}
+
 export interface WeatherResponse {
   status: string
-  lives?: { city: string; weather: string; temperature: string; winddirection: string; windpower: string }[]
+  days?: WeatherDay[]
 }
 
 export interface RecommendResponse {
@@ -38,16 +44,17 @@ export interface AmapRouteResponse {
 export async function getWeather(city: string, adcode?: string | number): Promise<string> {
   const q = encodeURIComponent(String(adcode ?? city))
   const data = await get<WeatherResponse>(`/api/map/weather?city=${q}`)
-  if (data.status === '1' && data.lives?.length) {
-    const l = data.lives[0]
-    return `${l.weather} ${l.temperature}℃ · ${l.winddirection}风 ${l.windpower}级`
+  if (data.status === '1' && data.days?.length) {
+    const note = (data as { _note?: string })._note ?? ''
+    // 日期写清楚：今天/明天/后天各占一行（气泡内换行渲染），白天天气+夜温~日温区间
+    return note + data.days.map((d) => `${d.label}${d.weather} ${d.temp}`).join('\n')
   }
-  throw new Error('天气获取失败')
+  throw new Error('该地区暂无天气数据')
 }
 
-export async function getRecommendations(city: string): Promise<{ foods: string[]; spots: string[] }> {
+export async function getRecommendations(city: string, force = false): Promise<{ foods: string[]; spots: string[] }> {
   const data = await post<RecommendResponse>(
-    `/api/map/recommend?city=${encodeURIComponent(city)}`)
+    `/api/map/recommend?city=${encodeURIComponent(city)}${force ? '&force=1' : ''}`)
   if (!data || (!data.foods && !data.spots)) throw new Error('推荐数据格式错误')
   return { foods: data.foods ?? [], spots: data.spots ?? [] }
 }

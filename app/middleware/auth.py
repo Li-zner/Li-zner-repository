@@ -169,6 +169,15 @@ async def refresh_access_token(token: str) -> dict:
         user = await get_user(username)
         if user is None:
             raise HTTPException(401, "User not found")
+        # 改密后旧会话失效（2026-09-07 审查 P2）：token 签发早于改密时刻的
+        # refresh 一律拒绝（改密时写入 auth:pwd_changed:{username}，TTL 与
+        # refresh 有效期一致，过期后无需再比）
+        iat_ts = payload.get("iat")
+        if iat_ts:
+            r = await get_redis()
+            changed = await r.get(f"auth:pwd_changed:{username}")
+            if changed and int(iat_ts) < int(changed):
+                raise HTTPException(401, "密码已修改，请重新登录")
     except HTTPException:
         raise
     except Exception:

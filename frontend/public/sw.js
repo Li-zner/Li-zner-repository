@@ -1,7 +1,7 @@
 /* 旅行助手 Service Worker
  * 策略：/assets/*（哈希文件名）缓存优先；页面导航网络优先、离线回退；
  * /api /v2 /auth（含 SSE 流）一律不拦截。 */
-const CACHE = 'gw-shell-v1'
+const CACHE = 'gw-shell-v2'  // v2：激活时清除 v1 旧缓存，强制老客户端换新资产
 
 self.addEventListener('install', () => {
   self.skipWaiting()

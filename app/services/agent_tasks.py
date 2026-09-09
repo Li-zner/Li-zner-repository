@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import time
+from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
@@ -67,6 +68,29 @@ def ensure_task_access(task: dict, username: str, role: str) -> None:
         raise HTTPException(status_code=404, detail="task not found")
 
 
+async def _task_quota_gate(username: str, role: str) -> None:
+    """任务端点按用户配额（2026-09-07 审查 P2）：任务路径原先只有全局 50 槽位、
+    无任何按用户限额，登录用户可刷 LLM 配额。QPS + 日 req/token 三项与
+    ensure_chat_allowed 同口径（UTC 日切）；并发槽位不适用后台任务（长生命周期
+    占位会误伤正常排队），不纳入。
+    """
+    from ..middleware.rate_limit import check_qps, get_daily_usage, update_daily_usage, _ROLE_LIMITS
+    from ..core.config import DAILY_REQUEST_LIMIT, DAILY_TOKEN_LIMIT
+    if not await check_qps(username, role):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    usage = await get_daily_usage(username, today)
+    limits = {"daily_req": DAILY_REQUEST_LIMIT, "daily_token": DAILY_TOKEN_LIMIT}
+    if role == "admin":
+        limits = _ROLE_LIMITS["admin"]
+    if usage["request_count"] >= limits["daily_req"]:
+        raise HTTPException(status_code=429, detail="今日请求次数已达上限")
+    if usage["token_sum"] >= limits["daily_token"]:
+        raise HTTPException(status_code=429, detail="今日 Token 消耗已达上限")
+    # 任务本身计一次日请求（LLM 消耗由 record_token_usage 统一累计 token）
+    await update_daily_usage(username, today, inc_request=1, inc_token=0)
+
+
 async def _release_task_slot() -> None:
     """回收后台任务并发槽位（任务结束或启动失败时调用）"""
     global _task_active_count
@@ -83,7 +107,9 @@ async def _launch_agent_task(**kwargs) -> None:
         finally:
             await _release_task_slot()
     try:
-        asyncio.create_task(_wrapped())
+        # spawn 持强引用：裸 create_task 的后台任务可被 GC 中途回收（2026-09-07 审查 P2）
+        from ..core.concurrency import spawn
+        spawn(_wrapped(), name=f"agent-task:{kwargs.get('task_id', '')}")
     except Exception:
         # 调度失败（事件循环关闭等极少数场景）：回收槽位避免泄漏
         await _release_task_slot()
@@ -97,9 +123,12 @@ async def create_agent_task(req: CreateTaskRequest, current_user: dict) -> dict:
     供 /resume 透传（P0 #6）。
     """
     username = current_user["username"]
+    role = current_user.get("role", "user")
     # GitHub 试用额度防御：任务端点也走 LLM，受限用户同样拦截（admin 豁免）
-    if current_user.get("role") != "admin" and is_quota_exhausted(current_user):
+    if role != "admin" and is_quota_exhausted(current_user):
         raise HTTPException(status_code=402, detail="免费额度已用完，请绑定手机号后继续使用")
+    # QPS + 日配额门禁（2026-09-07 审查 P2）
+    await _task_quota_gate(username, role)
 
     # 幂等：同一 username+conversation + 相同消息 10秒内复用（P0 #5：键含 username 防跨用户串号；
     # P1 #42：SET NX 原子占位替代 GET 后再创建的竞态窗口）
@@ -115,11 +144,13 @@ async def create_agent_task(req: CreateTaskRequest, current_user: dict) -> dict:
 
     try:
         task_id = await create_task(req.conversation_id, req.message, owner=username)
-        # 在 task 存储中保留恢复所需字段（persona_id / file_ids），供 /resume 透传（P0 #6）
+        # 在 task 存储中保留恢复所需字段（persona_id / file_ids / lang），供 /resume 透传
+        # （P0 #6；lang 原先未持久化，resume 恒回中文，2026-09-07 审查 P2）
         _r = await get_redis()
         await _r.hset(f"task:{task_id}", mapping={
             "persona_id": req.persona_id or "",
             "file_ids": json.dumps(req.file_ids or []),
+            "lang": req.lang or "",
         })
         save_idempotent(f"{username}:{req.conversation_id}", req.message, task_id)
 
@@ -170,7 +201,8 @@ async def wait_task_result(task_id: str, task: dict, wait: int) -> dict:
 
 async def cancel_agent_task(task_id: str, task: dict) -> dict:
     """取消生成任务（置取消信号 + 标记 cancelled）"""
-    if task["status"] in ("completed", "cancelled", "error"):
+    # timeout 也是终态（2026-09-07 审查 P2）：漏判会对已超时任务再置 cancelled
+    if task["status"] in ("completed", "cancelled", "error", "timeout"):
         return {"status": task["status"], "message": "任务已终结，无需取消"}
     set_cancelled(task_id)
     partial = await read_accumulated_result(task_id)
@@ -179,13 +211,19 @@ async def cancel_agent_task(task_id: str, task: dict) -> dict:
 
 
 async def resume_agent_task(task_id: str, task: dict, username: str,
-                            user_perms: list | None = []) -> dict:
+                            user_perms: list | tuple | None = (),
+                            role: str = "user") -> dict:
     """重新生成（创建新任务，丢弃旧草稿）；仅已取消的任务可恢复
 
-    user_perms 默认仅公开（fail-closed）；由路由层传 task_user_perms(current_user)。
+    user_perms 默认仅公开（fail-closed，不可变 () 而非 []/None，理由见
+    runner.run_agent_task）；由路由层传 task_user_perms(current_user)。
+    role 供 resume 前的配额复查（2026-09-07 审查 P2）。
     """
     if task["status"] != "cancelled":
         return {"error": "只有已取消的任务才能恢复", "status": task["status"]}
+
+    # 恢复也是一次新 LLM 任务：试用额度与日配额复查（原 create 有、resume 漏）
+    await _task_quota_gate(username, role)
 
     # 后台任务并发上限（P1 #18）
     if not await _try_reserve_task_slot():
@@ -198,16 +236,18 @@ async def resume_agent_task(task_id: str, task: dict, username: str,
         persona_id = task.get("persona_id") or ""
         file_ids_raw = task.get("file_ids") or ""
         file_ids = json.loads(file_ids_raw) if file_ids_raw else []
+        lang = task.get("lang") or "zh"
         _r = await get_redis()
         await _r.hset(f"task:{new_task_id}", mapping={
             "persona_id": persona_id,
             "file_ids": json.dumps(file_ids),
+            "lang": lang,
         })
 
         await _launch_agent_task(
             task_id=new_task_id, username=username, conversation_id=_task_conversation_id(task),
             user_query=task["user_message"],
-            persona_id=persona_id, file_ids=file_ids, lang=task.get("lang", "zh"),
+            persona_id=persona_id, file_ids=file_ids, lang=lang,
             user_perms=user_perms,
         )
     except Exception:

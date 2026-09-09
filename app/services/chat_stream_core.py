@@ -30,7 +30,7 @@ async def route_intent(ctx: ChatStreamCtx) -> None:
     """意图路由：先分类用户意图，只加载匹配工具；设置 ctx 的 agents/simple/recommend/tools"""
     from ..agents.router import classify_intent, get_tools_for_intent
     try:
-        intent_result = await classify_intent(ctx.user_query, use_llm=False)
+        intent_result = await classify_intent(ctx.user_query, use_llm=False, username=ctx.username)
         matched_agents = intent_result.get("agents", [])
         is_simple = intent_result.get("is_simple", True)
         is_recommend = intent_result.get("is_recommend", False)

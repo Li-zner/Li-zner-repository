@@ -6,6 +6,7 @@ import json
 
 from ..core.db import get_pool
 from ..core.logging import setup_logging
+from ..core.concurrency import spawn
 
 logger = setup_logging()
 
@@ -38,7 +39,8 @@ async def audit(user_id: str, action: str, detail: dict | None = None) -> None:
         except Exception as e:
             logger.warning(f"审计写入失败（不影响主流程）: {e}")
 
-    asyncio.create_task(_write())
+    # spawn 持强引用：裸 create_task 的后台任务可被 GC 中途回收（2026-09-07 审查 P2）
+    spawn(_write(), name=f"audit:{action}")
 
 
 async def query_audit(user_id: str = "", action: str = "", limit: int = 100) -> list:

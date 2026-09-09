@@ -97,24 +97,35 @@ async def mark_key_result(key: str, ok: bool) -> None:
 # ---------- 公共非流式 LLM 调用（带 Flash 降级） ----------
 # 场景：地图推荐 / 子代理等非流式调用。DEEPSEEK_MODEL 若与上游白名单不匹配（400），
 # 自动用 DEEPSEEK_FLASH_MODEL 重试——与主链路 model_try_list 降级语义一致。
-async def post_chat_completion(payload: dict, timeout: float) -> tuple[bool, dict]:
+async def post_chat_completion(payload: dict, timeout: float, prefer_flash: bool = False,
+                               preferred_timeout: float | None = None) -> tuple[bool, dict]:
     """非流式 /chat/completions 公共原语：llm_endpoint 按模型路由端点，
     主模型失败时自动用 DEEPSEEK_FLASH_MODEL（走 DeepSeek 端点）重试。
+    prefer_flash=True 时 flash 优先、原模型兜底——轻量结构化任务（地图推荐/
+    查询改写）flash 生成快得多（2026-09-09 埋点：主模型 10-17s，flash 1-6s）。
+    preferred_timeout：首选模型的单独超时（2026-09-10 埋点：flash 间歇性挂起
+    吃满 15s 才换备用，总计 21-27s；给首选 8s 快速熔断，总时长可控）。
     返回 (ok, data)；失败时 data 为 {"status":..., "body":...} 诊断信息。
     """
     import httpx
     from ..core.config import DEEPSEEK_FLASH_MODEL, DEEPSEEK_MODEL, llm_endpoint
-    models = [payload.get("model") or DEEPSEEK_MODEL, DEEPSEEK_FLASH_MODEL]
+    primary = payload.get("model") or DEEPSEEK_MODEL
+    models = [DEEPSEEK_FLASH_MODEL, primary] if prefer_flash else [primary, DEEPSEEK_FLASH_MODEL]
     seen: set = set()
     last = {"status": None, "body": ""}
-    for model in models:
+    for idx, model in enumerate(models):
         if model in seen:
             continue
         seen.add(model)
+        attempt_timeout = (preferred_timeout or timeout) if idx == 0 else timeout
         base_url, api_key = llm_endpoint(model, os.getenv("DEEPSEEK_API_KEY", ""))
         body = dict(payload, model=model)
+        if model.startswith("qwen"):
+            # 百炼兼容端点对带 temperature 的请求偶发 400（历史注释），
+            # 随机温度抖动只用于 DeepSeek 侧，qwen 兜底时剥离
+            body.pop("temperature", None)
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=attempt_timeout) as client:
                 resp = await client.post(
                     f"{base_url}/chat/completions",
                     headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},

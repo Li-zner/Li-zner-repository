@@ -169,6 +169,7 @@ onMounted(() => {
             {{ countdown > 0 ? `${countdown}s` : t('get_code') }}
           </button>
         </div>
+        <div v-if="info" class="info-msg code-info">{{ info }}</div>
         <input
           v-model="phonePassword"
           type="password"
@@ -182,7 +183,6 @@ onMounted(() => {
         </label>
         <button type="button" class="btn-primary" @click="handlePhoneLogin">{{ t('phone_login_btn') }}</button>
         <div v-if="error" class="error-msg">{{ error }}</div>
-        <div v-if="info" class="info-msg">{{ info }}</div>
       </div>
 
       <!-- GitHub 登录 -->
@@ -286,6 +286,12 @@ onMounted(() => {
   white-space: nowrap;
   transition: 0.2s;
   box-sizing: border-box;
+}
+/* 验证码发送提示：贴在验证码行下方（高度对齐发送按钮的紧凑条） */
+.code-info {
+  margin: 8px 0 0;
+  padding: 4px 0;
+  min-height: 18px;
 }
 .field-hint {
   margin: -6px 0 12px;

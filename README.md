@@ -13,7 +13,6 @@
 ## 目录导览
 
 - [showcase/](showcase/README.md) —— 项目展示（给 HR / 招聘方看的完整细则）
-- [docs/](docs/) —— 架构文档与学习笔记
 - [app/](app/) —— 后端核心代码（FastAPI 分层：routes / services / agents / payment / core）
 - [frontend/](frontend/) —— 前端 v2 源码（Vue3 + TypeScript + Vite）
 - [可复用资产/](可复用资产/) —— 跨项目可复用资产（AI 应用资产 / 前端资产 / harness 模板 / MCP / skill）

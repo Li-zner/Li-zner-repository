@@ -113,3 +113,6 @@ desktop.ini
 
 # 本地权限/个人配置（含 ssh 允许，不入库）
 .claude/settings.local.json
+
+# ---------- 内部学习笔记与复盘文档（本地保留，不进公开仓库） ----------
+docs/

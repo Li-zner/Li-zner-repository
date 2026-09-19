@@ -17,11 +17,13 @@ const error = ref('')
 const errorOk = ref(false)
 const countdown = ref(0)
 const busy = ref(false)
+const sending = ref(false)
 let timer: ReturnType<typeof setInterval> | null = null
 
 async function sendCode() {
-  if (countdown.value > 0) return
+  if (countdown.value > 0 || sending.value) return
   error.value = ''
+  sending.value = true
   try {
     await sendPhoneCode(phone.value)
     errorOk.value = true
@@ -34,6 +36,8 @@ async function sendCode() {
   } catch (e) {
     errorOk.value = false
     error.value = e instanceof Error ? e.message : t('send_failed_2')
+  } finally {
+    sending.value = false
   }
 }
 
@@ -46,7 +50,9 @@ async function submit() {
   try {
     const result = await bindPhone(phone.value, code.value)
     saveTokens(result)
-    await auth.loadProfile()
+    // 绑定已经成功即为成功；profile 刷新失败只影响本地资料缓存，不能把
+    // 一次已提交成功的绑定反转成“操作失败”。
+    void auth.loadProfile().catch(() => {})
     emit('close')
     emit('bound')
   } catch (e) {
@@ -69,14 +75,14 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
       </div>
       <div class="modal-body">
         <div style="font-size:13px;color:var(--text-secondary);margin-bottom:16px;line-height:1.6;">{{ props.tip || t('bind_phone_trial_tip') }}</div>
-        <input v-model="phone" type="text" :placeholder="t('phone_input_ph')">
+        <input v-model="phone" type="tel" inputmode="numeric" maxlength="11" :placeholder="t('phone_input_ph')">
         <div style="display:flex;gap:6px;margin-bottom:14px;">
-          <input v-model="code" type="text" :placeholder="t('code_ph')">
-          <button :disabled="countdown > 0" style="width:110px;flex-shrink:0;padding:12px 0;background:var(--primary);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;" @click="sendCode">
+          <input v-model="code" type="text" inputmode="numeric" maxlength="6" :placeholder="t('code_ph')">
+          <button :disabled="countdown > 0 || sending" style="width:110px;flex-shrink:0;padding:12px 0;background:var(--primary);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;" @click="sendCode">
             {{ countdown > 0 ? `${countdown}s` : t('bind_phone_send_code') }}
           </button>
         </div>
-        <div v-if="error" style="font-size:13px;margin-bottom:10px;color:#ef4444;">{{ error }}</div>
+        <div v-if="error" :style="{ fontSize: '13px', marginBottom: '10px', color: errorOk ? '#22c55e' : '#ef4444' }">{{ error }}</div>
         <div style="display:flex;gap:8px;">
           <button :disabled="busy" style="flex:1;padding:12px;background:var(--primary);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;" @click="submit">{{ t('bind_phone_btn') }}</button>
           <button style="flex:1;padding:12px;background:var(--bg-body);color:var(--text-secondary);border:1.5px solid var(--border-color);border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;" @click="emit('close')">{{ t('skip_bind') }}</button>

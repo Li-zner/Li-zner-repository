@@ -8,13 +8,16 @@ from typing import AsyncIterator, Dict, List, Optional
 
 from ..core.config import DEEPSEEK_MODEL, TOOL_TIMEOUT
 from ..core.logging import setup_logging
+from ..core.persona_manager import is_civil_persona
 from ..core.stream_utils import dispatch_tool, sse
-from ..core.safety_filter import get_filter
+from ..core.safety_filter import (
+    get_filter, sanitize_untrusted_text, serialize_untrusted_value,
+)
 from .chat_stream_ctx import ChatStreamCtx, finalize_answer
-from .chat_support import hide_reasoning, mark_key_result
-from .reasoning_guard import sanitize_reasoning
+from .chat_support import display_safe_tool_result, hide_reasoning, mark_key_result
 from .llm_streaming import _spawn_drain_bill, record_token_usage, stream_llm_throttled
 from .chat_fallback import fallback_chain
+from .rag_request_trace import mark_route
 
 logger = setup_logging()
 MAX_STEPS = 3
@@ -51,6 +54,65 @@ def _frame_tool_calls(tool_calls_index: Dict) -> Optional[List[dict]]:
     ]
 
 
+def _drain_bill_blocked(agen, ctx: ChatStreamCtx, fallback_text: str) -> None:
+    """DFA 拦截 break 遗弃上游生成器时的计费排空（2026-09-12 深检 P1）。
+
+    usage 尾块未消费则本步计 0，而上游 token 已真实消耗——与断连同款机制
+    排空计费；正常结束的 usage 已在流内消费，不会双计。
+    """
+    _spawn_drain_bill(agen, ctx.username, ctx.conv_id, "react-blocked",
+                      fallback_text=fallback_text)
+
+
+async def _fallback_and_finalize(ctx: ChatStreamCtx, full_content: str) -> AsyncIterator[str]:
+    """降级链输出 + 统一收尾（2026-09-14 审计 P1）。
+
+    降级输出此前只转发未 finalize——会话历史、日请求计数、RAG answer trace 全缺。
+    聚合最终文本（answer_complete 承载终检后全文）后与正常路径同一收口；
+    write_cache=False：降级答案可能残缺/为兜底文案，不入缓存。
+
+    saved_normally 先于 finalize 置位（C-F11 同款教训）：降级内容此刻已送达前端，
+    finalize 若抛异常绝不能让上层再降级出第二段回答。
+
+    full_content 非空说明失败前已有 answer_chunk 送达前端，此时不得换模型重答
+    （2026-09-19 审查 chat P2-1，与 llm_streaming.answer_via_models 同口径）。
+    """
+    if full_content:
+        async for chunk in _finalize_partial_answer(ctx, full_content):
+            yield chunk
+        return
+    from .chat_fallback import accumulate_sse_text
+    _fb_text = ""
+    async for chunk in fallback_chain(ctx.req, ctx.username, cache_ctx=ctx.cache_ctx):
+        yield chunk
+        _fb_text = accumulate_sse_text(_fb_text, chunk)
+    _final = _fb_text or full_content or "抱歉，我暂时无法回答。"
+    ctx.partial_answer = _final
+    ctx.saved_normally = True
+    ctx.finished = True
+    try:
+        await finalize_answer(ctx, _final, write_cache=False)
+    except Exception as fin_err:
+        logger.warning(f"降级收尾失败（内容已送达，不影响用户）: {fin_err}")
+
+
+async def _finalize_partial_answer(ctx: ChatStreamCtx,
+                                   full_content: str) -> AsyncIterator[str]:
+    """已流出部分回答时的收口（2026-09-19 审查 chat P2-1）。
+
+    换模型重答会与已送达的半截回答拼接成前后矛盾的两段，故只补完成标记；
+    内容未经完整生成，不写语义缓存（write_cache=False）。
+    """
+    ctx.partial_answer = full_content
+    yield sse("answer_complete", full_content) + "data: [DONE]\n\n"
+    ctx.saved_normally = True
+    ctx.finished = True
+    try:
+        await finalize_answer(ctx, full_content, write_cache=False)
+    except Exception as fin_err:
+        logger.warning(f"中途失败收尾失败（内容已送达，不影响用户）: {fin_err}")
+
+
 async def _stream_react(ctx: ChatStreamCtx, model_try: str, frame: Dict) -> AsyncIterator[str]:
     """单步流式消费；产出 SSE；frame 记录 {full_reasoning, full_content, tool_calls, usage, fallback, content_blocked}"""
     full_reasoning = ""
@@ -58,6 +120,10 @@ async def _stream_react(ctx: ChatStreamCtx, model_try: str, frame: Dict) -> Asyn
     has_tool_calls = False
     content_blocked = False
     sf = get_filter()
+    # 跨块敏感词守卫（2026-09-10 审查 P2）：块尾缓冲拼接后再送检，
+    # 拦住被块边界切开的词；收尾终检仍保留作兜底
+    from ..core.safety_filter import ContentStreamGuard
+    _content_guard = ContentStreamGuard(sf)
     tool_calls_index: Dict = {}
     usage = {"prompt_tokens": 0, "completion_tokens": 0}
     _agen = stream_llm_throttled(
@@ -70,35 +136,47 @@ async def _stream_react(ctx: ChatStreamCtx, model_try: str, frame: Dict) -> Asyn
                 usage.update(payload)
             elif kind == "reasoning":
                 if not hide_reasoning(ctx.persona_id, ctx.persona):
-                    chunk = sanitize_reasoning(payload)
-                    if chunk:
-                        full_reasoning += chunk
-                        yield sse("reasoning_chunk", chunk)
+                    # 思考已在 stream_llm_throttled 内经 ReasoningStreamGuard 行级过滤
+                    # （勿再 sanitize：那会 strip 掉行尾换行，思考行在展示端粘连）
+                    if payload:
+                        full_reasoning += payload
+                        yield sse("reasoning_chunk", payload)
             elif kind == "answer":
-                # 逐块 DFA 过滤：answer_chunk 此刻已实时发往前端，事后检查拦不回
-                # （与 runner 任务路径同一标准；跨块词由收尾终检兜底）
-                _chk = sf.check_stream(payload)
-                if not _chk["safe"]:
+                # 逐块 DFA 过滤 + 跨块缓冲（2026-09-10）：answer_chunk 此刻已实时
+                # 发往前端，事后检查拦不回（与 runner 任务路径同一标准）
+                _piece, _blocked = _content_guard.feed(payload)
+                if _blocked:
                     full_content += sf.safe_message
                     yield sse("answer_chunk", sf.safe_message)
                     content_blocked = True
+                    _drain_bill_blocked(_agen, ctx, full_content)
                     break
-                full_content += payload
-                yield sse("answer_chunk", payload)
+                if _piece:
+                    full_content += _piece
+                    yield sse("answer_chunk", _piece)
             elif kind == "tool_calls":
                 has_tool_calls = True
                 _accumulate_tool_calls(tool_calls_index, payload["delta"])
+        if not content_blocked:
+            _tail, _tail_blocked = _content_guard.flush()
+            if _tail_blocked:
+                content_blocked = True
+                full_content += sf.safe_message
+                yield sse("answer_chunk", sf.safe_message)
+            elif _tail:
+                full_content += _tail
+                yield sse("answer_chunk", _tail)
         if full_reasoning:
             yield f"data: {json.dumps({'type': 'reasoning_done'})}\n\n"
     except Exception as e:
         logger.warning(f"DeepSeek API 调用失败 (流式): {e}")
+        from ..core.metrics import llm_requests_total as _lrt
+        _lrt.labels(model=model_try, endpoint='v2_chat', status='error').inc()  # 2026-09-11 审查 P1：告警接线
         await mark_key_result(ctx.api_key, False)
-        if full_content:
-            ctx.partial_answer = full_content
-        async for chunk in fallback_chain(ctx.req, ctx.username, cache_ctx=ctx.cache_ctx):
+        # 中途失败收口（2026-09-19 审查 chat P2-1）：已流出部分回答时不再换模型重答，
+        # 分派见 _fallback_and_finalize
+        async for chunk in _fallback_and_finalize(ctx, full_content):
             yield chunk
-        ctx.saved_normally = True
-        ctx.finished = True
         frame["fallback"] = True
         return
     except (GeneratorExit, asyncio.CancelledError):
@@ -143,7 +221,16 @@ async def _execute_react_tools(ctx: ChatStreamCtx, tool_calls: List[dict], frame
         else:
             # 兜底查询统一用改写后的 user_query（与 chat_fast_paths:175 同一口径，
             # 2026-09-07 审查 P2：原先一个用 req.query 一个用 user_query，语义不一致）
-            tasks.append(dispatch_tool(func_name, args, ctx.user_query, ctx.user_perms, ctx.username))
+            _persona_id = getattr(ctx, "persona_id", "")
+            if _persona_id:
+                tasks.append(dispatch_tool(
+                    func_name, args, ctx.user_query, ctx.user_perms, ctx.username,
+                    persona_id=_persona_id,
+                ))
+            else:
+                tasks.append(dispatch_tool(
+                    func_name, args, ctx.user_query, ctx.user_perms, ctx.username,
+                ))
     _tool_task_list = [asyncio.create_task(coro) for coro in tasks]
     try:
         tool_results = await asyncio.wait_for(
@@ -153,13 +240,20 @@ async def _execute_react_tools(ctx: ChatStreamCtx, tool_calls: List[dict], frame
             if not _t.done():
                 _t.cancel()
         logger.warning("工具并行调用超时，触发降级")
-        yield sse("reasoning_chunk", '知识库查询超时，正在基于已有知识继续回答...')
+        _timeout_note = (
+            '知识库查询超时，本次无法基于民法典依据继续回答。'
+            if is_civil_persona(ctx.persona_id)
+            else '知识库查询超时，正在基于已有知识继续回答...'
+        )
+        yield sse("reasoning_chunk", _timeout_note)
         tool_results = [{"error": "工具查询超时", "fallback": True} for _ in tool_calls]
 
     for idx, result in enumerate(tool_results):
         if isinstance(result, Exception):
             result = {"error": str(result)}
-        yield f"data: {json.dumps({'type': 'tool_result', 'index': idx, 'result': result})}\n\n"
+        # 对外事件消毒（2026-09-10 审查 P2）：第三方内容/错误串不直发前端；
+        # frame["tool_results"] 仍持原对象供 LLM 上下文与圆桌使用
+        yield f"data: {json.dumps({'type': 'tool_result', 'index': idx, 'result': display_safe_tool_result(result)})}\n\n"
     law_mapping_hit = None
     for _res in tool_results:
         if isinstance(_res, dict) and _res.get("mapping_hit"):
@@ -170,7 +264,12 @@ async def _execute_react_tools(ctx: ChatStreamCtx, tool_calls: List[dict], frame
 
 
 def _build_tool_messages(tool_calls: List[dict], tool_results: List[dict]) -> List[dict]:
-    """把工具结果拼装为 tool 角色消息（error → 友好降级文案）"""
+    """把工具结果拼装为 tool 角色消息（error → 友好降级文案）。
+
+    2026-09-12 修复（外部复核 P1）：回喂模型的内容须经 _sanitize_context——
+    web_search 等第三方结果可携带"忽略之前指令"式提示词注入（react_steps
+    同款修复，本函数此前漏接）。
+    """
     tool_messages = []
     for idx, result in enumerate(tool_results):
         if isinstance(result, Exception):
@@ -187,7 +286,7 @@ def _build_tool_messages(tool_calls: List[dict], tool_results: List[dict]) -> Li
             result = {"error": error_msg, "fallback_message": fallback_text, "success": False}
         tool_messages.append({
             "role": "tool", "tool_call_id": tool_calls[idx]["id"],
-            "content": json.dumps(result, ensure_ascii=False),
+            "content": serialize_untrusted_value(result),
         })
     return tool_messages
 
@@ -212,7 +311,9 @@ async def _roundtable(ctx: ChatStreamCtx, tool_calls: List[dict], tool_results: 
     try:
         from ..agents.orchestrator import AgentOrchestrator
         from ..agents.router import get_agent_names_for_orchestrator
-        orch = AgentOrchestrator(ctx.req.query)
+        # username 透传（2026-09-14 审计 P1）：圆桌 Phase1 的 LLM 调用原先全部
+        # 漏计费——AgentOrchestrator 按 username 归户计量
+        orch = AgentOrchestrator(ctx.req.query, username=ctx.username)
         agent_names = get_agent_names_for_orchestrator(ctx.matched_agents)
         if not agent_names:
             agent_names = ["query_weather", "query_hotel", "query_route", "query_food"]
@@ -223,9 +324,15 @@ async def _roundtable(ctx: ChatStreamCtx, tool_calls: List[dict], tool_results: 
                 result = {"error": str(result)}
             if func_name in agent_names:
                 if isinstance(result, dict) and "error" in result:
-                    orch.add_tool_result(func_name, {}, error=str(result["error"]))
+                    orch.add_tool_result(
+                        func_name, {},
+                        error=sanitize_untrusted_text(str(result["error"])),
+                    )
                 else:
-                    orch.add_tool_result(func_name, result)
+                    orch.add_tool_result(
+                        func_name,
+                        {"untrusted_tool_data": serialize_untrusted_value(result)},
+                    )
         if orch.get_involved_agents() and len(agent_names) > 1:
             yield sse("thought", '专家们正在讨论分析...')
             discussion_summary = await orch.run(enable_phase2=False)
@@ -235,10 +342,18 @@ async def _roundtable(ctx: ChatStreamCtx, tool_calls: List[dict], tool_results: 
 
 
 async def _inject_discussion(ctx: ChatStreamCtx, discussion_summary: str) -> AsyncIterator[str]:
-    """把讨论摘要发到思考区并作为内部参考注入 system（禁止提及"专家/讨论"等词）"""
+    """把讨论摘要发到思考区并作为内部参考注入 system（禁止提及"专家/讨论"等词）
+
+    CHAT-1（2026-09-19 审查）：摘要出自子 Agent 的 LLM 输出，与主链路思考同
+    性质，必须过同一个 ReasoningStreamGuard——此前模型身份/端点/工具失败类
+    内容可整段零过滤外泄。
+    """
     if not discussion_summary:
         return
-    for line in discussion_summary.split('\n'):
+    from .reasoning_guard import ReasoningStreamGuard
+    guard = ReasoningStreamGuard(getattr(ctx, "persona_id", ""))
+    safe_text = guard.feed(discussion_summary) + guard.flush()
+    for line in safe_text.split('\n'):
         if line.strip():
             yield sse("reasoning_chunk", line + "\n")
     yield f"data: {json.dumps({'type': 'reasoning_done'})}\n\n"
@@ -278,15 +393,17 @@ async def _react_step(ctx: ChatStreamCtx, step: int) -> AsyncIterator[str]:
     tool_calls = frame["tool_calls"]
     if not tool_calls:
         # 纯文本回答：内容已逐块流式发送，此处仅做 DFA 检查 + 完成标记
+        _cacheable = bool(frame["full_content"])
         final_safe = frame["full_content"] or "抱歉，我暂时无法回答。"
         sf = get_filter()
         if sf.contains_sensitive(final_safe):
             logger.warning(f"DFA 拦截响应")
             final_safe = sf.safe_message
+            _cacheable = False
             yield sse("answer_chunk", final_safe)
         yield sse("answer_complete", final_safe) + "data: [DONE]\n\n"
         ctx.partial_answer = final_safe
-        await finalize_answer(ctx, final_safe)
+        await finalize_answer(ctx, final_safe, write_cache=_cacheable)
         ctx.saved_normally = True
         ctx.finished = True
         return
@@ -302,6 +419,16 @@ async def _react_step(ctx: ChatStreamCtx, step: int) -> AsyncIterator[str]:
         ctx.finished = True
         return
 
+    if is_civil_persona(ctx.persona_id):
+        from .civil_grounding import civil_tool_result, grounding_reply
+        if not any(civil_tool_result(result) for result in (tool_results or [])):
+            _civil_stop = grounding_reply("no_evidence", ctx.req.lang)
+            yield sse("answer_complete", _civil_stop) + "data: [DONE]\n\n"
+            await finalize_answer(ctx, _civil_stop, write_cache=False)
+            ctx.saved_normally = True
+            ctx.finished = True
+            return
+
     round_frame: Dict = {}
     async for ev in _roundtable(ctx, tool_calls, tool_results, round_frame):
         yield ev
@@ -315,8 +442,14 @@ async def _react_step(ctx: ChatStreamCtx, step: int) -> AsyncIterator[str]:
 
 async def react_loop(ctx: ChatStreamCtx) -> AsyncIterator[str]:
     """ReAct 主循环（max_steps）；耗尽后返回已有内容兜底"""
+    mark_route("react")
     yield sse("thought", '正在分析你的问题...')
     await ctx.mm.save_user_message({"role": "user", "content": ctx.req.query})
+    # P0 修复（2026-09-11 规则审查）：ctx.messages 由 _assemble_messages 组装时
+    # 只有 system+历史（旧版 v2.py 单体里有 user 消息追加，纯移动重构时丢失），
+    # 导致 ReAct 路径的 LLM 在"没有当前问题"的上下文上作答/决定工具调用。
+    # 此处恰好每请求进入一次，且 fast path 不经过本函数（自行追加），互不重复。
+    ctx.messages.append({"role": "user", "content": ctx.user_query})
     for step in range(MAX_STEPS):
         async for ev in _react_step(ctx, step):
             yield ev
@@ -330,7 +463,11 @@ async def react_loop(ctx: ChatStreamCtx) -> AsyncIterator[str]:
                 last_content = m["content"]
                 break
         if not last_content:
-            last_content = "抱歉，我暂时无法完成完整的回答。"
+            if is_civil_persona(ctx.persona_id):
+                from .civil_grounding import grounding_reply
+                last_content = grounding_reply("service_error", ctx.req.lang)
+            else:
+                last_content = "抱歉，我暂时无法完成完整的回答。"
         logger.warning(f"V2 循环达到最大步数，返回已有内容: {len(last_content)} chars")
         yield sse("answer_complete", last_content) + "data: [DONE]\n\n"
         ctx.partial_answer = last_content

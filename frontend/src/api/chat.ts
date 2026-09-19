@@ -5,8 +5,8 @@
  *   thought / reasoning_chunk / reasoning_done / answer_chunk /
  *   answer_complete / tool_call / tool_result，终止 data: [DONE]
  */
-import { ApiError, getAccessToken, refreshAccessToken } from './http'
-import { SseLineFramer, type SseEvent } from './sse'
+import { ApiError, getAccessToken, notifyUnauthorized, refreshAccessToken, resolve_url } from './http'
+import { SseLineFramer, SSE_DONE, type SseEvent } from './sse'
 
 export type ChatStreamHandler = (event: SseEvent) => void
 
@@ -24,7 +24,7 @@ export interface ChatStreamOptions {
 
 /** 发起流式请求；401 时单飞刷新后重试一次（对齐 http.ts 的 request 语义） */
 async function fetchStream(body: string, signal: AbortSignal | undefined, retried: boolean): Promise<Response> {
-  const resp = await fetch('/v2/chat/stream', {
+  const resp = await fetch(resolve_url('/v2/chat/stream'), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -36,6 +36,11 @@ async function fetchStream(body: string, signal: AbortSignal | undefined, retrie
   })
   if (resp.status === 401 && !retried && (await refreshAccessToken())) {
     return fetchStream(body, signal, true)
+  }
+  // 刷新最终失败：与 http.ts request 语义对齐——清登录态并触发跳登录兜底
+  // （2026-09-10 审查 P2：原先流式 401 刷新失败既不清 token 也不跳登录）
+  if (resp.status === 401) {
+    notifyUnauthorized()
   }
   return resp
 }
@@ -65,16 +70,49 @@ export async function streamChat(opts: ChatStreamOptions): Promise<void> {
 
   // 完整事件对象透传：tool_call 的 name/args、tool_result 的 result 是顶层字段，
   // 只传 type/content 会把工具动态展示整个剥掉
+  // 截断检测（2026-09-12 外部复核 P1）：后端所有路径都以 answer_complete+[DONE]
+  // 终结（chat_fallback 兜底保证）；两者皆缺 = 流被中途掐断，回答可能不完整
+  let terminated = false
   const framer = new SseLineFramer((event) => {
-    if (event) opts.onEvent(event)
+    if (!event) return
+    if (event === SSE_DONE) {
+      terminated = true
+      return
+    }
+    if (event.type === 'answer_complete') terminated = true
+    opts.onEvent(event)
   })
 
   const reader = resp.body.getReader()
   const decoder = new TextDecoder()
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    framer.feed(decoder.decode(value, { stream: true }))
+  // 空闲看门狗：60s 无任何字节视为连接僵死（2026-09-12 修复：原先流悬挂时
+  // 前端永久停留"生成中"且无法恢复）
+  let timedOut = false
+  let watchdog: ReturnType<typeof setTimeout> | null = null
+  const resetWatchdog = () => {
+    if (watchdog) clearTimeout(watchdog)
+    watchdog = setTimeout(() => {
+      timedOut = true
+      reader.cancel('idle timeout').catch(() => {})
+    }, 60000)
+  }
+  resetWatchdog()
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      // 每个有效 chunk 都代表连接仍在工作，必须重新计算空闲时间。
+      resetWatchdog()
+      framer.feed(decoder.decode(value, { stream: true }))
+    }
+  } catch (e) {
+    if (!timedOut) throw e
+    throw new ApiError(504, '连接空闲超时，请重试')
+  } finally {
+    if (watchdog) clearTimeout(watchdog)
   }
   framer.flush()
+  if (!terminated) {
+    throw new ApiError(502, '连接中断，回答可能不完整，请重试')
+  }
 }

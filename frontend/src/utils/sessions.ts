@@ -12,13 +12,15 @@ export interface ChatSession {
   pinned?: boolean
 }
 
-function storageKey(personaId: string): string {
-  return `gw_sessions_${personaId}`
+function storageKey(personaId: string, owner = ''): string {
+  // 认证态必须绑定账号；shared 键已废弃，避免 profile 尚未加载时串读旧数据。
+  return `gw_sessions_${owner}_${personaId}`
 }
 
-export function loadSessions(personaId: string): ChatSession[] {
+export function loadSessions(personaId: string, owner = ''): ChatSession[] {
+  if (!owner) return []
   try {
-    const raw = localStorage.getItem(storageKey(personaId))
+    const raw = localStorage.getItem(storageKey(personaId, owner))
     if (!raw) return []
     const parsed: unknown = JSON.parse(raw)
     // 形状防御：损坏数据（对象/数字等）兜底为空，避免后续 unshift/find 抛异常
@@ -28,8 +30,9 @@ export function loadSessions(personaId: string): ChatSession[] {
   }
 }
 
-export function saveSessions(personaId: string, sessions: ChatSession[]): void {
-  localStorage.setItem(storageKey(personaId), JSON.stringify(sessions))
+export function saveSessions(personaId: string, sessions: ChatSession[], owner = ''): void {
+  if (!owner) return
+  localStorage.setItem(storageKey(personaId, owner), JSON.stringify(sessions))
 }
 
 /** 随机 id：crypto.randomUUID 优先（http 不安全环境回退时间戳+随机串） */
@@ -57,7 +60,7 @@ export function sessionToMarkdown(s: ChatSession, locale = 'zh'): string {
   const fmt = (ts?: number) =>
     ts ? new Date(ts).toLocaleString(locale === 'zh' ? 'zh-CN' : 'en-US') : ''
   const roleLabel = (m: ChatMessage) =>
-    m.role === 'user' ? (locale === 'zh' ? '🧑 我' : '🧑 Me') : (locale === 'zh' ? '🤖 助手' : '🤖 Assistant')
+    m.role === 'user' ? (locale === 'zh' ? '用户' : 'User') : (locale === 'zh' ? '助手' : 'Assistant')
   const lines: string[] = [`# ${s.title}`, '']
   if (locale === 'zh') lines.push(`> 导出于 ${fmt(Date.now())}`, '')
   else lines.push(`> Exported at ${fmt(Date.now())}`, '')

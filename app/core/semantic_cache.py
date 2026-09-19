@@ -9,6 +9,7 @@ from ..core.redis import get_redis
 from ..core.logging import setup_logging
 from ..core.metrics import semantic_cache_hits_total, semantic_cache_misses_total
 from ..core.config import CACHE_SIMILARITY_THRESHOLD, CACHE_L0_TTL
+from .place_extract import travel_constraint_fingerprint
 
 logger = setup_logging()
 
@@ -38,6 +39,10 @@ class _LRUCache:
         self._cache.move_to_end(key)
         if len(self._cache) > self._capacity:
             self._cache.popitem(last=False)
+
+    def invalidate(self, key: str) -> None:
+        """删除单个热缓存键；动作执行器用于精确失效。"""
+        self._cache.pop(key, None)
 
     def __len__(self):
         return len(self._cache)
@@ -71,17 +76,38 @@ class SemanticCache:
     SIMILARITY_THRESHOLD = CACHE_SIMILARITY_THRESHOLD
 
     @staticmethod
-    def build_cache_ctx(persona_id: str = "", user_profile: str = "") -> str:
-        """构建语义缓存上下文维度（人格|画像指纹）
+    def build_cache_ctx(username: str = "", persona_id: str = "",
+                        user_profile: str = "", conversation_id: str = "",
+                        user_query: str = "", lang: str = "",
+                        model: str = "") -> str:
+        """构建语义缓存上下文维度（用户|人格|画像指纹|会话指纹|旅游约束|语言|模型）
 
         背景（Bug #1）：缓存按 query 建键，而回答会注入人格/画像等个性化上下文，
         导致 A 用户的个性化回答被缓存命中给 B 用户。
-        修复：回答进入缓存必须带上下文维度；画像用 SHA-256 前 8 位做指纹，
-        既隔离不同画像的回答，又不把画像明文写进缓存表。
-        相同上下文可互用，不同上下文互不可见。
+        修复：回答进入缓存必须带上下文维度；画像/会话均用 SHA-256 前 16 位做指纹
+        （画像原 8 位/32bit 在 ~10^5 用户量级生日碰撞概率≈1，碰撞对之间画像隔离
+        失效，2026-09-10 审查对齐），既隔离不同画像/窗口，又不把明文写进缓存表。
+        2026-09-12 修复（外部复核 P0）：会话指纹来自调用方可控的 conversation_id
+        （客户端可传任意值），画像相同的两个账号复用会话 ID 即可互串缓存——
+        增加不可变 username 作为首位分量，跨账号缓存彻底隔离。
+
+        2026-09-17：旅游答案会被日期、天数、同行人、预算、主题直接改变，
+        仅靠文本相似度会在 0.85 阈值下误命中。这里追加结构化约束指纹，
+        约束不同的查询自然落到不同缓存分区，无需数据库迁移。
+
+        2026-09-19 审查 core P2-5：再补语言与模型两个维度——同一条 query 文本在
+        zh/en 界面指令下答案语言不同，缺 lang 会互相命中；换主模型后旧模型的答案
+        也会继续命中。两者非 PII，明文并入键尾便于排障。
         """
-        profile_fp = hashlib.sha256((user_profile or "").encode("utf-8")).hexdigest()[:8]
-        return f"{persona_id or ''}|{profile_fp}"
+        user_fp = hashlib.sha256((username or "").encode("utf-8")).hexdigest()[:16]
+        profile_fp = hashlib.sha256((user_profile or "").encode("utf-8")).hexdigest()[:16]
+        conv_fp = hashlib.sha256((conversation_id or "").encode("utf-8")).hexdigest()[:16]
+        base = f"{user_fp}|{persona_id or ''}|{profile_fp}|{conv_fp}"
+        force_travel = "travel" in (persona_id or "").lower() or "旅游" in (persona_id or "")
+        constraint_fp = travel_constraint_fingerprint(user_query, force=force_travel)
+        if constraint_fp:
+            base = f"{base}|{constraint_fp}"
+        return f"{base}|{lang or ''}|{model or ''}"
 
     @staticmethod
     async def get(query: str, cache_ctx: str = ""):
@@ -102,7 +128,7 @@ class SemanticCache:
         pool = await get_pool()
         query_hash = hashlib.sha256(query.encode()).hexdigest()
 
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=5) as conn:
             # L1: 精确匹配（毫秒级）
             row = await conn.fetchrow(
                 "SELECT response FROM semantic_cache "
@@ -149,7 +175,7 @@ class SemanticCache:
                 )
                 logger.info(f"语义缓存命中 (相似度 {row['sim']:.2f}): {query[:30]}...")
                 semantic_cache_hits_total.inc()
-                # 回填 L0 + L1
+                # 回填 L0 热缓存（L1 为 PG 源数据不回写，147-148 设计如此）
                 _hot_cache.set(l0_key, row["response"], ttl=_hot_ttl())
                 return row["response"]
 
@@ -190,7 +216,7 @@ class SemanticCache:
         pool = await get_pool()
         query_hash = hashlib.sha256(query.encode()).hexdigest()
 
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=5) as conn:
             await conn.execute(
                 """
                 INSERT INTO semantic_cache (query_hash, query_text, response, cache_ctx)
@@ -204,6 +230,19 @@ class SemanticCache:
                 cache_ctx,
             )
             logger.info(f"缓存写入: {query[:30]}...")
+
+    @staticmethod
+    async def invalidate_exact(query: str, cache_ctx: str = "") -> int:
+        """精确失效单条缓存：同时清 L0 热缓存和 PG 精确行。"""
+        _hot_cache.invalidate(_cache_l0_key(query, cache_ctx))
+        pool = await get_pool()
+        query_hash = hashlib.sha256(query.encode()).hexdigest()
+        async with pool.acquire(timeout=5) as conn:
+            row = await conn.fetchrow(
+                "DELETE FROM semantic_cache "
+                "WHERE query_hash=$1 AND cache_ctx=$2 RETURNING 1",
+                query_hash, cache_ctx)
+        return 1 if row else 0
 
     @staticmethod
     async def set_empty(query: str, cache_ctx: str = "", ttl: int = 30):

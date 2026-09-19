@@ -63,7 +63,7 @@ function pickTheme(theme: string) {
         <div class="s-avatar">{{ (auth.user?.display_name || auth.user?.username || '?').slice(0, 1).toUpperCase() }}</div>
         <div class="s-user">
           <div class="s-name">{{ auth.user?.display_name || auth.user?.username }}</div>
-          <div class="s-role">{{ auth.user?.role === 'admin' ? '管理员' : '用户' }}</div>
+          <div class="s-role">{{ auth.user?.role === 'admin' ? t('role_admin') : t('role_user') }}</div>
         </div>
         <button class="s-close" @click="ui.closeSettings()">✕</button>
       </header>

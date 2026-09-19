@@ -27,8 +27,6 @@ from datetime import datetime, timezone
 from typing import Optional, Dict
 from ..core.redis import get_redis as _get_redis
 from ..core.config import TASK_TTL_SECONDS, TASK_TIMEOUT
-from ..core.concurrency import spawn
-
 from ..core.logging import setup_logging
 
 logger = setup_logging()
@@ -79,27 +77,84 @@ async def get_task(task_id: str) -> Optional[dict]:
     result = {k.decode() if isinstance(k, bytes) else k:
               v.decode() if isinstance(v, bytes) else v
               for k, v in data.items()}
-    # 惰性超时：pending/generating 超时 → 读侧标记 timeout（不写回，由外部定时任务清理）
+    # 惰性超时：pending/generating 超时 → CAS 写回真实终态 timeout 并设取消
+    # 标记（生成实例下一检查点退出）。2026-09-12 修复（外部复核 P1）：原实现只在
+    # 返回对象上标记不回写——后台任务继续运行并可能晚到写 completed。
     if result.get("status") in ("pending", "generating"):
         try:
             _dt = datetime.fromisoformat(result.get("created_at") or "")
             if _dt.tzinfo is None:
                 _dt = _dt.replace(tzinfo=timezone.utc)
             if (datetime.now(timezone.utc) - _dt).total_seconds() > TASK_TIMEOUT:
-                result["status"] = "timeout"
+                ok = await r.eval(
+                    _TIMEOUT_TASK_LUA, 1, f"task:{task_id}",
+                    "timeout", result.get("result") or "",
+                    datetime.now(timezone.utc).isoformat(),
+                    str(TASK_TTL),
+                )
+                if ok == 1:
+                    # 设跨实例取消标记：生成实例在下一检查点（usage/边界）退出
+                    await r.set(_cancel_key(task_id), "timeout", ex=TASK_TTL)
+                    logger.warning(f"任务超时已终结: task_id={task_id}")
+                    result["status"] = "timeout"
+                else:
+                    # CAS 失败说明其他实例已写终态；必须重读真实状态，
+                    # 不能把返回对象强行标成 timeout 欺骗调用方。
+                    fresh = await r.hgetall(f"task:{task_id}")
+                    if fresh:
+                        result = {
+                            k.decode() if isinstance(k, bytes) else k:
+                            v.decode() if isinstance(v, bytes) else v
+                            for k, v in fresh.items()
+                        }
         except Exception as e:
             logger.debug(f"任务超时检查时间解析失败: {e}")
     return result
 
 
-async def update_status(task_id: str, status: str, result: str = ""):
-    """更新任务状态和结果"""
+_TIMEOUT_TASK_LUA = """
+local status = redis.call('HGET', KEYS[1], 'status')
+if status ~= 'pending' and status ~= 'generating' then return 0 end
+redis.call('HSET', KEYS[1],
+    'status', 'timeout',
+    'result', ARGV[1],
+    'updated_at', ARGV[2])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+return 1
+"""
+
+
+_START_TASK_LUA = """
+local status = redis.call('HGET', KEYS[1], 'status')
+if status ~= 'pending' and status ~= 'generating' then return 0 end
+if status == 'generating' and ARGV[1] == 'pending' then return 0 end
+redis.call('HSET', KEYS[1],
+    'status', ARGV[1],
+    'result', ARGV[2],
+    'updated_at', ARGV[3])
+redis.call('EXPIRE', KEYS[1], ARGV[4])
+return 1
+"""
+
+
+async def update_status(task_id: str, status: str, result: str = "") -> bool:
+    """更新任务状态和结果（CAS：仅 pending→generating 合法迁移）。
+
+    2026-09-12 修复（外部复核 P0）：原实现只校验目标状态不校验当前状态——
+    已取消/已完成的任务可被写回 generating，取消失效且继续消耗 token。
+    本函数是 finish/fail/cancel 三个终态 CAS 之外的旁路，现同样按当前态
+    Lua CAS 执行：终态一律拒绝回到 active。
+    """
+    if status not in ("pending", "generating"):
+        raise ValueError(
+            f"update_status 仅限 pending/generating，终态请走 finish/fail/cancel: {status}")
     r = await _redis()
     now = datetime.now(timezone.utc).isoformat()
-    # 显式设置 result（None/空串都覆盖旧值，避免残留，P1 #37）
-    mapping = {"status": status, "updated_at": now, "result": result if result is not None else ""}
-    await r.hset(f"task:{task_id}", mapping=mapping)
-    await r.expire(f"task:{task_id}", TASK_TTL)
+    ok = await r.eval(
+        _START_TASK_LUA, 1, f"task:{task_id}",
+        status, result if result is not None else "", now, TASK_TTL,
+    )
+    return ok == 1
 
 
 async def append_result(task_id: str, chunk: str):
@@ -115,6 +170,12 @@ async def read_accumulated_result(task_id: str) -> str:
     r = await _redis()
     raw = await r.get(f"task:{task_id}:result_buf")
     return raw if raw else ""
+
+
+async def reset_accumulated_result(task_id: str) -> None:
+    """清空结果缓冲，供降级重写完整答案时避免半截内容与降级内容拼接。"""
+    r = await _redis()
+    await r.delete(f"task:{task_id}:result_buf")
 
 
 # ============================================================
@@ -135,7 +196,7 @@ def is_cancelled(task_id: str) -> bool:
 
 
 def set_cancelled(task_id: str):
-    """标记取消"""
+    """标记取消（仅本进程 Event，供生成所在实例快速感知）"""
     ev = get_cancel_event(task_id)
     ev.set()
 
@@ -158,7 +219,7 @@ def _idempotent_key(session_id: str, msg: str) -> str:
     return f"{session_id}:{hashlib.sha256(msg.encode()).hexdigest()[:16]}"
 
 
-async def _persist_idempotent(key: str, task_id: str):
+async def _persist_idempotent(key: str, task_id: str) -> None:
     """写幂等映射到 Redis（10 秒 TTL）；失败仅影响幂等复用，不影响主流程"""
     try:
         r = await _redis()
@@ -169,6 +230,11 @@ async def _persist_idempotent(key: str, task_id: str):
 
 # 占位值：表示同键请求正在创建任务（TTL 10s 自愈，创建方崩溃后自动过期）
 _CREATING = "__creating__"
+
+# 等待超时返回的冲突标记（2026-09-14 审计 P1）：创建方 wait_s 内未写入真实
+# task_id——可能仍在建（建任务链路慢）或已崩溃。调用方应拒绝请求（409），
+# 而不是并发再建第二个任务（那正是幂等占位要防的事）；占位键 TTL 自愈。
+CLAIM_IN_PROGRESS = "__claim_in_progress__"
 
 
 async def try_idempotent(session_id: str, msg: str) -> Optional[str]:
@@ -186,13 +252,13 @@ async def try_idempotent(session_id: str, msg: str) -> Optional[str]:
     return None
 
 
-async def claim_idempotency(session_id: str, msg: str, wait_s: float = 1.0) -> Optional[str]:
+async def claim_idempotency(session_id: str, msg: str, wait_s: float = 1.0):
     """原子占位幂等键（SET NX，P1 #42 修复原 GET→创建→SETEX 检查后行动竞态）
 
-    返回：None=占位成功（调用方继续创建任务）；其余=可复用的 task_id。
-    旧实现两次请求都通过 GET 检查 → 各自建任务；现在首个请求原子占位，
-    后续请求等待读取真实 task_id 复用。等待超时（创建方可能崩溃）按未占位
-    处理退化为原并发语义，TTL 自动清理；Redis 异常同样返回 None（尽力而为）。
+    返回：None=占位成功（调用方继续创建任务）；字符串 task_id=可复用的已有任务；
+    CLAIM_IN_PROGRESS=占位等待超时，创建方仍未写入真实 task_id（2026-09-14 审计 P1：
+    原实现按"未占位"放行会并发再建第二个任务，改返回冲突标记由调用方拒绝）。
+    Redis 异常仍返回 None（尽力而为，幂等是优化不是正确性依赖）。
     """
     key = f"{_IDEMPOTENT_PREFIX}{_idempotent_key(session_id, msg)}"
     try:
@@ -208,9 +274,19 @@ async def claim_idempotency(session_id: str, msg: str, wait_s: float = 1.0) -> O
                 task = await get_task(v)
                 if task and task["status"] in ("pending", "generating"):
                     return v
-                return None  # 旧任务已完结：放行走新建（save_idempotent 会覆盖映射）
+                # 旧任务已终结时用 Lua 原子把映射从旧 task_id 替换为创建占位；
+                # 多个并发请求只有一个能取得创建权，其余继续等待或返回冲突。
+                replaced = await r.eval(
+                    _REPLACE_TERMINAL_CLAIM_LUA,
+                    2, key, f"task:{v}",
+                    v, _CREATING, 10,
+                )
+                if replaced == 1:
+                    return None
+                await asyncio.sleep(0.05)
+                continue
             await asyncio.sleep(0.05)
-        return None  # 创建方超时未写入：按未占位处理（TTL 自愈）
+        return CLAIM_IN_PROGRESS  # 创建方超时未写入：明确冲突，不并发放行
     except Exception:
         return None
 
@@ -220,6 +296,112 @@ _RELEASE_CLAIM_LUA = (
     "if redis.call('get', KEYS[1]) == ARGV[1] then "
     "return redis.call('del', KEYS[1]) else return 0 end"
 )
+
+# 幂等映射指向终态任务时，原子把映射替换为新的创建占位。
+_REPLACE_TERMINAL_CLAIM_LUA = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+local status = redis.call('HGET', KEYS[2], 'status')
+if status == 'pending' or status == 'generating' then return -1 end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+return 1
+"""
+
+
+_FINISH_TASK_LUA = """
+local status = redis.call('HGET', KEYS[1], 'status')
+if status ~= 'pending' and status ~= 'generating' then return 0 end
+redis.call('HSET', KEYS[1],
+    'status', ARGV[1],
+    'result', ARGV[2],
+    'updated_at', ARGV[3])
+redis.call('EXPIRE', KEYS[1], ARGV[4])
+return 1
+"""
+
+_CANCEL_TASK_LUA = """
+local status = redis.call('HGET', KEYS[1], 'status')
+if status ~= 'pending' and status ~= 'generating' then return 0 end
+redis.call('HSET', KEYS[1],
+    'status', 'cancelled',
+    'result', ARGV[1],
+    'updated_at', ARGV[2])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+return 1
+"""
+
+
+async def finish_task(task_id: str, result: str) -> bool:
+    """仅 active 任务可写 completed，禁止晚到结果覆盖 cancelled/error/timeout。"""
+    r = await _redis()
+    now = datetime.now(timezone.utc).isoformat()
+    ok = await r.eval(
+        _FINISH_TASK_LUA, 1, f"task:{task_id}",
+        "completed", result if result is not None else "", now, TASK_TTL,
+    )
+    return ok == 1
+
+
+async def fail_task(task_id: str, result: str) -> bool:
+    """仅 active 任务可写 error，避免异常晚到覆盖取消终态。"""
+    r = await _redis()
+    now = datetime.now(timezone.utc).isoformat()
+    ok = await r.eval(
+        _FINISH_TASK_LUA, 1, f"task:{task_id}",
+        "error", result if result is not None else "", now, TASK_TTL,
+    )
+    return ok == 1
+
+
+async def cancel_task_if_active(task_id: str, partial: str) -> bool:
+    """仅 pending/generating 可转 cancelled，避免取消覆盖刚完成的终态。"""
+    r = await _redis()
+    now = datetime.now(timezone.utc).isoformat()
+    ok = await r.eval(
+        _CANCEL_TASK_LUA, 1, f"task:{task_id}",
+        partial if partial is not None else "", now, TASK_TTL,
+    )
+    return ok == 1
+
+
+def _cancel_key(task_id: str) -> str:
+    return f"task:{task_id}:cancel"
+
+
+async def request_cancel(task_id: str) -> bool:
+    """写跨实例取消标记，返回是否写入成功。
+
+    2026-09-12 修复（外部复核 P1）：写失败原来只告警——取消接口被当作成功但
+    任务继续执行。现返回 False 供路由明确报错。不再 set 本进程 Event（取消
+    请求可能落在非生成实例，本地 Event 对生成实例不可见且条目永不清理）。
+    """
+    try:
+        r = await _redis()
+        await r.set(_cancel_key(task_id), "1", ex=TASK_TTL)
+        return True
+    except Exception as e:
+        logger.warning(f"跨实例取消标记写入失败: {e}")
+        return False
+
+
+async def is_cancelled_remote(task_id: str) -> bool:
+    """检查取消信号：本进程事件优先，再查 Redis 跨实例标记。"""
+    if is_cancelled(task_id):
+        return True
+    try:
+        r = await _redis()
+        return bool(await r.get(_cancel_key(task_id)))
+    except Exception as e:
+        logger.debug(f"取消标记读取失败，按未取消处理: {e}")
+        return False
+
+
+async def clear_cancel_marker(task_id: str) -> None:
+    """任务收尾清理跨实例取消标记。"""
+    try:
+        r = await _redis()
+        await r.delete(_cancel_key(task_id))
+    except Exception as e:
+        logger.debug(f"取消标记清理失败（TTL 自愈）: {e}")
 
 
 async def release_idempotency_claim(session_id: str, msg: str):
@@ -232,11 +414,7 @@ async def release_idempotency_claim(session_id: str, msg: str):
         logger.debug(f"幂等占位释放失败（TTL 自愈）: {e}")
 
 
-def save_idempotent(session_id: str, msg: str, task_id: str):
-    """记录幂等映射（10 秒 TTL，Redis 存储；保持同步签名，调用方无需改）"""
+async def save_idempotent(session_id: str, msg: str, task_id: str) -> None:
+    """等待幂等映射写入 Redis，关闭并发请求的调度窗口。"""
     key = _idempotent_key(session_id, msg)
-    try:
-        # spawn 持强引用：裸 create_task 的后台任务可被 GC 中途回收（2026-09-07 审查 P2）
-        spawn(_persist_idempotent(key, task_id), name="idempotent-persist")
-    except RuntimeError:  # noqa: silent-except 豁免：无运行循环为预期路径
-        pass  # 无运行循环（非 async 上下文）时静默跳过，幂等写入尽力而为
+    await _persist_idempotent(key, task_id)

@@ -48,7 +48,7 @@ core/
 1. **`agents/router.py`** → 理解「意图路由」如何把用户问题分发给正确的 AI 助手
 2. **`agents/runner.py`** → 理解 Agent 如何调用工具、迭代求解
 3. **`agents/orchestrator.py`** → 理解多 Agent 如何并行协作
-4. **`core/semantic_cache.py`** → 理解三级缓存如何扛住 1600 并发
+4. **`core/semantic_cache.py`** → 理解多级缓存结构与隔离键如何防止跨用户、跨会话串答
 5. **`middleware/auth.py`** → 理解认证与刷新令牌轮换
 
 ## 说明

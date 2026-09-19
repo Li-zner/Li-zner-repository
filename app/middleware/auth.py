@@ -18,9 +18,10 @@ from ..core.config import (
 from ..core.logging import setup_logging
 from ..core.password import hash_password, is_legacy_hash, pwd_context, verify_password
 from ..core.redis import get_redis
+from ..core.auth_cookies import ACCESS_COOKIE
 
 logger = setup_logging()
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 # ---------- 数据库用户操作 ----------
 import asyncpg
@@ -29,7 +30,7 @@ from ..core.config import POSTGRES_DSN
 async def get_user(username: str):
     from ..core.db import get_pool
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=5) as conn:
         row = await conn.fetchrow(
             "SELECT username, hashed_password, role, tenant_id, permissions, "
             "phone, quota_limited, used_requests, is_active FROM users WHERE username=$1",
@@ -73,7 +74,7 @@ async def _upgrade_legacy_hash(username: str, password: str):
         from ..core.db import get_pool
         pool = await get_pool()
         new_hashed = hash_password(password)
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=5) as conn:
             await conn.execute(
                 "UPDATE users SET hashed_password=$1 "
                 "WHERE username=$2 AND hashed_password LIKE '$2b$%'",
@@ -102,15 +103,17 @@ def create_refresh_token(data: dict):
     to_encode = data.copy()
     now = datetime.now(timezone.utc)  # P2 #12：废弃 datetime.utcnow
     expire = now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.setdefault("family", uuid.uuid4().hex)
     to_encode.update({"exp": expire, "iat": now, "type": "refresh", "jti": uuid.uuid4().hex})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 def create_token_pair(username: str) -> dict:
     """签发 access + refresh 一对 token（登录/注册/第三方回调统一入口）"""
+    family = uuid.uuid4().hex
     return {
         "access_token": create_access_token({"sub": username}),
-        "refresh_token": create_refresh_token({"sub": username}),
+        "refresh_token": create_refresh_token({"sub": username, "family": family}),
     }
 
 
@@ -169,6 +172,8 @@ async def refresh_access_token(token: str) -> dict:
         user = await get_user(username)
         if user is None:
             raise HTTPException(401, "User not found")
+        if not user.get("is_active", True):
+            raise HTTPException(401, "账号已被禁用")
         # 改密后旧会话失效（2026-09-07 审查 P2）：token 签发早于改密时刻的
         # refresh 一律拒绝（改密时写入 auth:pwd_changed:{username}，TTL 与
         # refresh 有效期一致，过期后无需再比）
@@ -183,6 +188,10 @@ async def refresh_access_token(token: str) -> dict:
     except Exception:
         raise HTTPException(401, "Invalid token")
     r = await get_redis()
+    family = payload.get("family") or jti
+    family_key = f"auth:refresh_family_blacklist:{family}" if family else None
+    if family_key and await r.get(family_key):
+        raise HTTPException(401, "Token family revoked")
     blacklist_key = f"auth:refresh_blacklist:{jti}" if jti else None
     claim_val = uuid.uuid4().hex
     if blacklist_key:
@@ -190,13 +199,18 @@ async def refresh_access_token(token: str) -> dict:
         # 并发重放（旧 token 被盗后与真实客户端同时兑换）第二个请求直接 401。
         claimed = await r.set(blacklist_key, claim_val, nx=True, ex=REFRESH_TOKEN_EXPIRE_DAYS * 86400)
         if not claimed:
-            raise HTTPException(401, "Token revoked")
+            if family_key:
+                await r.set(
+                    family_key, "1",
+                    ex=REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+                )
+            raise HTTPException(401, "Token replay detected")
     try:
         # 先校验与抢占全部成功后才签发，签发异常时回滚抢占（不让用户被锁死）
         new_pair = {
             "username": username,
             "access_token": create_access_token({"sub": username}),
-            "refresh_token": create_refresh_token({"sub": username}),
+            "refresh_token": create_refresh_token({"sub": username, "family": family}),
         }
         return new_pair
     except Exception:
@@ -206,19 +220,35 @@ async def refresh_access_token(token: str) -> dict:
         raise
 
 
-async def revoke_refresh_token(token: str):
-    """登出：把 refresh token 的 jti 加入黑名单（幂等，无效 token 静默忽略）"""
+async def revoke_refresh_token(token: str) -> bool:
+    """登出：把 refresh token 的 jti 与整个 family 加入黑名单。
+
+    返回 False 表示"token 无效"（幂等 OK）或"Redis 异常"（吊销未落地）；
+    调用方可据此向客户端提示登出未完全生效——原先吞掉一切异常只留 debug 日志，
+    Redis 故障时用户以为已登出、token 实际仍可用（假登出，2026-09-10 审查 P2）。
+    """
     try:
         payload = _decode_token(token, verify_exp=False)
-        jti = payload.get("jti")
-        if jti:
-            r = await get_redis()
-            await r.set(
-                f"auth:refresh_blacklist:{jti}", "1",
-                ex=REFRESH_TOKEN_EXPIRE_DAYS * 86400,
-            )
+    except Exception:
+        return False  # token 无效：无 jti 可吊销，幂等成功语义
+    jti = payload.get("jti")
+    if not jti:
+        return False
+    try:
+        r = await get_redis()
+        family = payload.get("family") or jti
+        await r.set(
+            f"auth:refresh_blacklist:{jti}", "1",
+            ex=REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+        )
+        await r.set(
+            f"auth:refresh_family_blacklist:{family}", "1",
+            ex=REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+        )
+        return True
     except Exception as e:
-        logger.debug(f"登出撤销 refresh token 失败（幂等忽略）: {e}")
+        logger.warning(f"登出撤销 refresh token 失败（吊销未落地）: {e}")
+        return False
 
 async def get_cached_user(username: str):
     """带 Redis 缓存读取用户信息（TTL 5 分钟；不含 hashed_password，P1 #2 防每次查库）
@@ -246,8 +276,13 @@ async def get_cached_user(username: str):
     return user
 
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
+async def get_current_user(
+        request: Request,
+        credentials: HTTPAuthorizationCredentials | None = Depends(security)):
+    token = credentials.credentials if credentials else request.cookies.get(
+        ACCESS_COOKIE, "")
+    if not token:
+        raise HTTPException(401, "Missing token")
     try:
         payload = _decode_token(token)
         # 独立 refresh token 不能当 access 用（缺 type 视为 access，兼容旧 token）
@@ -265,7 +300,33 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     # 禁用账号拒绝访问（A8：is_active=False；缓存 5 分钟内生效）
     if not user.get("is_active", True):
         raise HTTPException(status_code=403, detail="账号已被禁用")
+    iat = payload.get("iat")
+    if iat:
+        try:
+            r = await get_redis()
+            changed = await r.get(f"auth:pwd_changed:{username}")
+            if changed and int(iat) < int(changed):
+                raise HTTPException(status_code=401, detail="密码已修改，请重新登录")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"改密状态检查失败，拒绝旧 access token: {e}")
+            raise HTTPException(status_code=503, detail="认证状态暂不可用")
     return user
+
+
+async def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
+    """路由级管理员门禁：供 `APIRouter(dependencies=[Depends(require_admin)])` 使用。
+
+    背景（2026-09-19 审查 routes/rag F-P2-2）：控制面的 role 判断此前逐个端点手写
+    （rag_admin.py 17 处 + 状态迁移 helper 1 处），实测覆盖是满的，但**新增端点漏写
+    不会有任何报错**——管理员分区的鉴权不该依赖人的记性。挂到 router 上之后默认拒绝，
+    端点内既有的显式判断继续生效（同一请求内 get_current_user 结果被 FastAPI 缓存，
+    不会多跑一次认证）。
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可访问")
+    return current_user
 
 
 oauth = OAuth()

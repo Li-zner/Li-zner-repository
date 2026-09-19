@@ -1,10 +1,9 @@
 import json
 import re
-import os
 import asyncio
 import httpx
 from ..core.logging import setup_logging
-from ..core.config import DEEPSEEK_MODEL, HTTP_TIMEOUT_MEDIUM, llm_endpoint
+from ..core.config import DEEPSEEK_MODEL, HTTP_TIMEOUT_MEDIUM
 from ..core.jfast import loads as jloads
 
 logger = setup_logging()
@@ -112,44 +111,48 @@ async def call_sub_agent(agent_name: str, args: dict, user_query: str, retry: bo
     ]
     
     async def _call():
-        # 主力模型可能是 qwen（百炼端点），按模型名路由端点与密钥
-        base_url, api_key = llm_endpoint(DEEPSEEK_MODEL, api_key)
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
-            resp = await client.post(
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                # payload 最小化：response_format/temperature 部分网关会 400（对齐主链路成功形态）
-                json={
-                    "model": DEEPSEEK_MODEL,
-                    "messages": messages,
-                }
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
+        # 主力模型失败自动 flash 兜底（复用主链路原语 post_chat_completion：
+        # 端点按模型路由 + Key 白名单一致 + qwen 温度剥离；2026-09-10 实测单发
+        # 主模型时上游一抖，酒店/路线/美食三个子 Agent 同时报错全军覆没）
+        from ..services.chat_support import post_chat_completion
+        from ..core.concurrency import llm_semaphore
+        # 纳入全局 LLM 并发闸（2026-09-10 审查 P2：子 Agent 被 react_steps gather
+        # 并行最多 4 路，原先可瞬间占满 LLM 并发额度）
+        async with llm_semaphore:
+            ok, data = await post_chat_completion(
+                {"model": DEEPSEEK_MODEL, "messages": messages}, HTTP_TIMEOUT_MEDIUM)
+        if not ok:
+            # 统一抛 HTTPError 进既有的退避重试/兜底通道（诊断体已截断，防 Key 入日志）
+            raise httpx.HTTPError(f"upstream {data.get('status')}: {str(data.get('body'))[:80]}")
 
-            # ---- Token 精细计量 ----
-            from ..core.metrics import llm_tokens_total, llm_tokens_detail, llm_requests_total
-            usage = data.get("usage", {})
-            prompt_tk = usage.get('prompt_tokens', 0) or 0
-            completion_tk = usage.get('completion_tokens', 0) or 0
-            llm_tokens_total.labels(type='input').inc(prompt_tk)
-            llm_tokens_total.labels(type='output').inc(completion_tk)
-            llm_tokens_detail.labels(model=DEEPSEEK_MODEL, endpoint='sub_agent', type='input').inc(prompt_tk)
-            llm_tokens_detail.labels(model=DEEPSEEK_MODEL, endpoint='sub_agent', type='output').inc(completion_tk)
-            llm_requests_total.labels(model=DEEPSEEK_MODEL, endpoint='sub_agent', status='success').inc()
-            # 计入计费（2026-09-09 主人拍板）：指标已打点，复用不含指标的扣费入口
-            if username:
-                from ..services.llm_streaming import bill_token_usage
-                bill_token_usage(usage, username, "",
-                                 remark=f"子Agent[{agent_name}]消耗 {prompt_tk + completion_tk} tokens")
+        content = data["choices"][0]["message"]["content"]
 
-            return _extract_json(content)
+        # ---- Token 精细计量（标签跟随实际应答模型：flash 兜底时不再误挂主模型名）----
+        from ..core.metrics import llm_tokens_total, llm_tokens_detail, llm_requests_total
+        used_model = data.get("model", DEEPSEEK_MODEL)
+        usage = data.get("usage", {})
+        prompt_tk = usage.get('prompt_tokens', 0) or 0
+        completion_tk = usage.get('completion_tokens', 0) or 0
+        llm_tokens_total.labels(type='input').inc(prompt_tk)
+        llm_tokens_total.labels(type='output').inc(completion_tk)
+        llm_tokens_detail.labels(model=used_model, endpoint='sub_agent', type='input').inc(prompt_tk)
+        llm_tokens_detail.labels(model=used_model, endpoint='sub_agent', type='output').inc(completion_tk)
+        llm_requests_total.labels(model=used_model, endpoint='sub_agent', status='success').inc()
+        # 计入计费（2026-09-09 主人拍板）：指标已打点，复用不含指标的扣费入口
+        if username:
+            from ..services.llm_streaming import bill_token_usage
+            bill_token_usage(usage, username, "",
+                             remark=f"子Agent[{agent_name}]消耗 {prompt_tk + completion_tk} tokens")
+
+        return _extract_json(content)
     
     try:
         return await _call()
-    except (json.JSONDecodeError, TypeError, ValueError, httpx.HTTPError) as e:
-        # httpx.HTTPError 一并进重试：网络抖动/限流首调失败直接重试一次，而不是炸穿调用方
+    except (json.JSONDecodeError, TypeError, ValueError, KeyError, IndexError,
+            httpx.HTTPError) as e:
+        # KeyError/IndexError 一并进重试（2026-09-14 审计 P1）：上游返回结构缺
+        # choices/message 时 data["choices"][0]["message"] 会抛，原捕获列表未含，
+        # 单次畸形响应直接打穿调用方；httpx.HTTPError：网络抖动/限流首调失败直接重试
         if retry:
             # 重试前加退避（P1 #34：防 API 限流时立即重试加剧压力）
             await asyncio.sleep(0.5)
@@ -157,7 +160,8 @@ async def call_sub_agent(agent_name: str, args: dict, user_query: str, retry: bo
             messages[0]["content"] = system_prompt + "\n【重要】只输出纯JSON，不要添加任何解释。"
             try:
                 return await _call()
-            except (json.JSONDecodeError, TypeError, ValueError, httpx.HTTPError) as e2:
+            except (json.JSONDecodeError, TypeError, ValueError, KeyError, IndexError,
+                    httpx.HTTPError) as e2:
                 # 日志截断：避免记录可能含 API Key 的完整异常（P1 #5）
                 logger.error(f"子Agent {agent_name} 重试仍失败: {str(e2)[:120]}")
                 return {"error": f"重试失败: {str(e2)[:120]}"}

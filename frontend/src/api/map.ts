@@ -35,12 +35,6 @@ export interface RouteLeg {
   distance_km: number
 }
 
-export interface AmapRouteResponse {
-  departure_location?: string
-  destination_location?: string
-  [key: string]: unknown
-}
-
 export async function getWeather(city: string, adcode?: string | number): Promise<string> {
   const q = encodeURIComponent(String(adcode ?? city))
   const data = await get<WeatherResponse>(`/api/map/weather?city=${q}`)
@@ -67,6 +61,3 @@ export async function ipLocate(): Promise<IpLocResponse> {
   return get<IpLocResponse>('/api/map/iploc')
 }
 
-export async function amapRoute(departure: string, destination: string): Promise<AmapRouteResponse> {
-  return post<AmapRouteResponse>('/api/map/amap-route', { departure, destination })
-}

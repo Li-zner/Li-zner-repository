@@ -25,9 +25,28 @@ class _Settings(BaseSettings):
         case_sensitive=False,
     )
 
+    # ---------- 安全过滤 / 地点提取 ----------
+    safe_filter_message: str = "该问题涉及敏感信息，小助手不便回答哦~"
+    safe_filter_words_file: str = ""
+    default_city: str = "梧州"
+
+    # ---------- 高德地图 ----------
+    # 天气/IP 定位/地理编码共用 Key（原 map_api 四处裸 os.getenv，2026-09-10 审查收编）
+    amap_api_key: str = ""
+
+    # ---------- 可观测性 ----------
+    # Prometheus /metrics 与 /test-otel 的 Bearer 门禁（原 observability 裸
+    # os.getenv，2026-09-10 审查收编；未配置即 fail-closed 403）
+    metrics_token: str = ""
+
     # ---------- 运行环境 ----------
     # 测试环境标记（原裸 os.getenv("APP_ENV")，与 BaseSettings 双轨，2026-09-07 审查收编）
     app_env: str = ""
+
+    # 可信反代开关（RT-1，2026-09-19 审查）：仅当部署链路确为
+    # Cloudflare Tunnel / nginx 反代时才置 1，_client_ip 才读转发头；
+    # 默认 0 = 只信 socket 对端地址（防伪造头绕登录锁/短信限额/oauth 限频）
+    trust_proxy_headers: bool = False
 
     # ---------- 数据库 ----------
     database_url: str = ""
@@ -45,12 +64,13 @@ class _Settings(BaseSettings):
     refresh_token_expire_days: int = 30
     refresh_max_days: int = 30
 
-    # ---------- DeepSeek（降级模型；deepseek_model 为主力模型槽位，2026-09 起可配 qwen 系）----------
+    # ---------- LLM 主备（deepseek_model 是主力槽位，qwen 系时自动路由百炼）----------
     deepseek_api_base: str = "https://api.deepseek.com"
     deepseek_api_timeout: float = 30.0
-    deepseek_model: str = "deepseek-v4-flash"
-    deepseek_flash_model: str = "deepseek-v4-flash"
+    deepseek_model: str = "qwen3.7-flash"
+    deepseek_flash_model: str = "deepseek-flash"
     deepseek_fallback_message: str = "服务器繁忙，请稍后再提问吧！"
+    llm_enable_thinking: bool = False
 
     # ---------- Qwen（阿里云百炼 OpenAI 兼容端点；主力模型为 qwen 系时使用）----------
     qwen_api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -63,6 +83,7 @@ class _Settings(BaseSettings):
     history_limit: int = 20
     history_ttl: int = 86400
     history_summary_ttl: int = 604800
+    rag_answer_top_k: int = 10
 
     # ---------- 超时 ----------
     tool_timeout: float = 30.0
@@ -71,6 +92,7 @@ class _Settings(BaseSettings):
     http_timeout_long: float = 30.0
     map_api_timeout: float = 8.0
     db_acquire_timeout: float = 10.0
+    db_command_timeout: float = 30.0
     task_timeout: float = 120.0
     llm_connect_timeout: float = 10.0
     task_ttl_seconds: int = 3600
@@ -79,6 +101,8 @@ class _Settings(BaseSettings):
     embedding_api_url: str = "http://localhost:11434/api/embeddings"
     embedding_api_key: str = ""
     embedding_model: str = "shaw/dmeta-embedding-zh"
+    embedding_provider: str = "ollama"
+    embedding_dimensions: int = 768
     cache_similarity_threshold: float = 0.85
     cache_l0_ttl: int = 600
 
@@ -113,10 +137,10 @@ class _Settings(BaseSettings):
     admin_phone: str = ""
     admin_username: str = "admin"
     admin_password: str = ""
-    fengfeng_password: str = ""
 
     # ---------- CORS / 回调 ----------
-    cors_origins: str = "http://localhost:10088,http://localhost:10086,http://localhost:10089,http://localhost:10090"
+    # 2026-09-12：入口端口迁移 100xx→1019x（WinNAT 保留段），新旧并留一版以防 .env 未跟上
+    cors_origins: str = "http://localhost:10088,http://localhost:10086,http://localhost:10189,http://localhost:10190,http://localhost:10090"
     github_redirect_uri: str = "http://localhost:10088/auth/github/callback"
     gateway_public_url: str = "http://localhost:10088"
 
@@ -172,6 +196,7 @@ DEEPSEEK_API_TIMEOUT = _settings.deepseek_api_timeout
 DEEPSEEK_MODEL = _settings.deepseek_model
 DEEPSEEK_FLASH_MODEL = _settings.deepseek_flash_model
 DEEPSEEK_FALLBACK_MESSAGE = _settings.deepseek_fallback_message
+LLM_ENABLE_THINKING = _settings.llm_enable_thinking
 RERANK_SIM_THRESHOLD = _settings.rerank_sim_threshold
 LLM_TEMPERATURE = _settings.llm_temperature
 
@@ -191,17 +216,37 @@ def llm_endpoint(model: str, deepseek_key: str = ""):
         return QWEN_API_BASE, QWEN_API_KEY
     return DEEPSEEK_API_BASE, deepseek_key
 
+
+def apply_llm_request_options(payload: dict, model: str) -> dict:
+    """为供应商请求补模型级选项，避免调用方遗漏导致行为漂移。
+
+    qwen 系默认关闭思考模式：民法典回答已经由检索和依据校验约束，额外
+    reasoning_content 只增加首包延迟和 token 成本，不提升事实覆盖率。
+    """
+    if str(model).startswith("qwen"):
+        payload.setdefault("enable_thinking", LLM_ENABLE_THINKING)
+    return payload
+
 SUMMARY_THRESHOLD = _settings.summary_threshold
 HISTORY_LIMIT = _settings.history_limit
 HISTORY_TTL = _settings.history_ttl
 HISTORY_SUMMARY_TTL = _settings.history_summary_ttl
+RAG_ANSWER_TOP_K = _settings.rag_answer_top_k
 
 TOOL_TIMEOUT = _settings.tool_timeout
 HTTP_TIMEOUT_SHORT = _settings.http_timeout_short
 HTTP_TIMEOUT_MEDIUM = _settings.http_timeout_medium
 HTTP_TIMEOUT_LONG = _settings.http_timeout_long
 MAP_API_TIMEOUT = _settings.map_api_timeout
+AMAP_API_KEY = _settings.amap_api_key
+SAFETY_FILTER_MESSAGE = _settings.safe_filter_message
+SAFETY_FILTER_WORDS_FILE = _settings.safe_filter_words_file
+DEFAULT_CITY = _settings.default_city
+APP_ENV = (_settings.app_env or "").lower()
+TRUST_PROXY_HEADERS = _settings.trust_proxy_headers
+METRICS_TOKEN_CFG = _settings.metrics_token
 DB_ACQUIRE_TIMEOUT = _settings.db_acquire_timeout
+DB_COMMAND_TIMEOUT = _settings.db_command_timeout
 TASK_TIMEOUT = _settings.task_timeout
 LLM_CONNECT_TIMEOUT = _settings.llm_connect_timeout
 TASK_TTL_SECONDS = _settings.task_ttl_seconds
@@ -209,8 +254,50 @@ TASK_TTL_SECONDS = _settings.task_ttl_seconds
 EMBEDDING_API_URL = _settings.embedding_api_url
 EMBEDDING_API_KEY = _settings.embedding_api_key
 EMBEDDING_MODEL = _settings.embedding_model
+EMBEDDING_PROVIDER = _settings.embedding_provider.strip().lower()
+EMBEDDING_DIMENSIONS = _settings.embedding_dimensions
 CACHE_SIMILARITY_THRESHOLD = _settings.cache_similarity_threshold
 CACHE_L0_TTL = _settings.cache_l0_ttl
+
+
+def embedding_endpoint_candidates() -> list:
+    """收集可用的 embeddings 端点候选（去空、去重、保序）。
+
+    2026-09-12 修复（P0）：原实现把配置值直接当唯一候选发出去，配置为空串时
+    请求 '' 报 "URL missing protocol" 后静默返回 None → `_recall_pg_vector`
+    再静默返回 [] → **向量召回整条失效**。实测 55/55 条真实 trace 的 vector 腿
+    hits 全为 0，长期无人发现（检索层当时零指标）。
+
+    候选优先级：显式 EMBEDDING_API_URL → 由 OLLAMA_URL 推导（Ollama 早已配好且
+    可达，原实现却完全不读它）。注意 Ollama 的嵌入接口是 /api/embeddings，
+    与其生成接口 /api/generate 不是同一个端点，必须换而非直接复用。
+    """
+    if EMBEDDING_PROVIDER != "ollama":
+        return [EMBEDDING_API_URL] if EMBEDDING_API_URL else []
+    cands = []
+    url = (EMBEDDING_API_URL or "").strip()
+    if url:
+        cands.append(url)
+        # 两个主机名互为兜底：容器内连 localhost 是即时拒绝，宿主机上连
+        # host.docker.internal 会黑洞等超时——故显式配置值优先，另一个在后
+        for a, b in (("localhost", "host.docker.internal"),
+                     ("host.docker.internal", "localhost")):
+            if a in url:
+                cands.append(url.replace(a, b))
+                break
+    ollama = (os.getenv("OLLAMA_URL") or "").strip()
+    if ollama:
+        base = ollama.split("/api/")[0].rstrip("/")
+        if base:
+            cands.append(f"{base}/api/embeddings")
+            if "host.docker.internal" in base:
+                cands.append(f"{base.replace('host.docker.internal', 'localhost')}/api/embeddings")
+    seen, out = set(), []
+    for u in cands:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 DAILY_REQUEST_LIMIT = _settings.daily_request_limit
 DAILY_TOKEN_LIMIT = _settings.daily_token_limit
@@ -239,7 +326,6 @@ SMS_ATTEMPT_LOCK_SECONDS = _settings.sms_attempt_lock_seconds
 ADMIN_PHONE = _settings.admin_phone
 ADMIN_USERNAME = _settings.admin_username
 ADMIN_PASSWORD = _settings.admin_password
-USER_FENGFENG_PASSWORD = _settings.fengfeng_password
 
 GITHUB_REDIRECT_URI = _settings.github_redirect_uri
 GATEWAY_PUBLIC_URL = _settings.gateway_public_url

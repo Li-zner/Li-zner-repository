@@ -7,10 +7,12 @@ import * as echarts from 'echarts/core'
 import { ScatterChart } from 'echarts/charts'
 import { GeoComponent } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
-import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
+import { ApiError } from '../api/http'
 import { useChatStore } from '../stores/chat'
+import { useAuthStore } from '../stores/auth'
 import { getRecommendations, getWeather } from '../api/map'
 import { useUserLocation } from '../composables/useUserLocation'
 import {
@@ -20,34 +22,25 @@ import {
 import type { GeoJson } from '../types'
 import '../styles/map.css'
 import { StorageKey } from '../enums'
-
+import { CITY_LIST as mapCityList, loadStringList as loadList, MUNI as mapMuni, saveStringList as saveList } from '../utils/mapData'
 // 按需注册：页面只用 geo + scatter + canvas（全量引入产物 1.1MB，按需后大幅减小）
 echarts.use([ScatterChart, GeoComponent, CanvasRenderer])
-
 const { t } = useI18n()
+const mapOwner = computed(() => auth.user?.username ?? '')
 const router = useRouter()
 const chat = useChatStore()
-const { userLocation, locate, locateByIp, clearLocation } = useUserLocation()
-
+const auth = useAuthStore()
+const { userLocation, locate, locateByIp, clearLocation } = useUserLocation(() => mapOwner.value)
 const mapEl = ref<HTMLDivElement | null>(null)
 const title = ref('')
 const bubbleVisible = ref(false)
 const bubbleCity = ref('')
+const loadError = ref('')
 const weather = ref('')
 const foods = ref<string[]>([])
 const spots = ref<string[]>([])
-/** 读字符串列表：损坏/非数组数据兜底为空（否则 setup 抛异常整页白屏） */
-function loadList(key: StorageKey): string[] {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(key) ?? '[]')
-    return Array.isArray(parsed) ? parsed : []
-  } catch {
-    return []
-  }
-}
-
-const favorites = ref<string[]>(loadList(StorageKey.MapFavorites))
-const history = ref<string[]>(loadList(StorageKey.MapHistory))
+const favorites = ref<string[]>([])
+const history = ref<string[]>([])
 const historyOpen = ref(false)
 const zoomPercent = ref(100)
 /** 手机端缩放基准：≤768px 视口小，全国视野放大 1.7 倍作为 100% 基准；50%–500% 硬限
@@ -64,7 +57,6 @@ const randomCd = ref(0)
 const locateToast = ref<boolean | null>(null)
 let toastTimer: ReturnType<typeof setTimeout> | null = null
 let cdTimer: ReturnType<typeof setInterval> | null = null
-
 function startCooldown(seconds: number, apply: (n: number) => void): void {
   apply(seconds)
   if (cdTimer) return
@@ -77,7 +69,6 @@ function startCooldown(seconds: number, apply: (n: number) => void): void {
     }
   }, 1000)
 }
-
 type EchartsInstance = ReturnType<typeof echarts.init>
 let chart: EchartsInstance | null = null
 let provinceGeo: GeoJson | null = null
@@ -85,10 +76,6 @@ let currentCity: string | null = null
 let currentLevel: 'province' | 'city' = 'province'
 /** 城市气泡请求代号：快速切城市时丢弃过期响应（旧响应慢到会覆盖新城市数据） */
 let infoSeq = 0
-
-function saveList(key: StorageKey, list: string[]): void {
-  localStorage.setItem(key, JSON.stringify(list))
-}
 
 async function showCityInfo(city: string, adcode?: string | number | null) {
   if (!city) return
@@ -117,7 +104,7 @@ async function showCityInfo(city: string, adcode?: string | number | null) {
     spots.value = [t('map_no_recommend')]
   })
   history.value = [city, ...history.value.filter((c) => c !== city)].slice(0, 30)
-  saveList(StorageKey.MapHistory, history.value)
+  saveList(StorageKey.MapHistory, history.value, mapOwner.value)
 }
 
 async function refreshRecommendations() {
@@ -129,6 +116,9 @@ async function refreshRecommendations() {
   if (recRes.status === 'fulfilled') {
     foods.value = recRes.value.foods
     spots.value = recRes.value.spots
+  } else {
+    // 2026-09-12 清欠（D-F11）：刷新失败不再静默，给出可见提示
+    loadError.value = t('map_load_failed')
   }
 }
 
@@ -143,12 +133,12 @@ function isFavorite(city: string): boolean {
 
 function removeFavorite(c: string): void {
   favorites.value = favorites.value.filter((x) => x !== c)
-  saveList(StorageKey.MapFavorites, favorites.value)
+  saveList(StorageKey.MapFavorites, favorites.value, mapOwner.value)
 }
 
 function removeFromHistory(c: string): void {
   history.value = history.value.filter((x) => x !== c)
-  saveList(StorageKey.MapHistory, history.value)
+  saveList(StorageKey.MapHistory, history.value, mapOwner.value)
 }
 
 function toggleFavorite(): void {
@@ -156,7 +146,7 @@ function toggleFavorite(): void {
   favorites.value = isFavorite(currentCity)
     ? favorites.value.filter((c) => c !== currentCity)
     : [...favorites.value, currentCity]
-  saveList(StorageKey.MapFavorites, favorites.value)
+  saveList(StorageKey.MapFavorites, favorites.value, mapOwner.value)
 }
 
 function computeProvinceCenter(geo: GeoJson): [number, number] | undefined {
@@ -237,13 +227,25 @@ function renderGeo(geo: GeoJson, mapName: string, initZoom: number, center?: [nu
 
 async function loadProvinceMap(): Promise<void> {
   currentLevel = 'province'
-  title.value = '中华人民共和国'
-  const resp = await fetch(PROVINCE_GEO_URL, { signal: AbortSignal.timeout(10000) })
-  const geo = (await resp.json()) as GeoJson
-  provinceGeo = geo
-  await nextTick()
-  if (!chart && mapEl.value) chart = echarts.init(mapEl.value)
-  renderGeo(geo, 'china', 1)
+  title.value = t('map_title_country')
+  try {
+    const resp = await fetch(PROVINCE_GEO_URL, { signal: AbortSignal.timeout(10000) })
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const geo = (await resp.json()) as GeoJson
+    provinceGeo = geo
+    await nextTick()
+    if (!chart && mapEl.value) chart = echarts.init(mapEl.value)
+    renderGeo(geo, 'china', 1)
+    loadError.value = ''
+  } catch {
+    // 2026-09-10 审查 P2：失败不再静默白图，给出可见提示与重试入口
+    loadError.value = t('map_load_failed')
+  }
+}
+
+async function retryLoadMap(): Promise<void> {
+  loadError.value = ''
+  await loadProvinceMap()
 }
 
 async function drillToCity(
@@ -260,7 +262,16 @@ async function drillToCity(
     await nextTick()
     if (!chart && mapEl.value) chart = echarts.init(mapEl.value)
     renderGeo(geo, name, initialZoomFor(geo.features.length), computeProvinceCenter(geo))
-    if (targetCity) setTimeout(() => showCityInfo(targetCity), 300)
+    if (targetCity) {
+      // 2026-09-10 审查 P2：300ms 延迟弹泡与用户中途操作（返回省级/手动关闭/再下钻）
+      // 存在竞态，回调前校验仍处本次下钻的上下文才弹出
+      const expectedTitle = name
+      setTimeout(() => {
+        if (currentLevel === 'city' && title.value === expectedTitle && !bubbleVisible.value) {
+          showCityInfo(targetCity)
+        }
+      }, 300)
+    }
   } catch {
     if (provinceName) showCityInfo(displayName(provinceName))
   }
@@ -296,7 +307,10 @@ async function goToCity(): Promise<void> {
   const city = currentCity
   if (!city) return
   // 地图属旅游功能：先切回旅游人格，确保自动提问在旅游上下文生成
-  if (chat.currentPersonaId !== 'unified') chat.switchPersona('unified')
+  if (chat.currentPersonaId !== 'unified' && !chat.switchPersona('unified')) {
+    // 2026-09-12 清欠（D-F12）：流式期间切人格被拒时不再静默，autoPrompt 不落错人格
+    loadError.value = t('map_switch_busy')
+  }
   const loc = userLocation.value ?? (await locate(false)) ?? (await locateByIp())
   const from = loc?.city ?? ''
   const prompt = from && from !== city
@@ -306,17 +320,8 @@ async function goToCity(): Promise<void> {
   router.push('/chat')
 }
 
-const CITY_LIST: { city: string; adcode: number }[] = [
-  { city: '北京', adcode: 110000 }, { city: '天津', adcode: 120000 },
-  { city: '上海', adcode: 310000 }, { city: '重庆', adcode: 500000 },
-  { city: '广州', adcode: 440000 }, { city: '深圳', adcode: 440000 },
-  { city: '杭州', adcode: 330000 }, { city: '南京', adcode: 320000 },
-  { city: '成都', adcode: 510000 }, { city: '武汉', adcode: 420000 },
-  { city: '长沙', adcode: 430000 }, { city: '西安', adcode: 610000 },
-  { city: '厦门', adcode: 350000 }, { city: '昆明', adcode: 530000 },
-  { city: '哈尔滨', adcode: 230000 }, { city: '三亚', adcode: 460000 },
-]
-const MUNI = [110000, 120000, 310000, 500000, 810000, 820000, 710000]
+const CITY_LIST = mapCityList
+const MUNI = mapMuni
 
 async function refreshLocation(): Promise<void> {
   if (locateCd.value > 0) return
@@ -347,13 +352,29 @@ function setZoom(percent: number): void {
 }
 
 function resize(): void {
+  const prevFactor = zoomFactor.value
   updateZoomFactor()
   chart?.resize()
-  // 视口跨 768px 后基准变了，scaleLimit 硬边界同步跟随
+  // 视口跨 768px 后基准变了：scaleLimit 硬边界同步跟随，且按倍率重缩放实际 zoom
+  // （2026-09-10 审查 P2：原先只换边界不重缩放，比例读数与实际视图脱节）
+  if (zoomFactor.value !== prevFactor && lastGeoZoom > 0) {
+    lastGeoZoom = lastGeoZoom * (zoomFactor.value / prevFactor)
+    chart?.setOption({ geo: { zoom: lastGeoZoom } })
+    zoomPercent.value = Math.round((lastGeoZoom / zoomFactor.value) * 100)
+  }
   chart?.setOption({ geo: { scaleLimit: { min: 0.5 * zoomFactor.value, max: 5 * zoomFactor.value } } })
 }
 
 onMounted(async () => {
+  try {
+    await auth.ensureProfile()
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 401) router.push('/login')
+    else loadError.value = t('map_load_failed')
+    return
+  }
+  favorites.value = loadList(StorageKey.MapFavorites, mapOwner.value)
+  history.value = loadList(StorageKey.MapHistory, mapOwner.value)
   updateZoomFactor()
   window.addEventListener('resize', resize)
   await loadProvinceMap()
@@ -384,6 +405,11 @@ onBeforeUnmount(() => {
         >{{ t('map_back') }}</button>
       </div>
       <div class="toolbar-title">{{ title || t('map_title_country') }}</div>
+      <!-- 地图数据加载失败提示（2026-09-10 审查 P2：失败不再静默白图） -->
+      <span v-if="loadError" class="map-load-error">
+        {{ loadError }}
+        <button @click="retryLoadMap">{{ t('retry') }}</button>
+      </span>
       <div class="right-tools">
         <button
           class="history-btn"
@@ -455,7 +481,7 @@ onBeforeUnmount(() => {
         <button @click="historyOpen = false">✕</button>
       </div>
       <template v-if="favorites.length">
-        <p class="label">收藏</p>
+        <p class="label">{{ t('map_favorites_short') }}</p>
         <div class="fav-chips">
           <span
             v-for="c in favorites"
@@ -469,7 +495,7 @@ onBeforeUnmount(() => {
         </div>
       </template>
 
-      <p class="label" style="margin-top: 10px;">历史</p>
+      <p class="label" style="margin-top: 10px;">{{ t('map_history_short') }}</p>
       <div
         v-for="c in history"
         :key="'h-' + c"
@@ -554,5 +580,21 @@ onBeforeUnmount(() => {
 @keyframes toast-fade {
   from { opacity: 1; }
   to { opacity: 0; }
+}
+.map-load-error {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 12px;
+  color: #c0392b;
+  font-size: 12px;
+}
+.map-load-error button {
+  border: 1px solid #c0392b;
+  border-radius: 4px;
+  background: transparent;
+  color: #c0392b;
+  cursor: pointer;
+  padding: 1px 8px;
 }
 </style>

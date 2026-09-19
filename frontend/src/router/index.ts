@@ -2,6 +2,14 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 import { getAccessToken, setUnauthorizedHandler } from '../api/http'
 
+/** 只接受站内 hash 路径，避免 redirect 参数造成开放跳转。 */
+function safeRedirect(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//')) {
+    return null
+  }
+  return value
+}
+
 const router = createRouter({
   // hash 路由：任何静态托管/直连端口都无需服务端回退配置（nginx try_files 为后续升级项）
   history: createWebHashHistory(),
@@ -14,8 +22,13 @@ const router = createRouter({
 })
 
 router.beforeEach((to) => {
-  if (to.path !== '/login' && !getAccessToken()) return { path: '/login' }
-  if (to.path === '/login' && getAccessToken()) return { path: '/chat' }
+  const redirect = safeRedirect(to.query.redirect)
+  if (to.path !== '/login' && !getAccessToken()) {
+    return { path: '/login', query: { redirect: to.fullPath } }
+  }
+  if (to.path === '/login' && getAccessToken()) {
+    return { path: redirect ?? '/chat' }
+  }
 })
 
 /** 401 最终兜底：清态后回登录页（由 http 层回调） */

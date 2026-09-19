@@ -14,16 +14,55 @@ from typing import AsyncIterator
 from ..models.schemas import ChatRequest
 from ..core.config import DEEPSEEK_MODEL
 from ..core.logging import setup_logging
+from ..core.persona_manager import is_civil_persona
 from ..core.semantic_cache import SemanticCache
 from ..core.stream_utils import sse
-from ..middleware.rate_limit import release_concurrent
+from ..middleware.rate_limit import release_concurrent, renew_concurrent
 from .chat_stream_ctx import ChatStreamCtx, build_stream_ctx, finalize_answer
 from .chat_support import get_deepseek_key
 from .chat_fallback import fallback_chain
 from .chat_fast_paths import simple_fast_path, recommend_fast_path
 from .chat_react import react_loop
+from .rag_request_trace import (begin_request, finish_request, mark_first_token,
+                                mark_route, record_span)
 
 logger = setup_logging()
+
+
+async def _tracked_stage(stage: str,
+                         source: AsyncIterator[str]) -> AsyncIterator[str]:
+    """记录阶段耗时与结果；生成器异常时保留失败状态。"""
+    started = time.perf_counter()
+    status = "ok"
+    try:
+        async for event in source:
+            yield event
+    except Exception:
+        status = "failed"
+        raise
+    finally:
+        record_span(
+            stage,
+            status=status,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+
+def _busy_message(ctx: ChatStreamCtx) -> str:
+    """返回当前语言的服务繁忙文案。"""
+    if getattr(ctx.req, "lang", "zh") == "en":
+        return "Service is busy, please try again later."
+    return "服务暂时繁忙，请稍后重试。"
+
+
+async def _finish_busy(ctx: ChatStreamCtx) -> AsyncIterator[str]:
+    """防击穿锁不可用时收口，禁止在无锁状态下继续调用模型。"""
+    message = _busy_message(ctx)
+    yield sse("answer_chunk", message)
+    yield sse("answer_complete", message) + "data: [DONE]\n\n"
+    ctx.saved_normally = True
+    ctx.finished = True
+    await finalize_answer(ctx, message, write_cache=False)
 
 
 async def route_intent(ctx: ChatStreamCtx) -> None:
@@ -35,7 +74,7 @@ async def route_intent(ctx: ChatStreamCtx) -> None:
         is_simple = intent_result.get("is_simple", True)
         is_recommend = intent_result.get("is_recommend", False)
         logger.info(f"意图路由: agents={matched_agents}, simple={is_simple}, recommend={is_recommend}")
-        if ctx.persona_id == "civil_code":
+        if is_civil_persona(ctx.persona_id):
             matched_agents = ["search_knowledge"]
             is_simple = True
             is_recommend = False
@@ -46,8 +85,13 @@ async def route_intent(ctx: ChatStreamCtx) -> None:
             tools = []
     except Exception as route_err:
         logger.warning(f"意图路由异常（降级为全部工具）: {route_err}")
-        from ..agents.tool_definitions import ALL_TOOLS
-        matched_agents, is_simple, is_recommend, tools = [], True, False, ALL_TOOLS
+        if is_civil_persona(ctx.persona_id):
+            from ..agents.tool_definitions import CIVIL_CODE_TOOLS
+            matched_agents = ["search_knowledge"]
+            is_simple, is_recommend, tools = True, False, CIVIL_CODE_TOOLS
+        else:
+            from ..agents.tool_definitions import ALL_TOOLS
+            matched_agents, is_simple, is_recommend, tools = [], True, False, ALL_TOOLS
     ctx.matched_agents = matched_agents
     ctx.is_simple = is_simple
     ctx.is_recommend = is_recommend
@@ -56,7 +100,7 @@ async def route_intent(ctx: ChatStreamCtx) -> None:
 
 async def civil_route_gate(ctx: ChatStreamCtx) -> AsyncIterator[str]:
     """前置路由裁决表（硬规则引擎）：civil 人格 adjudicate 领域，reject 直接返回"""
-    if getattr(ctx.req, 'persona_id', None) != "civil_code":
+    if not is_civil_persona(getattr(ctx.req, 'persona_id', None)):
         return
     try:
         from ..agents.routing_table import route_query
@@ -64,6 +108,7 @@ async def civil_route_gate(ctx: ChatStreamCtx) -> AsyncIterator[str]:
         ctx.civil_route_match = _route.match_type
         if _route.action == "reject":
             logger.info(f"路由裁决: reject → {_route.domain} ({_route.match_type})")
+            mark_route("civil_reject")
             yield sse("answer_complete", _route.message) + "data: [DONE]\n\n"
             # 拒答也要收尾入历史：与 law_mapping_gate 同一标准，问答不丢上下文
             await finalize_answer(ctx, _route.message)
@@ -79,15 +124,21 @@ async def civil_route_gate(ctx: ChatStreamCtx) -> AsyncIterator[str]:
 
 async def serve_from_cache(ctx: ChatStreamCtx) -> AsyncIterator[str]:
     """语义缓存拦截（有文件上传时跳过）；命中/穿透占位直接返回"""
-    if ctx.req.file_ids:
+    if ctx.req.file_ids or ctx.has_history:
         return
     try:
         cached_response = await SemanticCache.get(ctx.req.query, cache_ctx=ctx.cache_ctx)
         if cached_response and await SemanticCache.is_empty(cached_response):
             logger.info("穿透占位命中，直接返回提示（不再打 LLM）")
+            mark_route("cache_empty")
             _busy_msg = "服务暂时繁忙，请稍后重试。" if getattr(ctx.req, 'lang', 'zh') != 'en' else "Service is busy, please try again later."
             yield sse("answer_chunk", _busy_msg)
             yield sse("answer_complete", _busy_msg) + "data: [DONE]\n\n"
+            # 2026-09-15 审查 I-07 残留：穿透占位提示也要 finalize——否则会话
+            # 历史、日请求计数与 answer trace 缺失，与缓存命中分支（下述）
+            # 同一口径。繁忙提示不入缓存（write_cache=False）。
+            ctx.saved_normally = True
+            await finalize_answer(ctx, _busy_msg, write_cache=False)
             ctx.finished = True
             return
         if cached_response and not await SemanticCache.is_empty(cached_response):
@@ -97,8 +148,16 @@ async def serve_from_cache(ctx: ChatStreamCtx) -> AsyncIterator[str]:
                 logger.warning("DFA 拦截语义缓存")
                 cached_response = sf.safe_message
             logger.info("语义缓存命中")
+            mark_route("cache_hit")
             yield sse("answer_chunk", cached_response)
             yield sse("answer_complete", cached_response) + "data: [DONE]\n\n"
+            # 2026-09-12 修复（外部复核 P1）：缓存命中此前不调用 finalize_answer——
+            # 会话历史缺失（下一轮追问失忆）且日请求计数缺失。缓存命中不计费但
+            # 历史与请求计数必须与正常回答同口径；命中内容不入缓存（已是缓存）。
+            # saved_normally 先于 finalize（C-F11 同款，2026-09-14 审查补）：
+            # 内容已送达 [DONE]，finalize 异常不得触发上层二次降级
+            ctx.saved_normally = True
+            await finalize_answer(ctx, cached_response, write_cache=False)
             ctx.finished = True
             return
     except Exception as cache_err:
@@ -106,35 +165,52 @@ async def serve_from_cache(ctx: ChatStreamCtx) -> AsyncIterator[str]:
 
 
 async def rebuild_lock_gate(ctx: ChatStreamCtx) -> AsyncIterator[str]:
-    """防击穿（互斥重建）：同一 query 并发时只允许一个调用 LLM；无锁时等待后重读缓存"""
-    if ctx.req.file_ids:
+    """防击穿（互斥重建）：无锁且缓存未命中时返回繁忙，禁止无锁调用模型。"""
+    if ctx.req.file_ids or ctx.has_history:
         return
     try:
         ctx.rebuild_lock = await SemanticCache.acquire_rebuild_lock(ctx.req.query, cache_ctx=ctx.cache_ctx)
-        if ctx.rebuild_lock is None:
-            await asyncio.sleep(0.3)
-            _cached_retry = await SemanticCache.get(ctx.req.query, cache_ctx=ctx.cache_ctx)
-            if _cached_retry and await SemanticCache.is_empty(_cached_retry):
-                _busy_msg = "服务暂时繁忙，请稍后重试。" if getattr(ctx.req, 'lang', 'zh') != 'en' else "Service is busy, please try again later."
-                yield sse("answer_chunk", _busy_msg)
-                yield sse("answer_complete", _busy_msg) + "data: [DONE]\n\n"
-                ctx.finished = True
-                return
-            if _cached_retry and not await SemanticCache.is_empty(_cached_retry):
-                # 与 serve_from_cache 同一标准：缓存内容过 DFA 再返回
-                # （修复前入库的旧缓存可能含未过滤内容）
-                from ..core.safety_filter import get_filter
-                _sf = get_filter()
-                if _sf.contains_sensitive(_cached_retry):
-                    logger.warning("DFA 拦截语义缓存（重读路径）")
-                    _cached_retry = _sf.safe_message
-                yield sse("answer_chunk", _cached_retry)
-                yield sse("answer_complete", _cached_retry) + "data: [DONE]\n\n"
-                ctx.finished = True
-                return
     except Exception as _rebuild_err:
-        logger.warning(f"防击穿锁获取失败（继续重建）: {_rebuild_err}")
+        logger.warning(f"防击穿锁获取失败，返回繁忙: {_rebuild_err}")
         ctx.rebuild_lock = None
+        async for ev in _finish_busy(ctx):
+            yield ev
+        return
+
+    if ctx.rebuild_lock is None:
+        await asyncio.sleep(0.3)
+        try:
+            _cached_retry = await SemanticCache.get(ctx.req.query, cache_ctx=ctx.cache_ctx)
+            _cached_empty = bool(
+                _cached_retry and await SemanticCache.is_empty(_cached_retry)
+            )
+        except Exception as _retry_err:
+            logger.warning(f"防击穿锁等待后缓存检查失败，返回繁忙: {_retry_err}")
+            async for ev in _finish_busy(ctx):
+                yield ev
+            return
+        if _cached_empty:
+            mark_route("cache_empty")
+            async for ev in _finish_busy(ctx):
+                yield ev
+            return
+        if _cached_retry:
+            # 与 serve_from_cache 同一标准：缓存内容过 DFA 再返回。
+            from ..core.safety_filter import get_filter
+            _sf = get_filter()
+            if _sf.contains_sensitive(_cached_retry):
+                logger.warning("DFA 拦截语义缓存（重读路径）")
+                _cached_retry = _sf.safe_message
+            mark_route("cache_hit")
+            yield sse("answer_chunk", _cached_retry)
+            yield sse("answer_complete", _cached_retry) + "data: [DONE]\n\n"
+            ctx.saved_normally = True
+            await finalize_answer(ctx, _cached_retry, write_cache=False)
+            ctx.finished = True
+            return
+        async for ev in _finish_busy(ctx):
+            yield ev
+        return
 
     if ctx.rebuild_lock:
         async def _renew_rebuild_loop() -> None:
@@ -147,12 +223,13 @@ async def rebuild_lock_gate(ctx: ChatStreamCtx) -> AsyncIterator[str]:
                         break
                 except Exception:
                     break
-        ctx.rebuild_renew_task = asyncio.create_task(_renew_rebuild_loop())
+        from ..core.concurrency import spawn as _spawn
+        ctx.rebuild_renew_task = _spawn(_renew_rebuild_loop(), name="rebuild-renew")
 
 
 async def law_mapping_gate(ctx: ChatStreamCtx) -> AsyncIterator[str]:
     """法律依据纠正映射表检查（优先于 LLM 调用；仅非强制白名单查询）"""
-    if ctx.persona_id != "civil_code":
+    if not is_civil_persona(ctx.persona_id):
         return
     # route_query 已由 civil_route_gate 执行并存入 ctx.civil_route_match，不再重复跑一遍
     if ctx.civil_route_match == "forced_whitelist":
@@ -163,6 +240,7 @@ async def law_mapping_gate(ctx: ChatStreamCtx) -> AsyncIterator[str]:
         _law_match = _check_law(ctx.user_query)
         if _law_match:
             logger.info(f"法律映射表命中 #{_law_match['id']}: {_law_match['scenario']} → {_law_match['law']}")
+            mark_route("law_mapping")
             yield sse("answer_complete", _law_match['message']) + "data: [DONE]\n\n"
             await finalize_answer(ctx, _law_match['message'])
             ctx.saved_normally = True
@@ -182,7 +260,13 @@ async def cleanup_stream(ctx: ChatStreamCtx) -> None:
             await SemanticCache.release_rebuild_lock(ctx.req.query, ctx.rebuild_lock, cache_ctx=ctx.cache_ctx)
         except Exception as _rel_err:
             logger.warning(f"防击穿锁释放失败（TTL 自愈兜底）: {_rel_err}")
-    await release_concurrent(ctx.username)
+    if ctx.concurrent_renew_task:
+        ctx.concurrent_renew_task.cancel()
+        try:
+            await ctx.concurrent_renew_task
+        except asyncio.CancelledError:  # noqa: silent-except 豁免：任务取消是预期收尾
+            pass
+    await release_concurrent(ctx.username, ctx.concurrent_lease)
     if not ctx.saved_normally and ctx.mm and ctx.partial_answer and ctx.partial_answer != "抱歉，我暂时无法回答。":
         try:
             await ctx.mm.save_messages(
@@ -194,68 +278,162 @@ async def cleanup_stream(ctx: ChatStreamCtx) -> None:
             logger.warning(f"断线保存失败: {save_err}")
 
 
-async def chat_generate(req: ChatRequest, current_user: dict, today: str) -> AsyncIterator[str]:
+async def _prepare_chat_ctx(req: ChatRequest, current_user: dict,
+                            today: str) -> ChatStreamCtx:
+    """构建上下文并启动并发租约续期。"""
+    ctx = await build_stream_ctx(req, current_user, today)
+    if ctx.concurrent_lease and ctx.concurrent_lease != "__bypass__":
+        async def _renew_lease_loop():
+            while True:
+                await asyncio.sleep(60)
+                if not await renew_concurrent(ctx.username, ctx.concurrent_lease):
+                    break
+        from ..core.concurrency import spawn as _spawn
+        ctx.concurrent_renew_task = _spawn(_renew_lease_loop(), name="lease-renew")
+    return ctx
+
+
+async def _run_chat_pipeline(ctx: ChatStreamCtx) -> AsyncIterator[str]:
+    """按既有顺序执行门禁、缓存、路由、快速通道和 ReAct。"""
+    async for ev in _tracked_stage("civil_route", civil_route_gate(ctx)):
+        yield ev
+        if ctx.finished:
+            return
+    async for ev in _tracked_stage("cache", serve_from_cache(ctx)):
+        yield ev
+        if ctx.finished:
+            return
+    async for ev in _tracked_stage("rebuild_lock", rebuild_lock_gate(ctx)):
+        yield ev
+        if ctx.finished:
+            return
+    if ctx.finished:
+        return
+    ctx.api_key = await get_deepseek_key()
+    if not ctx.api_key:
+        logger.error("DeepSeek API Key 未设置，无法调用")
+        mark_route("config_error")
+        record_span("generation", status="failed", error_code="missing_api_key")
+        _config_error = "服务配置不完整（API Key 缺失），请联系管理员。"
+        yield sse("answer_complete", _config_error) + "data: [DONE]\n\n"
+        ctx.saved_normally = True
+        ctx.finished = True
+        await finalize_answer(ctx, _config_error, write_cache=False)
+        return
+    _route_started = time.perf_counter()
+    await route_intent(ctx)
+    record_span(
+        "intent_route",
+        latency_ms=int((time.perf_counter() - _route_started) * 1000),
+        attributes={"agents": ctx.matched_agents, "is_simple": ctx.is_simple,
+                    "is_recommend": ctx.is_recommend},
+    )
+    async for ev in _tracked_stage("law_mapping", law_mapping_gate(ctx)):
+        yield ev
+        if ctx.finished:
+            return
+    if (ctx.is_simple and len(ctx.matched_agents) == 1) or not ctx.matched_agents:
+        async for ev in _tracked_stage("simple_fast_path", simple_fast_path(ctx)):
+            yield ev
+        if ctx.finished:
+            return
+    if ctx.is_recommend and len(ctx.matched_agents) >= 2:
+        async for ev in _tracked_stage("recommend_fast_path", recommend_fast_path(ctx)):
+            yield ev
+        if ctx.finished:
+            return
+    async for ev in _tracked_stage("react", react_loop(ctx)):
+        yield ev
+
+
+async def _fallback_events(ctx: ChatStreamCtx | None,
+                           error: Exception) -> AsyncIterator[str]:
+    """异常降级；已送达答案时不重复输出。降级输出聚合后统一 finalize。"""
+    if ctx is not None and ctx.saved_normally:
+        logger.warning(f"V2 收尾阶段异常（主回答已送达，跳过降级）: {error}")
+        return
+    if ctx is not None and is_civil_persona(ctx.persona_id):
+        from .civil_grounding import grounding_reply
+        _civil_error = grounding_reply("service_error", getattr(ctx.req, "lang", "zh"))
+        logger.error(f"民法典链路异常，禁止通用知识降级: {error}")
+        yield sse("answer_complete", _civil_error) + "data: [DONE]\n\n"
+        ctx.saved_normally = True
+        ctx.finished = True
+        await finalize_answer(ctx, _civil_error, write_cache=False)
+        return
+    logger.error(f"V2 未知异常，降级备胎: {error}", exc_info=True)
+    mark_route("fallback")
+    record_span("fallback", status="degraded", error_code=type(error).__name__)
+    if ctx is None:
+        # ctx 构建失败（如 Redis/PG 抖动）：没有 req 可喂降级链，
+        # 直接给兜底文案，不再让降级链自身 AttributeError 变 500
+        yield sse("answer_complete", "服务暂时不可用，请稍后再试。") + "data: [DONE]\n\n"
+        return
+    from .chat_fallback import accumulate_sse_text
+    _fb_text = ""
+    try:
+        async for chunk in fallback_chain(ctx.req, ctx.username, cache_ctx=ctx.cache_ctx):
+            yield chunk
+            _fb_text = accumulate_sse_text(_fb_text, chunk)
+    except Exception as fb_err:
+        logger.error(f"降级也失败: {fb_err}")
+        _fb_text = _fb_text or '服务暂时不可用，请稍后再试。'
+        yield sse("answer_complete", _fb_text) + "data: [DONE]\n\n"
+    # 2026-09-14 审计 P1：顶层异常降级此前只转发 SSE 未 finalize——用户拿到
+    # 答案但 trace 记失败、历史与日请求计数缺失。write_cache=False：降级答案
+    # 可能残缺/为兜底文案，不入缓存。saved_normally 无条件置位：内容已送达，
+    # finalize 结果只影响台账不影响用户
+    if ctx is not None:
+        ctx.saved_normally = True
+        try:
+            await finalize_answer(
+                ctx, _fb_text or '服务暂时不可用，请稍后再试。', write_cache=False)
+        except Exception as fin_err:
+            logger.warning(f"降级收尾失败（内容已送达，不影响用户）: {fin_err}")
+
+
+async def _cleanup_generation(ctx: ChatStreamCtx | None,
+                              current_user: dict) -> None:
+    """释放流式资源；ctx 构建失败时仍需释放并发槽位。"""
+    if ctx is not None:
+        await cleanup_stream(ctx)
+    else:
+        await release_concurrent(
+            current_user["username"], current_user.get("_concurrent_lease", "")
+        )
+
+
+async def _chat_generate_impl(req: ChatRequest, current_user: dict,
+                              today: str) -> AsyncIterator[str]:
     """v2 流式对话主流程（SSE）；门禁/快速通道/ReAct 按原版顺序编排"""
     ctx = None
     try:
-        # ctx 构建放入 try 内：若其抛异常（如 build_file_context / get_context 失败），
-        # finally 仍需释放并发槽位/防击穿锁（与原版把整段置于 generate 的 try/finally 一致）。
-        ctx = await build_stream_ctx(req, current_user, today)
-        # 1. 前置路由裁决表
-        async for ev in civil_route_gate(ctx):
-            yield ev
-            if ctx.finished:
-                return
-        # 2. 语义缓存拦截
-        async for ev in serve_from_cache(ctx):
-            yield ev
-            if ctx.finished:
-                return
-        # 3. 防击穿锁
-        async for ev in rebuild_lock_gate(ctx):
-            yield ev
-            if ctx.finished:
-                return
-        # 4. Key 检查
-        ctx.api_key = await get_deepseek_key()
-        if not ctx.api_key:
-            logger.error("DeepSeek API Key 未设置，无法调用")
-            yield sse("answer_complete", '服务配置不完整（API Key 缺失），请联系管理员。') + "data: [DONE]\n\n"
-            return
-        # 5. 意图路由（设置 ctx.matched_agents/is_simple/is_recommend/tools）
-        await route_intent(ctx)
-        # 6. 法律映射表检查
-        async for ev in law_mapping_gate(ctx):
-            yield ev
-            if ctx.finished:
-                return
-        # 7. 简单任务快速通道
-        if (ctx.is_simple and len(ctx.matched_agents) == 1) or (len(ctx.matched_agents) == 0):
-            async for ev in simple_fast_path(ctx):
-                yield ev
-            if ctx.finished:
-                return
-        # 8. 推荐多 Agent 快速通道
-        if ctx.is_recommend and len(ctx.matched_agents) >= 2:
-            async for ev in recommend_fast_path(ctx):
-                yield ev
-            if ctx.finished:
-                return
-        # 9. ReAct 循环
-        async for ev in react_loop(ctx):
+        ctx = await _prepare_chat_ctx(req, current_user, today)
+        async for ev in _run_chat_pipeline(ctx):
             yield ev
     except Exception as e:
-        logger.error(f"V2 未知异常，降级备胎: {e}", exc_info=True)
-        try:
-            async for chunk in fallback_chain(ctx.req, ctx.username, cache_ctx=ctx.cache_ctx):
-                yield chunk
-        except Exception as fb_err:
-            logger.error(f"降级也失败: {fb_err}")
-            yield sse("answer_complete", '服务暂时不可用，请稍后再试。') + "data: [DONE]\n\n"
+        async for ev in _fallback_events(ctx, e):
+            yield ev
     finally:
-        if ctx is not None:
-            await cleanup_stream(ctx)
-        else:
-            # 构建失败（ctx 未生成）：并发槽位仍须释放（ensure_chat_allowed 已在入口占用），
-            # 与原版 generate 的 finally 保证一致，防 30s 槽位泄漏。
-            await release_concurrent(current_user["username"])
+        await _cleanup_generation(ctx, current_user)
+
+
+async def chat_generate(req: ChatRequest, current_user: dict,
+                        today: str) -> AsyncIterator[str]:
+    """为单次用户请求建立 trace 上下文并透传底层流。"""
+    begin_request(
+        conversation_id=getattr(req, "conversation_id", "") or "",
+        username=current_user.get("username", ""),
+    )
+    emit_first = True
+    try:
+        async for event in _chat_generate_impl(req, current_user, today):
+            if emit_first and (
+                '"type": "answer_chunk"' in event
+                or '"type": "answer_complete"' in event
+            ):
+                mark_first_token()
+                emit_first = False
+            yield event
+    finally:
+        finish_request(status="failed", error_code="stream_ended_without_finalize")

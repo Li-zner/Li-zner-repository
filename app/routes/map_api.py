@@ -1,46 +1,66 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import httpx
 import os
 import json
 import re
-from datetime import datetime
-import time
+from datetime import datetime, timezone
 from ..middleware.auth import get_current_user
-from ..core.config import HTTP_TIMEOUT_MEDIUM, MAP_API_TIMEOUT
+from ..core.config import AMAP_API_KEY, HTTP_TIMEOUT_MEDIUM, MAP_API_TIMEOUT
 from ..core.logging import setup_logging
+from .auth import _client_ip
+from .map_utils import is_reserved_ip, weather_candidates
+from .map_amap import plan_amap_route
 
 logger = setup_logging()
 
 class RouteRequest(BaseModel):
-    departure: str
-    destination: str
+    """路线请求（限长：地址串会拼进 LLM prompt，防超长输入放大计费与注入面）"""
+    departure: str = Field(..., min_length=1, max_length=128)
+    destination: str = Field(..., min_length=1, max_length=128)
 
 router = APIRouter(prefix="/api/map", tags=["map"])
 
 
-# ===== 高频城市缓存（2026-09-10 主人定稿）=====
-# 点击计数按日（zset，两天 TTL）；当日点击 Top-N 的城市才写入缓存：
-#   天气：TTL 1 天（每日惰性刷新；高德免费接口无逐小时数据，8-22 点"最长天气段"
-#         无法计算，按主人指示维持实况原样——即缓存写入时刻的实况）
-#   美食景点：TTL 15 天（短期内不会变，无需频繁重生成）
-# force=1（刷新按钮）：跳过读缓存重新生成，且无视 Top-N 一律覆盖写入。
-# Top-N 只是"多少城市享受缓存秒出"的产品策略，单条 ~1-2KB，Top200 亦无压力；
-# 可用 CITY_CACHE_TOP_N 环境变量调整。
+async def _require_map_qps(current_user: dict) -> None:
+    """所有高德/外部地图入口统一 QPS 门禁。"""
+    from ..middleware.rate_limit import check_qps
+    if not await check_qps(
+        current_user["username"], current_user.get("role", "user")
+    ):
+        raise HTTPException(429, "请求过于频繁，请稍后再试")
+
+
+# ===== 城市缓存（两类口径，2026-09-20 主人定稿）=====
+# 天气（维持原口径）：点击计数按日 zset，当日 Top-N 城市写缓存；缓存键带当日日期，
+#   跨日即换新键——等价于"每天清除所有城市天气缓存"，每天首点重新生成（TTL 1 天）。
+# 美食/景点（改为全城共享池）：键**不带日期**，TTL 15 天，Redis 对所有用户可读；
+#   存的是该城市历次 LLM 生成过的条目合集（并入去重、封顶 30 条/类）。
+#   普通点击从池中随机抽 3+3 直接返回（不走 LLM、不计费）；
+#   只有刷新按钮（force=1）才重新生成并并入池、续期 15 天。
+# Top-N 环境变量 CITY_CACHE_TOP_N 现仅约束天气。
 CITY_HIT_ZSET = "map:city_hits:{date}"
 CITY_CACHE_PREFIX = "map:city_cache:"
 CITY_TOP_N = int(os.getenv("CITY_CACHE_TOP_N", "200"))
-WEATHER_TTL_SECONDS = 86400        # 天气：每天刷新一次
-RECOMMEND_TTL_SECONDS = 15 * 86400  # 美食景点：15 天刷新一次
+WEATHER_TTL_SECONDS = 86400         # 天气：每天刷新一次
+RECOMMEND_TTL_SECONDS = 15 * 86400  # 美食景点共享池：每次刷新生成续期 15 天
+RECOMMEND_PICK = 3                  # 普通点击每类随机抽取条数
+RECOMMEND_POOL_MAX = 30             # 共享池每类封顶条数（防无界增长）
 # recommend 失败兜底数据（模块级单例：handler 用同一性判断"是兜底就不写缓存"）
 _DEFAULT_REC = {"foods": ["当地特色小吃", "地道家常菜", "招牌美食"],
                 "spots": ["城市地标", "历史文化街区", "自然公园"]}
 
 
+def _san_city(city: str) -> str:
+    """城市名入键/入日志前统一消毒：去换行（防日志伪造）+ 截断 64 字符"""
+    return re.sub(r"[\r\n]", "", city or "")[:64]
+
+
 async def _city_cache_get(city: str, kind: str):
     from ..core.redis import get_redis
     r = await get_redis()
-    raw = await r.get(f"{CITY_CACHE_PREFIX}{kind}:{city[:64]}")
+    day = datetime.now().strftime("%Y%m%d")
+    raw = await r.get(f"{CITY_CACHE_PREFIX}{kind}:{day}:{_san_city(city)}")
     if raw is None:
         return None
     try:
@@ -50,27 +70,78 @@ async def _city_cache_get(city: str, kind: str):
 
 
 async def _city_cache_put(city: str, kind: str, payload, force: bool = False) -> None:
-    """点击计数（按日 zset）+ 当日 Top-N（或 force 刷新）才写缓存。
-    TTL：天气 1 天 / 美食景点 15 天（2026-09-10 主人定稿）"""
+    """天气专用：点击计数（按日 zset）+ 当日 Top-N（或 force 刷新）才写缓存。
+    缓存键带当日日期（跨日自然失效=每天清缓存；预报标签是"今天/明天/后天"
+    相对值，不带日期的缓存会跨日展示错误日期）。美食/景点已迁共享池
+    （_recommend_pool_put），不再走本函数。"""
     from ..core.redis import get_redis
     r = await get_redis()
-    member = f"{kind}:{city[:64]}"
-    zkey = CITY_HIT_ZSET.format(date=datetime.now().strftime("%Y%m%d"))
+    day = datetime.now().strftime("%Y%m%d")
+    member = f"{kind}:{_san_city(city)}"
+    zkey = CITY_HIT_ZSET.format(date=day)
     await r.zincrby(zkey, 1, member)
     await r.expire(zkey, 172800)  # 两天，跨自然日仍能判定"当日 Top-N"
     if not force:
         rank = await r.zrevrank(zkey, member)
         if rank is None or rank >= CITY_TOP_N:
             return  # 不在当日 Top-N：不写，保持既有缓存（若有）继续服役
-    ttl = WEATHER_TTL_SECONDS if kind == "weather" else RECOMMEND_TTL_SECONDS
-    await r.set(f"{CITY_CACHE_PREFIX}{member}",
-                json.dumps(payload, ensure_ascii=False), ex=ttl)
+    await r.set(f"{CITY_CACHE_PREFIX}{kind}:{day}:{_san_city(city)}",
+                json.dumps(payload, ensure_ascii=False), ex=WEATHER_TTL_SECONDS)
+
+
+# ---------- 美食/景点共享池（2026-09-20 口径：键不带日期，全员可读） ----------
+
+async def _recommend_pick_from_pool(city: str):
+    """从城市共享池随机抽 3+3；无池/数据损坏/条数不足返回 None（触发生成）。"""
+    import random
+    from ..core.redis import get_redis
+    r = await get_redis()
+    raw = await r.get(f"{CITY_CACHE_PREFIX}recommend:{city}")
+    if raw is None:
+        return None
+    try:
+        pool = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(pool, dict):
+        return None
+    picked = {}
+    for kind in ("foods", "spots"):
+        items = pool.get(kind)
+        if not (isinstance(items, list) and len(items) >= RECOMMEND_PICK):
+            return None
+        picked[kind] = random.sample(items, RECOMMEND_PICK)
+    return picked
+
+
+async def _recommend_pool_put(city: str, result: dict) -> None:
+    """把本轮生成结果并入共享池：新条目在前、去重、封顶 30 条/类，每次写入续期 15 天。"""
+    from ..core.redis import get_redis
+    r = await get_redis()
+    key = f"{CITY_CACHE_PREFIX}recommend:{city}"
+    try:
+        pool = json.loads(await r.get(key) or "{}")
+    except ValueError:
+        pool = {}
+    if not isinstance(pool, dict):
+        pool = {}
+    merged = {}
+    for kind in ("foods", "spots"):
+        old = pool.get(kind) if isinstance(pool.get(kind), list) else []
+        dedup = []
+        for item in [*(result.get(kind) or []), *old]:
+            s = str(item).strip()
+            if s and s not in dedup:
+                dedup.append(s)
+        merged[kind] = dedup[:RECOMMEND_POOL_MAX]
+    await r.set(key, json.dumps(merged, ensure_ascii=False), ex=RECOMMEND_TTL_SECONDS)
 
 
 @router.get("/regeo")
 async def reverse_geocode(lat: float, lng: float, current_user: dict = Depends(get_current_user)):
     """经纬度→城市名（高德逆地理编码）"""
-    amap_key = os.getenv("AMAP_API_KEY")
+    await _require_map_qps(current_user)
+    amap_key = AMAP_API_KEY
     if not amap_key:
         return {"city": ""}
     try:
@@ -102,21 +173,6 @@ async def reverse_geocode(lat: float, lng: float, current_user: dict = Depends(g
         return {"city": ""}
 
 
-def _is_reserved_ip(ip: str) -> bool:
-    """判断 IP 是否为私有/保留地址（10.x / 172.16-31.x / 192.168.x / 127.x 等）。
-
-    这类 IP 无法在高德 IP 定位里解析出真实城市，直接视为"无定位"，
-    避免前端拿高德返回的"局域网"占位词当真实出发地（如"我从局域网出发…"）。
-    """
-    if not ip:
-        return True
-    import ipaddress as _ipa
-    try:
-        return _ipa.ip_address(ip).is_private or _ipa.ip_address(ip).is_loopback or _ipa.ip_address(ip).is_reserved
-    except ValueError:
-        return True  # 非合法 IP
-
-
 @router.get("/iploc")
 async def ip_location(request: Request, current_user: dict = Depends(get_current_user)):
     """IP 近似定位兜底：浏览器 geolocation 不可用时（国内 Chrome 走 Google 定位常被墙），
@@ -125,17 +181,13 @@ async def ip_location(request: Request, current_user: dict = Depends(get_current
     私有/保留 IP（如本地测试经 docker/局域网访问）或高德无法解析时返回空——
     定位未知应让前端改问出发地，而非把"局域网"当真实城市。
     """
-    amap_key = os.getenv("AMAP_API_KEY")
+    await _require_map_qps(current_user)
+    amap_key = AMAP_API_KEY
     if not amap_key:
         return {"city": "", "province": ""}
-    # 真实用户 IP：CF-Connecting-IP > X-Forwarded-For 首个 > X-Real-IP > 客户端 IP
-    ip = (request.headers.get("cf-connecting-ip")
-          or request.headers.get("x-forwarded-for")
-          or request.headers.get("x-real-ip")
-          or (request.client.host if request.client else ""))
-    if ip and "," in ip:
-        ip = ip.split(",")[0].strip()
-    if not ip or _is_reserved_ip(ip):
+    # 与登录/OAuth/短信统一走同一可信代理解析，避免各入口各信一个头。
+    ip = _client_ip(request)
+    if not ip or is_reserved_ip(ip):
         return {"city": "", "province": ""}
     try:
         async with httpx.AsyncClient(timeout=MAP_API_TIMEOUT) as client:
@@ -160,28 +212,6 @@ async def ip_location(request: Request, current_user: dict = Depends(get_current
         logger.debug(f"IP 定位服务不可用: {type(e).__name__}")
     return {"city": "", "province": ""}
 
-def _weather_candidates(name: str):
-    """生成高德天气可用的候选名称列表（原样 → 自治州核心名 → 去市/州后缀）"""
-    if not name:
-        return []
-    candidates = [name]
-    # 自治州：保留核心地名（如 海西蒙古族藏族自治州 → 海西）
-    m = re.search(r'^(.*?)(?:维吾尔|壮|回|蒙古|藏|苗|彝|土家|侗|布依|瑶|白|哈尼|哈萨克|傣|黎|傈僳|佤|畲|高山|拉祜|水|东乡|纳西|景颇|柯尔克孜|土|达斡尔|仫佬|羌|布朗|撒拉|保安|仡佬|锡伯|阿昌|普米|朝鲜|满|鄂温克|鄂伦春|赫哲|门巴|珞巴|基诺)*族*自治州$', name)
-    if m and m.start() > 0:
-        core = name[:m.start()]
-        candidates.append(core)
-        candidates.append(core + '市')
-    # 去掉末尾 市/州/地区/省
-    cleaned = re.sub(r'(市|州|地区|特别行政区|省)$', '', name)
-    if cleaned != name:
-        candidates.append(cleaned)
-    # 去重保序
-    seen = []
-    for c in candidates:
-        if c and c not in seen:
-            seen.append(c)
-    return seen
-
 async def _resolve_adcode(amap_key: str, name: str, client):
     """通过高德地理编码把城市名解析为 adcode"""
     try:
@@ -198,6 +228,8 @@ async def _resolve_adcode(amap_key: str, name: str, client):
 
 @router.get("/weather")
 async def get_weather(city: str, force: int = 0, current_user: dict = Depends(get_current_user)):
+    await _require_map_qps(current_user)
+    city = _san_city(city)
     import time as _time
     _t0 = _time.perf_counter()
     result = await _weather_impl(city, force)
@@ -213,7 +245,7 @@ async def _weather_impl(city: str, force: int):
         if cached is not None:
             logger.info(f"[map-perf] weather city={city} cache=hit")
             return cached
-    amap_key = os.getenv("AMAP_API_KEY")
+    amap_key = AMAP_API_KEY
     fallback = {"status": "1", "days": []}
     if not amap_key:
         return fallback
@@ -225,7 +257,7 @@ async def _weather_impl(city: str, force: int):
             "澳门": {"city": "珠海", "note": "（以下为珠海天气，澳门临近仅供参考）"},
         }
 
-        candidates = _weather_candidates(city)
+        candidates = weather_candidates(city)
         note = ""
         if city in fallback_map:
             fb = fallback_map[city]
@@ -264,7 +296,8 @@ async def _weather_impl(city: str, force: int):
     except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError):
         # 网络超时或无法连接时返回兜底数据
         return fallback
-    except Exception:
+    except Exception as _err:
+        logger.warning(f"天气上游异常，返回兜底: {type(_err).__name__}: {_err}")
         return fallback
     # 全部失败 → 兜底数据（不抛 502，前端可正常展示美食/景点）
     return fallback
@@ -292,27 +325,51 @@ def _format_forecast(data: dict, note: str):
 
 @router.post("/recommend")
 async def get_recommend(city: str, force: int = 0, current_user: dict = Depends(get_current_user)):
+    city = _san_city(city)
     import time as _time
     _t0 = _time.perf_counter()
-    # 高频城市当日缓存：命中直接返回（不走 LLM 也不计费）；force=1 强制重新生成并覆盖
+    # 共享池命中：随机抽 3+3 直接返回（全员可读、不走 LLM 也不计费）；
+    # force=1（刷新按钮）跳过读池，重新生成并并入池
     if not force:
-        cached = await _city_cache_get(city, "recommend")
-        if cached is not None:
-            logger.info(f"[map-perf] recommend city={city} cache=hit")
-            return cached
+        picked = await _recommend_pick_from_pool(city)
+        if picked is not None:
+            logger.info(f"[map-perf] recommend city={city} cache=pool_hit")
+            return picked
     # 配额门禁（2026-09-07 审查 P1）：原先完全绕过 ensure_chat_allowed/日 token 限额，
     # 登录用户可刷 LLM 配额；LLM 调用期间占用并发槽位，finally 释放
     from ..services.chat_stream_ctx import ensure_chat_allowed
     from ..middleware.rate_limit import release_concurrent
-    await ensure_chat_allowed(current_user)
+    today = await ensure_chat_allowed(current_user)
+    lease = current_user.get("_concurrent_lease", "")
     try:
-        result = await _recommend_llm(city, username=current_user["username"])
+        try:
+            result = await _recommend_llm(city, username=current_user["username"])
+        except Exception:
+            # 上游畸形响应/网络异常时，用户没有得到有效推荐，试用额度必须归还。
+            from ..core.quota import rollback_used_questions
+            await rollback_used_questions(current_user["username"])
+            raise
+        if result is _DEFAULT_REC:
+            # 上游失败/缺少 Key 时不能吞掉预留的试用额度，否则用户未得到真实
+            # 推荐却被计一次可用次数。
+            from ..core.quota import rollback_used_questions
+            await rollback_used_questions(current_user["username"])
+            return result
+        # 形状校验（2026-09-10 复查 P2）：畸形但合法的 JSON 不得写入共享池
+        if not (isinstance(result, dict) and isinstance(result.get("foods"), list)
+                and isinstance(result.get("spots"), list)):
+            result = _DEFAULT_REC
         if result is not _DEFAULT_REC:
-            await _city_cache_put(city, "recommend", result, force=bool(force))
-        logger.info(f"[map-perf] recommend city={city} total={_time.perf_counter() - _t0:.2f}s cache=generate")
+            await _recommend_pool_put(city, result)
+        # 2026-09-12 修复（外部复核 P1）：地图通道成功后计入日请求——原仅对话
+        # 主链 finalize_answer 计数，本通道日请求上限可被绕过
+        from ..middleware.rate_limit import update_daily_usage
+        await update_daily_usage(current_user["username"], today, inc_request=1, inc_token=0)
+        logger.info(f"[map-perf] recommend city={city} total={_time.perf_counter() - _t0:.2f}s "
+                    f"cache={'force' if force else 'pool_miss_generate'}")
         return result
     finally:
-        await release_concurrent(current_user["username"])
+        await release_concurrent(current_user["username"], lease)
 
 
 async def _recommend_llm(city: str, username: str = "") -> dict:
@@ -351,9 +408,12 @@ async def _recommend_llm(city: str, username: str = "") -> dict:
     }
     # 带降级（flash 优先：轻量结构化任务生成快 3 倍+，主模型兜底——2026-09-09 埋点结论）
     from ..services.chat_support import post_chat_completion
+    from ..core.concurrency import llm_semaphore
     try:
-        ok, data = await post_chat_completion(payload, timeout=HTTP_TIMEOUT_MEDIUM,
-                                              prefer_flash=True, preferred_timeout=8)
+        # 纳入全局 LLM 并发闸（2026-09-10 审查 P2：与其他 LLM 出口口径统一）
+        async with llm_semaphore:
+            ok, data = await post_chat_completion(payload, timeout=HTTP_TIMEOUT_MEDIUM,
+                                                  prefer_flash=True, preferred_timeout=8)
         _t_llm = time.perf_counter()
         if not ok:
             logger.warning(f"[map-perf] recommend city={city} 上游失败 耗时={_t_llm - _t0:.2f}s (key={_t_key - _t0:.2f}s)")
@@ -386,11 +446,19 @@ async def plan_route(req: RouteRequest, current_user: dict = Depends(get_current
     # 配额门禁（2026-09-07 审查 P1）：同 /recommend，原先绕过全部限额直烧 LLM token
     from ..services.chat_stream_ctx import ensure_chat_allowed
     from ..middleware.rate_limit import release_concurrent
-    await ensure_chat_allowed(current_user)
+    today = await ensure_chat_allowed(current_user)
+    lease = current_user.get("_concurrent_lease", "")
     try:
-        return await _plan_route_llm(req.departure, req.destination, username=current_user["username"])
+        result = await _plan_route_llm(req.departure, req.destination, username=current_user["username"])
+        from ..middleware.rate_limit import update_daily_usage
+        await update_daily_usage(current_user["username"], today, inc_request=1, inc_token=0)
+        return result
+    except Exception:
+        from ..core.quota import rollback_used_questions
+        await rollback_used_questions(current_user["username"])
+        raise
     finally:
-        await release_concurrent(current_user["username"])
+        await release_concurrent(current_user["username"], lease)
 
 
 async def _plan_route_llm(departure: str, destination: str, username: str = "") -> dict:
@@ -425,16 +493,28 @@ async def _plan_route_llm(departure: str, destination: str, username: str = "") 
   "total_distance_km": 2083,
   "recommendation": "建议先飞广州，再转高铁到珠海，全程约4小时"
 }}"""
-    from ..core.config import DEEPSEEK_API_BASE, DEEPSEEK_MODEL
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
-        resp = await client.post(
-            f"{DEEPSEEK_API_BASE}/chat/completions",
-            headers={"Authorization": f"Bearer {deepseek_key}", "Content-Type": "application/json"},
-            json={"model": DEEPSEEK_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 500}
-        )
-        if resp.status_code != 200:
-            raise HTTPException(502, "DeepSeek API error")
-        data = resp.json()
+    from ..core.config import (
+        DEEPSEEK_MODEL,
+        apply_llm_request_options,
+        llm_endpoint,
+    )
+    from ..core.concurrency import llm_semaphore
+    base_url, api_key = llm_endpoint(DEEPSEEK_MODEL, deepseek_key)
+    async with llm_semaphore:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
+            resp = await client.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=apply_llm_request_options({
+                    "model": DEEPSEEK_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 500,
+                }, DEEPSEEK_MODEL)
+            )
+            if resp.status_code != 200:
+                raise HTTPException(502, "DeepSeek API error")
+            data = resp.json()
         # 计量扣费（2026-09-09 审查 P1）：/route 原先只过配额门禁，不扣费不计日 token
         _usage = data.get("usage") or {}
         if username and (_usage.get("prompt_tokens") or _usage.get("completion_tokens")):
@@ -449,141 +529,43 @@ async def _plan_route_llm(departure: str, destination: str, username: str = "") 
 
 
 @router.post("/amap-route")
-async def amap_route(req: RouteRequest, current_user: dict = Depends(get_current_user)):  # noqa: func-length 豁免（主人决策 2026-09-05）：高德 API 集成层，与外部服务端点一一对应，拆分破坏内聚
-    """使用高德地图 API 规划真实路线（驾车/公交/步行）"""
-    amap_key = os.getenv("AMAP_API_KEY")
-    if not amap_key:
+async def amap_route(req: RouteRequest, current_user: dict = Depends(get_current_user)):
+    """高德路线入口：按用户限流与并发租约，避免多接口请求被匿名/单账号刷爆。"""
+    from ..middleware.rate_limit import (
+        check_qps, check_concurrent, release_concurrent, update_daily_usage,
+    )
+    username = current_user["username"]
+    role = current_user.get("role", "user")
+    if not await check_qps(username, role):
+        raise HTTPException(429, "请求过于频繁，请稍后再试")
+    lease = await check_concurrent(username, role)
+    if lease is None:
+        raise HTTPException(429, "并发请求过多，请稍后再试")
+    try:
+        result = await _plan_amap_route(req)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        await update_daily_usage(username, today, inc_request=1, inc_token=0)
+        return result
+    finally:
+        await release_concurrent(username, lease)
+
+
+async def _plan_amap_route(req: RouteRequest) -> dict:
+    """路由层薄封装：缺 Key 时 fail loudly，业务解析在 map_amap 模块。"""
+    if not AMAP_API_KEY:
         raise HTTPException(503, "路线规划服务暂不可用")
-
-    dep = req.departure
-    dest = req.destination
-
-    # 1. 先通过高德地理编码获取起终点经纬度
-    # 显式超时（2026-09-07 审查 P2）：默认 5s×5 次连外重试，无超时上限
-    async with httpx.AsyncClient(timeout=MAP_API_TIMEOUT) as client:
-        # 地理编码（地点→坐标）
-        geo_dep_resp = await client.get("https://restapi.amap.com/v3/geocode/geo", params={
-            "key": amap_key, "address": dep, "city": dep
-        })
-        geo_dest_resp = await client.get("https://restapi.amap.com/v3/geocode/geo", params={
-            "key": amap_key, "address": dest, "city": dest
-        })
-        geo_dep = geo_dep_resp.json()
-        geo_dest = geo_dest_resp.json()
-
-        if geo_dep.get("status") != "1" or geo_dest.get("status") != "1":
-            raise HTTPException(502, "地理编码失败")
-
-        dep_loc = geo_dep["geocodes"][0]["location"] if geo_dep.get("geocodes") else None
-        dest_loc = geo_dest["geocodes"][0]["location"] if geo_dest.get("geocodes") else None
-        if not dep_loc or not dest_loc:
-            raise HTTPException(502, "无法获取起终点坐标")
-
-        # 2. 获取驾车路线
-        driving_resp = await client.get("https://restapi.amap.com/v3/direction/driving", params={
-            "key": amap_key, "origin": dep_loc, "destination": dest_loc,
-            "strategy": 0, "extensions": "all"
-        })
-        driving_data = driving_resp.json()
-
-        # 3. 获取公交/火车/飞机综合路线
-        transit_resp = await client.get("https://restapi.amap.com/v3/direction/transit/integrated", params={
-            "key": amap_key, "origin": dep_loc, "destination": dest_loc,
-            "city": dep, "cityd": dest, "strategy": 0, "extensions": "all"
-        })
-        transit_data = transit_resp.json()
-
-        # 4. 获取骑行路线
-        bicycling_resp = await client.get("https://restapi.amap.com/v3/direction/bicycling", params={
-            "key": amap_key, "origin": dep_loc, "destination": dest_loc
-        })
-        bicycling_data = bicycling_resp.json()
-
-        # 5. 获取步行路线
-        walking_resp = await client.get("https://restapi.amap.com/v3/direction/walking", params={
-            "key": amap_key, "origin": dep_loc, "destination": dest_loc
-        })
-        walking_data = walking_resp.json()
-
-    # 解析结果
-    result = {"departure": dep, "destination": dest, "departure_location": dep_loc, "destination_location": dest_loc}
-
-    # 驾车路线
-    if driving_data.get("status") == "1" and driving_data.get("route", {}).get("paths"):
-        path = driving_data["route"]["paths"][0]
-        # steps 为空数组时 [0] 会 IndexError（2026-09-07 审查 P2），or 兜底空对象
-        result["driving"] = {
-            "distance_km": round(int(path.get("distance", 0)) / 1000, 1),
-            "duration_min": round(int(path.get("duration", 0)) / 60),
-            "tolls": path.get("tolls", "0"),
-            "polyline": (path.get("steps") or [{}])[0].get("polyline", "")
-        }
-
-    # 公交/火车路线
-    if transit_data.get("status") == "1" and transit_data.get("route", {}).get("transits"):
-        transits = transit_data["route"]["transits"][:3]  # 最多3条
-        result["transit"] = []
-        for t in transits:
-            segments = t.get("segments", [])
-            legs = []
-            for seg in segments:
-                mode = None
-                if "railway" in seg:
-                    mode = "火车" if "火车" in str(seg.get("railway", {}).get("name", "")) else "高铁"
-                    r = seg["railway"]
-                    legs.append({
-                        "mode": mode or "高铁",
-                        "from": r.get("departure_station", {}).get("name", dep),
-                        "to": r.get("arrival_station", {}).get("name", dest),
-                        "duration_min": round(int(r.get("time", 0)) / 60) if r.get("time") else 0,
-                        "distance_km": round(int(r.get("distance", 0)) / 1000, 1) if r.get("distance") else 0
-                    })
-                elif "bus" in seg:
-                    bus_info = seg["bus"]
-                    bus_lines = bus_info.get("buslines", [{}])[0]
-                    legs.append({
-                        "mode": "公交",
-                        "from": bus_lines.get("departure_stop", {}).get("name", ""),
-                        "to": bus_lines.get("arrival_stop", {}).get("name", ""),
-                        "duration_min": round(int(seg.get("duration", 0)) / 60) if seg.get("duration") else 0,
-                        "distance_km": round(int(seg.get("distance", 0)) / 1000, 1) if seg.get("distance") else 0
-                    })
-                elif "walking" in seg:
-                    legs.append({
-                        "mode": "步行",
-                        "duration_min": round(int(seg.get("duration", 0)) / 60) if seg.get("duration") else 0,
-                        "distance_km": round(int(seg.get("distance", 0)) / 1000, 1) if seg.get("distance") else 0
-                    })
-            total_time = sum(l.get("duration_min", 0) for l in legs)
-            total_dist = sum(l.get("distance_km", 0) for l in legs)
-            result["transit"].append({
-                "legs": legs,
-                "total_duration_min": total_time,
-                "total_distance_km": round(total_dist, 1)
-            })
-
-    # 骑行路线（短途）
-    if bicycling_data.get("status") == "1" and bicycling_data.get("route", {}).get("paths"):
-        path = bicycling_data["route"]["paths"][0]
-        result["bicycling"] = {
-            "distance_km": round(int(path.get("distance", 0)) / 1000, 1),
-            "duration_min": round(int(path.get("duration", 0)) / 60)
-        }
-
-    # 步行路线（短途）
-    if walking_data.get("status") == "1" and walking_data.get("route", {}).get("paths"):
-        path = walking_data["route"]["paths"][0]
-        result["walking"] = {
-            "distance_km": round(int(path.get("distance", 0)) / 1000, 1),
-            "duration_min": round(int(path.get("duration", 0)) / 60)
-        }
-
-    return result
+    try:
+        return await plan_amap_route(
+            AMAP_API_KEY, req.departure, req.destination
+        )
+    except ValueError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 @router.get("/geojson")
 async def get_geojson(adcode: str = "100000", current_user: dict = Depends(get_current_user)):
     """代理 GeoJSON 地图数据，绕过阿里云 DataV 的 Referer 防盗链（需登录）"""
+    await _require_map_qps(current_user)
     # P3 修复：adcode 只允许 6 位数字，防 URL 路径拼接
     if not re.fullmatch(r"\d{6}", adcode):
         raise HTTPException(400, "adcode 必须为 6 位数字")

@@ -10,6 +10,7 @@
   成功登录后由 auth.authenticate_user 惰性升级为新方案。
 """
 from passlib.context import CryptContext
+from passlib.exc import UnknownHashError
 
 from .config import BCRYPT_MAX_BYTES
 from .logging import setup_logging
@@ -33,7 +34,12 @@ def hash_password(plain_password: str) -> str:
 
 def is_legacy_hash(hashed_password: str) -> bool:
     """是否为存量（改造前）哈希：登录成功后据此触发惰性升级"""
-    return bool(hashed_password) and not hashed_password.startswith(SHA256_PREFIX)
+    if not hashed_password:
+        return False
+    try:
+        return pwd_context.identify(hashed_password) == "bcrypt"
+    except Exception:
+        return False
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -45,15 +51,19 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     """
     if not hashed_password:
         return False
-    if hashed_password.startswith(SHA256_PREFIX):
-        # 新方案：不可截断（截断会改变 SHA-256 输入，导致验证失败）
-        return pwd_context.verify(plain_password, hashed_password)
-    # 存量方案：字节截断，与旧创建端（passlib 隐式截断）行为一致
-    pw_bytes = plain_password.encode("utf-8")
-    if len(pw_bytes) > BCRYPT_MAX_BYTES:
-        logger.warning(
-            "password_truncated_legacy",
-            extra={"extra_fields": {"password_bytes": len(pw_bytes)}},
-        )
-        pw_bytes = pw_bytes[:BCRYPT_MAX_BYTES]
-    return pwd_context.verify(pw_bytes, hashed_password)
+    try:
+        if hashed_password.startswith(SHA256_PREFIX):
+            # 新方案：不可截断（截断会改变 SHA-256 输入，导致验证失败）
+            return pwd_context.verify(plain_password, hashed_password)
+        # 存量方案：字节截断，与旧创建端（passlib 隐式截断）行为一致
+        pw_bytes = plain_password.encode("utf-8")
+        if len(pw_bytes) > BCRYPT_MAX_BYTES:
+            logger.warning(
+                "password_truncated_legacy",
+                extra={"extra_fields": {"password_bytes": len(pw_bytes)}},
+            )
+            pw_bytes = pw_bytes[:BCRYPT_MAX_BYTES]
+        return pwd_context.verify(pw_bytes, hashed_password)
+    except (UnknownHashError, ValueError, TypeError):
+        logger.warning("password_hash_invalid")
+        return False

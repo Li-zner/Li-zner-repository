@@ -11,18 +11,22 @@ runner.run_agent_task 只做编排（缓存/锁/路由/收尾），本模块负�
 
 import asyncio
 import json
-import os
 import httpx
 
 from ..core.logging import setup_logging
+from ..core.persona_manager import is_civil_persona
 from ..core.config import (
     TOOL_TIMEOUT, DEEPSEEK_API_BASE, DEEPSEEK_MODEL,
     DEEPSEEK_FLASH_MODEL, HTTP_TIMEOUT_LONG,
 )
+from ..core.safety_filter import (
+    ContentStreamGuard, sanitize_untrusted_text, serialize_untrusted_value,
+)
 from ..core.stream_utils import dispatch_tool, stream_llm
 from ..core.task_manager import (
-    update_status, append_result, read_accumulated_result,
-    is_cancelled, cleanup_event,
+    append_result, read_accumulated_result,
+    is_cancelled_remote, cancel_task_if_active, clear_cancel_marker,
+    reset_accumulated_result,
 )
 
 logger = setup_logging()
@@ -30,8 +34,8 @@ logger = setup_logging()
 
 async def _finish_cancelled(task_id: str, partial: str):
     """标记任务为已取消，保存草稿（runner 编排层与步骤层共用）"""
-    await update_status(task_id, "cancelled", partial)
-    cleanup_event(task_id)  # 2026-09-05 二次遍历修复：拆分时遗漏，取消路径事件对象滞留泄漏
+    await cancel_task_if_active(task_id, partial)
+    await clear_cancel_marker(task_id)
     logger.info(f"任务已取消: task_id={task_id}")
 
 
@@ -50,6 +54,7 @@ async def _consume_llm_stream(task_id: str, api_key: str, messages: list, tools:
     返回 (state, done)：state 含 content/tool_calls 聚合/usage/blocked；
     done=True 表示任务已因取消而终结，调用方直接返回。
     """
+    _content_guard = ContentStreamGuard(sf)
     state = {
         "content": "", "has_tool_calls": False,
         "tool_calls_index": {},
@@ -57,28 +62,32 @@ async def _consume_llm_stream(task_id: str, api_key: str, messages: list, tools:
         "blocked": False,
     }
     # 统一走 stream_llm（ReAct 路径保持模型默认 temperature）
-    async for _ev in stream_llm(api_key, DEEPSEEK_MODEL, messages, tools=tools,
-                                tool_choice="auto", temperature=None, max_tokens=None):
-        if is_cancelled(task_id):
-            await _finish_cancelled(task_id, await read_accumulated_result(task_id))
-            return state, True
-
+    _agen = stream_llm(api_key, DEEPSEEK_MODEL, messages, tools=tools,
+                       tool_choice="auto", temperature=None, max_tokens=None)
+    _stream_blocked = False
+    async for _ev in _agen:
         if _ev["type"] == "usage":
             state["usage"]["prompt_tokens"] = _ev["prompt_tokens"]
             state["usage"]["completion_tokens"] = _ev["completion_tokens"]
+            if await is_cancelled_remote(task_id):
+                return state, True
         elif _ev["type"] == "content":
             chunk = _ev["text"]
-            # 逐块 DFA 过滤：内容块此刻已实时写入 Redis（轮询端立即可见），
-            # 等最终检查再拦截已经晚了（对齐 _fallback_flash 的逐块检查行为）
-            _chk = sf.check_stream(chunk)
-            if not _chk["safe"]:
+            piece, blocked = _content_guard.feed(chunk)
+            if blocked:
                 state["content"] += sf.safe_message
                 await append_result(task_id, sf.safe_message)
                 state["blocked"] = True
+                _stream_blocked = True
+                # 拦截后排空内层流拿 usage 尾块计费（原代码 break 遗弃生成器）
+                async for _rest in _agen:
+                    if _rest["type"] == "usage":
+                        state["usage"]["prompt_tokens"] = _rest["prompt_tokens"]
+                        state["usage"]["completion_tokens"] = _rest["completion_tokens"]
                 break
-            state["content"] += chunk
-            # 每块写入 Redis，前端可轮询获取进度
-            await append_result(task_id, chunk)
+            if piece:
+                state["content"] += piece
+                await append_result(task_id, piece)
         elif _ev["type"] == "tool_calls":
             state["has_tool_calls"] = True
             for tc in _ev["delta"]:
@@ -94,6 +103,15 @@ async def _consume_llm_stream(task_id: str, api_key: str, messages: list, tools:
                         state["tool_calls_index"][idx]["function"]["name"] = tc["function"]["name"]
                     if tc["function"].get("arguments"):
                         state["tool_calls_index"][idx]["function"]["arguments"] += tc["function"]["arguments"]
+    if not _stream_blocked:
+        tail, tail_blocked = _content_guard.flush()
+        if tail_blocked:
+            state["content"] += sf.safe_message
+            await append_result(task_id, sf.safe_message)
+            state["blocked"] = True
+        elif tail:
+            state["content"] += tail
+            await append_result(task_id, tail)
     return state, False
 
 
@@ -119,9 +137,13 @@ async def _run_discussion(user_query: str,
                 result = {"error": str(result)}
             if func_name in agent_names:
                 if isinstance(result, dict) and "error" in result:
-                    orch.add_tool_result(func_name, {}, error=str(result["error"]))
+                    orch.add_tool_result(
+                        func_name, {}, error=sanitize_untrusted_text(str(result["error"])))
                 else:
-                    orch.add_tool_result(func_name, result)
+                    orch.add_tool_result(
+                        func_name,
+                        {"untrusted_tool_data": serialize_untrusted_value(result)},
+                    )
         if orch.get_involved_agents() and len(agent_names) > 1:
             return await orch.run(enable_phase2=False)
         return ""
@@ -132,7 +154,7 @@ async def _run_discussion(user_query: str,
 
 async def _handle_tool_step(task_id: str, username: str, user_query: str,
                             assistant_content: str, messages: list, tool_calls_list: list,
-                            intent, user_perms) -> str:
+                            intent, user_perms, persona_id: str = "") -> str:
     """执行本轮工具调用并按结果续写对话（工具消息 + 多 Agent 讨论）。
 
     返回 "ok"（继续下一轮）/ "cancelled"（降级中任务已取消）/ "timeout"（工具超时已降级，
@@ -147,7 +169,15 @@ async def _handle_tool_step(task_id: str, username: str, user_query: str,
             # LLM 偶发产出非法 JSON 参数：按工具失败处理，而不是炸掉整个任务
             tasks.append(_tool_arg_error(func_name))
         else:
-            tasks.append(dispatch_tool(func_name, args, user_query, user_perms, username))
+            if persona_id:
+                tasks.append(dispatch_tool(
+                    func_name, args, user_query, user_perms, username,
+                    persona_id=persona_id,
+                ))
+            else:
+                tasks.append(dispatch_tool(
+                    func_name, args, user_query, user_perms, username,
+                ))
 
     try:
         tool_results = await asyncio.wait_for(
@@ -155,7 +185,7 @@ async def _handle_tool_step(task_id: str, username: str, user_query: str,
         )
     except asyncio.TimeoutError:
         logger.warning("工具超时，降级")
-        if await _stream_fallback(task_id, user_query, username):
+        if await _stream_fallback(task_id, user_query, username, persona_id=persona_id):
             return "cancelled"
         return "timeout"
 
@@ -175,14 +205,12 @@ async def _handle_tool_step(task_id: str, username: str, user_query: str,
             elif "超时" in err:
                 fb = "查询超时，请稍后再试"
             result = {"error": err, "fallback_message": fb, "success": False}
-        # 外部内容消毒（2026-09-09 审查 P1）：web_search 等工具结果含外部网页
-        # title/body，原样进 tool 消息可携带提示词注入；复用 orchestrator 既有
-        # _sanitize_context（圆桌路径已用），不新写
-        from .orchestrator import _sanitize_context
+        # tool 角色本身是不可信边界，内容再递归消毒后序列化，避免 title/body
+        # 等外部字段携带提示词注入或控制字符。
         tool_msgs.append({
             "role": "tool",
             "tool_call_id": tool_calls_list[idx]["id"],
-            "content": _sanitize_context(json.dumps(result, ensure_ascii=False))
+            "content": serialize_untrusted_value(result),
         })
 
     messages.append({
@@ -199,10 +227,21 @@ async def _handle_tool_step(task_id: str, username: str, user_query: str,
     return "ok"
 
 
-async def _stream_fallback(task_id: str, user_query: str, username: str) -> bool:
+async def _stream_fallback(task_id: str, user_query: str, username: str,
+                           persona_id: str = "") -> bool:
     """降级链输出到 Redis（主模型失败/工具超时时）。返回 True 表示降级中任务被取消（已终结）。"""
+    if is_civil_persona(persona_id):
+        from ..services.civil_grounding import grounding_reply
+        # grounding 话术是"整段替换"语义而非补充：主模型中途失败时 result_buf 里
+        # 已有半截回答，直接 append 会拼出两段互相矛盾的正文（2026-09-19 审查 agents P2-1）
+        await reset_accumulated_result(task_id)
+        await append_result(task_id, grounding_reply("service_error"))
+        return False
+    # 主模型可能已写出安全前缀；降级回答必须替换而不是追加，否则最终结果会
+    # 变成“半截主回答 + 完整降级回答”两段互相矛盾的内容。
+    await reset_accumulated_result(task_id)
     async for chunk in _fallback_chain(user_query, username):
-        if is_cancelled(task_id):
+        if await is_cancelled_remote(task_id):
             await _finish_cancelled(task_id, await read_accumulated_result(task_id))
             return True
         await append_result(task_id, chunk)
@@ -225,13 +264,17 @@ async def _fallback_chain(user_query: str, username: str):
 
 async def _fallback_flash(user_query: str, username: str):
     """降级：DeepSeek Flash"""
-    api_key = os.getenv("DEEPSEEK_API_KEY")
+    from ..services.chat_support import get_deepseek_key
+    from ..services.llm_streaming import _estimate_tokens, record_token_usage
+    api_key = await get_deepseek_key()
     if not api_key:
         return
     from ..core.safety_filter import get_filter
     sf = get_filter()
+    guard = ContentStreamGuard(sf)
     _usage = None  # include_usage 尾块用量（2026-09-09 计费收口）
     _full = ""     # 断连估算用已产出累积（2026-09-09 P1）
+    _blocked = False
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_LONG) as client:
         async with client.stream(
             "POST", f"{DEEPSEEK_API_BASE}/chat/completions",
@@ -254,24 +297,35 @@ async def _fallback_flash(user_query: str, username: str):
                             choices = data.get("choices") or [{}]
                             chunk = choices[0].get("delta", {}).get("content", "")
                             if chunk:
+                                if _blocked:
+                                    continue
                                 _full += chunk
-                                result = sf.check_stream(chunk)
-                                if not result['safe']:
+                                piece, is_blocked = guard.feed(chunk)
+                                if is_blocked:
+                                    _blocked = True
                                     yield sf.safe_message
-                                    return
-                                yield chunk
+                                    continue
+                                if piece:
+                                    yield piece
                         except json.JSONDecodeError:
                             continue  # 非数据行/残包：跳过继续读流（P2 修复：不再裸 pass）
             except (GeneratorExit, asyncio.CancelledError):
                 # 断连/取消估算计费（2026-09-09 审查 P1）：直连 httpx 无法安全排空，
                 # 退化按已产出文本估算（正常完成路径已在下方按真实 usage 计费）
-                from ..services.llm_streaming import _estimate_tokens, record_token_usage
                 if username and _full:
                     record_token_usage(
                         {"prompt_tokens": 0, "completion_tokens": _estimate_tokens(_full)},
                         username, "",
                         remark=f"断连估算补计费（任务降级 {_estimate_tokens(_full)} tokens）")
                 raise
+            if not _blocked:
+                tail, tail_blocked = guard.flush()
+                if tail_blocked:
+                    yield sf.safe_message
+                elif tail:
+                    yield tail
             # 计入计费（2026-09-09 主人拍板）：任务降级路径原先零计量
             if _usage:
-                record_token_usage(_usage, username, "")
+                record_token_usage(
+                    _usage, username, "", model=DEEPSEEK_FLASH_MODEL,
+                )

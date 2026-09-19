@@ -15,6 +15,10 @@ try:
     def dumps(obj, ensure_ascii=False, **kwargs):
         """序列化为 str。orjson 默认 UTF-8，ensure_ascii 参数仅作兼容保留（无效）。
         注意：orjson 不支持 default 回调（P2 #76），含不可序列化对象时请先处理。"""
+        # orjson 不支持 stdlib 的 default/indent 等参数；一旦传入就回退标准库，
+        # 避免同一函数在不同依赖环境下产生不同语义。
+        if kwargs:
+            return _json.dumps(obj, ensure_ascii=ensure_ascii, **kwargs)
         return orjson.dumps(obj).decode("utf-8")
 
     def loads(s):

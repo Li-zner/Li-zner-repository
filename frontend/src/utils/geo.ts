@@ -8,7 +8,9 @@ export const PROVINCE_GEO_URL = `${DATAV_BASE}/100000_full.json`
 
 /** 城市级 GeoJSON 地址（adcode 由调用方保证为数字串） */
 export function buildCityGeoUrl(adcode: string | number): string {
-  return `${DATAV_BASE}/${adcode}_full.json`
+  const value = String(adcode)
+  if (!/^\d{6}$/.test(value)) throw new Error('adcode 必须为 6 位数字')
+  return `${DATAV_BASE}/${value}_full.json`
 }
 
 /** 显示名：去掉"市/省"后缀（保留自治州全称，如"海西蒙古族藏族自治州"） */
@@ -39,15 +41,6 @@ export function initialZoomFor(featureCount: number): number {
 export function findAdcode(geo: GeoJson, name: string): string | number | null {
   const f = geo.features.find((f) => f.properties.name === name)
   if (!f) return null
-  return f.id ?? f.properties.adcode ?? null
-}
-
-/** 高德天气 lives → 展示文案 */
-export function formatWeather(lives: {
-  weather: string
-  temperature: string
-  winddirection: string
-  windpower: string
-}): string {
-  return `${lives.weather} ${lives.temperature}℃ · ${lives.winddirection}风 ${lives.windpower}级`
+  const candidate = f.id ?? f.properties.adcode
+  return /^\d{6}$/.test(String(candidate ?? '')) ? candidate ?? null : null
 }

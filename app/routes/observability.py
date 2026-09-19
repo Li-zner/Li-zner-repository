@@ -29,10 +29,14 @@ def _check_metrics_token(request: Request) -> JSONResponse | None:
     规则：METRICS_TOKEN 未配置 → fail closed（返回 403 与配置提示，杜绝裸奔）；
     已配置 → 仅接受 Authorization: Bearer <METRICS_TOKEN>（Prometheus 抓取配置
     authorization credentials 即可）。匹配返回 None 放行。
+    2026-09-10 审查 P2：token 收编 config（配置集中原则）；比较改
+    hmac.compare_digest 常量时间（防御深度）。
     """
-    expected = os.getenv("METRICS_TOKEN", "")
+    from ..core.config import METRICS_TOKEN_CFG
+    import hmac
+    expected = METRICS_TOKEN_CFG or ""
     got = request.headers.get("authorization", "")
-    if expected and got == f"Bearer {expected}":
+    if expected and hmac.compare_digest(got.encode(), f"Bearer {expected}".encode()):
         return None
     return JSONResponse(
         {"detail": "metrics endpoint requires METRICS_TOKEN"

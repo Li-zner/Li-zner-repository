@@ -1,59 +1,32 @@
 import os
+import threading
+import contextvars
 import json
 import asyncio
-import httpx
+import time
 from ..core.logging import setup_logging
-from ..core.config import (
-    HTTP_TIMEOUT_SHORT, HTTP_TIMEOUT_MEDIUM,
-)
+from ..core.config import EMBEDDING_MODEL
+from .article_normalizer import normalize_article_ref
+from .retrieval_diagnostics import chunk_keys, diagnostics_enabled
+from .retrieval_trace import _LAST_LEGS, record as record_retrieval
+from ..services.rag_request_trace import record_span
+from ..services.rag_runtime_config import get_rerank_top
 
 logger = setup_logging()
 
-async def fetch_weather_async(city: str):
-    """异步调用高德天气 API"""
-    amap_key = os.getenv("AMAP_API_KEY")
-    if not amap_key:
-        return {"error": "缺少高德 API Key"}
-    try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SHORT) as client:
-            # 1. 查城市编码
-            geo_resp = await client.get(
-                "https://restapi.amap.com/v3/geocode/geo",
-                params={"key": amap_key, "address": city}
-            )
-            geo_data = geo_resp.json()
-            if geo_data["status"] != "1" or not geo_data["geocodes"]:
-                return {"error": f"未找到城市: {city}"}
-            adcode = geo_data["geocodes"][0]["adcode"]
-            
-            # 2. 查天气
-            weather_resp = await client.get(
-                "https://restapi.amap.com/v3/weather/weatherInfo",
-                params={"key": amap_key, "city": adcode, "extensions": "base"}
-            )
-            weather_data = weather_resp.json()
-            if weather_data["status"] != "1":
-                return {"error": "天气查询失败"}
-            lives = weather_data.get("lives") or []
-            if not lives:
-                # lives 为空数组（2026-09-07 审查 P2）：原先 [0] IndexError 落
-                # "天气查询失败"，实际语义是"该地区无天气数据"
-                return {"error": f"{city} 暂无天气数据"}
-            live = lives[0]
-            # 港澳台：高德无天气数据（lives 缺字段）；geo 解析会落邻城（港→深/澳→珠），
-            # 此时如实标注数据来源城市，由访客自行参考
-            if not live.get("weather") or not live.get("temperature"):
-                return {"error": f"{city} 暂无天气数据"}
-            return {
-                "city": live.get("city", city),
-                "temperature": live["temperature"],
-                "weather": live["weather"],
-                "wind": live["winddirection"]
-            }
-    except Exception as e:
-        # 异常 str 可能带含 key 的完整 URL，用户侧只给通用文案（细节进日志）
-        logger.warning(f"天气查询异常: {type(e).__name__}: {e}")
-        return {"error": "天气查询失败"}
+# 天气子系统已拆至 weather.py（2026-09-10：tools.py 超 600 行硬限，按子系统边界
+# 拆分）；此处 re-export 保持既有 import 路径兼容（stream_utils/dispatch_tool/测试）。
+from .weather import (  # noqa: F401
+    fetch_weather_async, _geocode_contains,
+)
+
+# 扩召子系统（条号直钉/邻接/章扩/保护带）已拆至 kb_expand.py（2026-09-14 防熵拆分）；旧名 re-export 兼容。
+from .kb_expand import (  # noqa: F401
+    NEIGHBOR_ENABLED, NEIGHBOR_GUARD, NEIGHBOR_TOP,
+    CHAPTER_EXPAND_ENABLED, CHAPTER_EXPAND_K,
+    _apply_neighbor_guard, _cosine, _expand_chapter, _expand_neighbors,
+    _promote_pinned,
+)
 
 
 # ============================================================
@@ -61,34 +34,41 @@ async def fetch_weather_async(city: str):
 # ============================================================
 _COLLOQUIAL_MAP = None
 _COLLOQUIAL_MAP_PATH = None
+_LOAD_LOCK = threading.Lock()
 
 def _load_colloquial_map() -> dict:
-    """加载口语化表述映射表（tests/民法典映射表.txt）"""
-    global _COLLOQUIAL_MAP, _COLLOQUIAL_MAP_PATH
+    """加载口语化表述映射表（tests/民法典映射表.txt）
+
+    2026-09-12 深检 P2：首调并发竞态修复——构建在局部 dict 完成后一次性发布。
+    原写法锁内置空 dict 后在锁外填充：并发快路径会把空/部分 dict 当作已加载
+    返回（口语化映射对该请求静默失效）。双检锁与 law_mapping.py 同款。
+    """
+    global _COLLOQUIAL_MAP
     if _COLLOQUIAL_MAP is not None:
         return _COLLOQUIAL_MAP
-
-    _COLLOQUIAL_MAP = {}
-    path = _COLLOQUIAL_MAP_PATH or os.path.join(
-        os.path.dirname(__file__), "..", "..", "tests", "民法典映射表.txt"
-    )
-    if not os.path.exists(path):
-        # 回退到容器内路径
-        path = "/app/tests/民法典映射表.txt"
-    if not os.path.exists(path):
-        return _COLLOQUIAL_MAP
-    
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("口语化") or line.startswith("==="):
-                continue
-            parts = line.split("\t", 1)
-            if len(parts) == 2:
-                colloquial = parts[0].strip()
-                legal = parts[1].strip()
-                if colloquial and legal:
-                    _COLLOQUIAL_MAP[colloquial] = legal
+    with _LOAD_LOCK:
+        if _COLLOQUIAL_MAP is not None:
+            return _COLLOQUIAL_MAP
+        mapping = {}
+        path = _COLLOQUIAL_MAP_PATH or os.path.join(
+            os.path.dirname(__file__), "..", "..", "tests", "民法典映射表.txt"
+        )
+        if not os.path.exists(path):
+            # 回退到容器内路径
+            path = "/app/tests/民法典映射表.txt"
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("口语化") or line.startswith("==="):
+                        continue
+                    parts = line.split("\t", 1)
+                    if len(parts) == 2:
+                        colloquial = parts[0].strip()
+                        legal = parts[1].strip()
+                        if colloquial and legal:
+                            mapping[colloquial] = legal
+        _COLLOQUIAL_MAP = mapping
     return _COLLOQUIAL_MAP
 
 
@@ -144,23 +124,40 @@ def _dedup(candidates: list, chunk_key: str, heading: str, content: str, sim: fl
     return True
 
 
-def _perm_clause(permissions: list | None) -> str:
+def _perm_clause(permissions: list | None, param_index: int = 3) -> str:
     """知识库权限过滤 SQL 片段（P0 #29/#41）。
 
     None=不过滤（内部/admin）；[]=仅公开（空数组 && 会漏掉公开文档，须等值判断）；
     非空=公开+命中权限组。三处调用（trgm/ILIKE/向量）占位符布局一致：
-    $1 检索参数、$2 limit、$3 权限数组，故固定用 $3。
+    trgm/ILIKE 默认布局为 $1 检索参数、$2 limit、$3 权限数组；
+    向量路前面多了 embedding_model，调用时传 param_index=4。
     """
     if permissions is None:
         return ""
     if permissions:
-        return " AND (COALESCE(permission, '{}') = '{}' OR permission && $3) "
+        return (
+            " AND (COALESCE(permission, '{}') = '{}' "
+            f"OR permission && ${param_index}) "
+        )
     return " AND COALESCE(permission, '{}') = '{}' "
 
 
 async def _recall_pg_trgm(conn, search_query: str, recall_limit: int,
                           permissions: list | None = None) -> list:
-    """pg_trgm 相似度召回（带相似度分数）。
+    """pg_trgm 词面召回（带相似度分数）。
+
+    打分方式经实测对比（2026-09-12，55 条民法典标注用例）：
+      similarity 整体重叠             → recall@5 = 0.7212
+      word_similarity 片段最大匹配     → recall@5 = 0.7121
+      GREATEST(两者)                  → 0.7121（**等价于只用 word_similarity**）
+
+    最后一条值得记住：word_similarity 在所有块上恒高于 similarity（相关块 0.583 vs
+    0.047、无关块 0.083 vs 0.012），尺度不同，取 max 会被它完全主导，不是真正的组合。
+
+    word_similarity 在**短关键词查询**上确实明显更强（「第五百三十三条」时该条在
+    similarity 下全库排第 22 名、召回窗 15 进不了池，word_similarity 排第 1），
+    但本知识库用例以自然语言长句为主，整体上 similarity 更稳，故维持后者。
+    若要两全需按 RRF 做**双路融合**（而非取 max），净收益约 ±1%，暂不引入额外查询开销。
 
     permissions=None = 不过滤（内部/admin）；[] = 仅公开；['vip'] = 公开+vip。
     """
@@ -170,7 +167,7 @@ async def _recall_pg_trgm(conn, search_query: str, recall_limit: int,
     rows = await conn.fetch(
         "SELECT chunk_key, source, heading, content, source_doc, "
         "similarity(content, $1) as sim "
-        "FROM knowledge_chunks WHERE source = 'civil_code' "
+        "FROM knowledge_chunks WHERE source = 'civil_code' AND valid "
         + _perm_clause(permissions) +
         "ORDER BY sim DESC LIMIT $2",
         *args,
@@ -192,17 +189,26 @@ async def _recall_pg_vector(conn, query_embedding: list, recall_limit: int,
     """
     if not query_embedding:
         return []
-    args = [json.dumps(query_embedding), recall_limit]
+    args = [json.dumps(query_embedding), recall_limit, EMBEDDING_MODEL]
     if permissions:
         args.append(permissions)
-    rows = await conn.fetch(
-        "SELECT chunk_key, source, heading, content, source_doc, "
-        "1 - (embedding <=> $1::vector) AS sim "
-        "FROM knowledge_chunks WHERE source = 'civil_code' AND embedding IS NOT NULL "
-        + _perm_clause(permissions) +
-        "ORDER BY embedding <=> $1::vector LIMIT $2",
-        *args,
-    )
+    # 2026-09-12 去近似化（ragclosure/reports/召回率提升分析.md §九）：civil 通道仅
+    # ~1300 行，ivfflat(lists=100) 默认 probes=1 只扫 ~1 个簇，纯属负收益——实测金条
+    # 位次随 LIMIT 漂移（17↔22↔9），8/11 零命中用例的金条连近似 top-60 都进不了。
+    # probes 拉满 = 全簇扫描（结果等价精确搜索），该量级耗时毫秒级。
+    # ponytail: 行数过 5 万时需重建 lists 并重估此设置，或调回近似 + 调 probes。
+    async with conn.transaction():
+        await conn.execute("SET LOCAL ivfflat.probes = 1000")
+        rows = await conn.fetch(
+            "SELECT chunk_key, source, heading, content, source_doc, "
+            "1 - (embedding <=> $1::vector) AS sim "
+            "FROM knowledge_chunks WHERE source = 'civil_code' "
+            "AND valid AND embedding IS NOT NULL "
+            "AND embedding_model = $3 "
+            + _perm_clause(permissions, 4) +
+            "ORDER BY embedding <=> $1::vector LIMIT $2",
+            *args,
+        )
     return [{
         "chunk_key": r["chunk_key"],
         "heading": r["heading"],
@@ -212,20 +218,44 @@ async def _recall_pg_vector(conn, query_embedding: list, recall_limit: int,
     } for r in rows]
 
 
-def _rrf_merge(*ranked_lists: list, k: int = 60) -> list:
+def _rrf_merge(*ranked_lists: list, k: int = 60, weights: tuple | None = None) -> list:
     """RRF 倒数排名融合：trgm 相似度 / 向量余弦 / ILIKE 命中不在同一度量空间，
-    按排名位置融合回避归一化；k=60 削弱单路榜首 dominance（社区经验值）。"""
+    按排名位置融合回避归一化；k=60 削弱单路榜首 dominance（社区经验值）。
+
+    weights（2026-09-12 新增，按路给权重）：trgm 路的排序**接近随机**——实测
+    `similarity()` 对"短查询 vs 长法条"是相关块 0.047 vs 无关块 0.012，区分度仅
+    4 倍且都落在噪声区。与向量路**等权**融合等于把噪声抬进前排。在 50 条标注 trace
+    上离线模拟：trgm 权重降到 0.3~0.5 时 RRF 前 5 命中率 0.78 → 0.82；完全归零
+    反而降到 0.80（仍有少量信号，只是不该等权）。默认 None = 保持等权（行为不变）。
+    """
+    if weights is None:
+        weights = (1.0,) * len(ranked_lists)
     scores = {}
-    for lst in ranked_lists:
+    for lst, w in zip(ranked_lists, weights):
         for rank, item in enumerate(lst):
             e = scores.setdefault(item["chunk_key"], {"item": item, "score": 0.0})
-            e["score"] += 1.0 / (k + rank + 1)
+            e["score"] += w / (k + rank + 1)
     return [e["item"] for e in sorted(scores.values(), key=lambda x: -x["score"])]
 
 
 async def _keyword_fill(conn, query: str, recall_limit: int, candidates: list,
                         permissions: list | None = None):
-    """关键词 ILIKE 补充（去重；补满 recall_limit 即停；支持权限过滤）"""
+    """关键词 ILIKE 补充（去重；补满 recall_limit 即停；支持权限过滤）
+
+    2026-09-12 诊断结论（**该函数当前恒不产出结果，两处原因，尚未修复**）：
+
+    ① 配额被饿死：`recall_limit - len(candidates)` 恒为 0——调用方
+       `_recall_two_ways` 先用 `_recall_pg_trgm` 取满 recall_limit 条（pg_trgm 对
+       任何查询都能排满，哪怕最高分只有 0.001），随后 `len(candidates) >=
+       recall_limit` 立即 break。实测两个真实查询各新增 0 条。
+    ② 提取的不是关键词：按标点切分后拿**整个句子**去 ILIKE 匹配，而中文没有词间
+       空格，`'楼上漏水把我家泡了'` 这类整句在法条原文里并不存在。
+
+    已尝试并**回滚**的修法：改用 `word_similarity` 做片段匹配——长查询下同样无效
+    （其高分只在短查询上出现），且会移除本函数的 ILIKE 通配符转义防护
+    （test_keyword_fill_escapes_like_wildcards 覆盖，2026-09-07 审查 P2）。
+    正确方向是**先做中文片段切分再匹配**，属独立改造，需单独立项。
+    """
     for kw in query.replace("?", "").replace("，", " ").replace("？", " ").split():
         if len(kw) < 2:
             continue
@@ -237,7 +267,7 @@ async def _keyword_fill(conn, query: str, recall_limit: int, candidates: list,
             args.append(permissions)
         more = await conn.fetch(
             "SELECT chunk_key, source, heading, content, 0.5 as sim "
-            "FROM knowledge_chunks WHERE source = 'civil_code' "
+            "FROM knowledge_chunks WHERE source = 'civil_code' AND valid "
             + _perm_clause(permissions) +
             "AND content ILIKE $1 ESCAPE '\\' LIMIT $2",
             *args,
@@ -248,130 +278,52 @@ async def _keyword_fill(conn, query: str, recall_limit: int, candidates: list,
             break
 
 
-# 召回窗 15 / 重排 5（2026-09-06 用户决策：原 max(top_k*4,20) 召回 + LLM 全量精排
+# 召回窗 15 / 重排候选池（2026-09-06 用户决策：原 max(top_k*4,20) 召回 + LLM 全量精排
 # 过大过贵——LLM rerank 曾 100% 超时，每查询白等 30s）
-RECALL_LIMIT = 15
-RERANK_TOP = 5
+# 2026-09-12：改为环境变量可配。此前硬编码导致 tests/run_retrieval_eval.py 的
+# TOP_K=20 形同虚设——最终返回被 RERANK_TOP 卡住，recall@10/@20 恒等于 recall@5。
+# 2026-09-12 二次调整（重排候选池 5→15）：实测重排只看 RRF 前 5 时**集合被锁死**
+# ——正确法条在融合池位次 6~26 的 10 条失败用例重排根本无权挽救（0 打坏 0 救回）；
+# 扩到 15 并配合 RRF×CE 线性融合（见 _blend_rrf_ce 的实测数据），recall@5 0.7633→0.7933。
+# 候选池变大增加 CPU 重排耗时（15 对约 3~5s），KB_RERANK_TOP 可无码调回。
+RECALL_LIMIT = int(os.getenv("KB_RECALL_LIMIT", "15"))
+# 2026-09-15 holdout 45 条复测：
+#   TOP=8  recall@5 0.8259 / MRR 0.7889 / avg 1103ms
+#   TOP=12 recall@5 0.8630 / MRR 0.8519 / avg 2337ms
+#   TOP=15 recall@5 0.8852 / MRR 0.8624 / avg 3062ms
+# 2026-09-15 最终漏斗补映射后：TOP=15 recall@10 0.9630 / MRR 0.9037。
+# 法律场景优先召回，默认取 15；运行期仍可安全调整。
+RERANK_TOP = int(os.getenv("KB_RERANK_TOP", "15"))
 
-# 触发式改写重试阈值（2026-09-07 决策：不默认全量开 LLM 查询改写，仅双路召回都低置信时
-# 触发一次改写重试，延迟只付给失败的查询）。
-# ponytail: 阈值未经标注集标定（经验初值），上线后用 tests/run_retrieval_eval.py 在标注集上
-# 校准触发率与改写收益；KB_REWRITE_* 环境变量可无码调整。
-REWRITE_TRIGGER_TRGM_SIM = float(os.getenv("KB_REWRITE_TRGM_SIM", "0.45"))
-REWRITE_TRIGGER_VEC_SIM = float(os.getenv("KB_REWRITE_VEC_SIM", "0.50"))
+# RRF 位次分 × cross-encoder 分数的线性融合权重（1.0 = 纯 CE 序）
+# 2026-09-12 首轮实测（50 条标注）：纯 RRF 0.7633 / 纯 CE 0.7300~0.7400 / 0.2~0.6 宽
+# 平台 0.7933，当时默认 0.4 取平台中点。
+# 2026-09-12 二次调参（train 100 条离线扫描，CE 序×RRF 序全组合复算，采集快照
+# tests/rerank_sweep_train.jsonl）：blend 0.55~0.65 平台 recall@5=0.8895（0.4 时
+# 0.8781，净 +4/-2 条），MRR 基本中性（0.7847→0.7827）；0.7 再多救 1 条但 MRR -0.02，
+# 不取。默认升到 0.6（平台中点）。holdout 验收见 ragclosure/reports/召回率提升分析.md §八。
+RERANK_BLEND = float(os.getenv("KB_RERANK_BLEND", "0.6"))
 
-# 本地重排器单例（sentence-transformers CrossEncoder；镜像内 torch 已预装）
-_RERANKER = None
-_RERANKER_INIT_FAILED = False
+# RRF 融合时 trgm 路的权重（向量路固定 1.0）
+# 2026-09-12：trgm 排序接近随机（见 _rrf_merge docstring 的实测数据），等权融合会把
+# 噪声抬进前排。离线模拟 0.3~0.5 区间最优（RRF 前 5 命中率 0.78 → 0.82）。
+RRF_TRGM_WEIGHT = float(os.getenv("KB_RRF_TRGM_WEIGHT", "0.4"))
 
-
-def _get_reranker():
-    """懒加载本地重排模型（进程内单例）；不可用返回 None，调用方回退 RRF 排序。
-
-    模型经 HF_ENDPOINT 镜像站预置进镜像（见 Dockerfile 构建期下载）。加载前强制
-    HF_HUB_OFFLINE=1：否则 huggingface_hub 每次加载都对 huggingface.co 做 HEAD
-    校验，离线机器上重试 5 轮、首查实测卡死 4 分钟后仍失败（2026-09-06 冒烟实测）。
-    构建期下载由 Dockerfile RUN 里显式 HF_HUB_OFFLINE=0 覆盖。
-    """
-    global _RERANKER, _RERANKER_INIT_FAILED
-    if _RERANKER is not None:
-        return _RERANKER
-    if _RERANKER_INIT_FAILED:
-        return None
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    try:
-        from sentence_transformers import CrossEncoder
-        _RERANKER = CrossEncoder(
-            os.getenv("RERANK_MODEL", "BAAI/bge-reranker-base"), max_length=256)
-        return _RERANKER
-    except Exception as e:
-        _RERANKER_INIT_FAILED = True
-        logger.warning(f"本地重排模型不可用（回退 RRF 排序）: {type(e).__name__}: {str(e)[:120]}")
-        return None
+# 高分 CE 保护带（2026-09-16）：实现与实测数据见 kb_ce_band.py；tools.py 只留接线。
+# 默认关闭，验收通过后再改默认值（同邻接/章扩召的处置惯例）。
+from .kb_ce_band import (  # noqa: E402  (常量须在下方接线前就位)
+    CE_BAND_ENABLED, CE_BAND_LEG_TOP, CE_BAND_MARGIN, _promote_high_ce,
+)
 
 
-async def _rerank_local(query: str, candidates: list) -> list:
-    """本地 cross-encoder（bge-reranker）精排 RRF 前 5 候选。
-
-    ponytail: CPU 软推理 5 对约 1.5-3s。模型刻意选 bge-reranker-base（278M/1.1GB）——
-    主人决策：后续要把 rerank 迁到云端 Ollama，不得换成更大的模型（如 v2-m3 568M）；
-    可用 RERANK_MODEL 环境变量无码切换。未启用/模型不可用返回 []，调用方保持 RRF 排序。
-    """
-    if os.getenv("LOCAL_RERANK_ENABLED", "1") != "1":
-        return []
-    ranker = _get_reranker()
-    if ranker is None or not candidates:
-        return []
-
-    def _predict() -> dict:
-        scores = ranker.predict([(query[:256], c["content"][:300]) for c in candidates])
-        return {c["chunk_key"]: float(s) for c, s in zip(candidates, scores)}
-
-    score_by_key = await asyncio.to_thread(_predict)
-    for c in candidates:
-        c["rerank_score"] = round(score_by_key.get(c["chunk_key"], 0.0), 4)
-    return sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
+# 2026-09-16 重排层拆到 kb_rerank.py，此处 re-export 保持 tools.* 调用路径不变。
+from .kb_rerank import (  # noqa: E402,F401
+    RERANK_MODEL, RERANK_QUANT, REWRITE_TRIGGER_TRGM_SIM, REWRITE_TRIGGER_VEC_SIM,
+    _blend_rrf_ce, _clean_rewrite, _get_reranker, _is_low_confidence,
+    _rerank_local, _rewrite_query_for_recall, _select_rerank_candidates,
+)
 
 
-def _is_low_confidence(max_trgm_sim: float, max_vec_sim: float) -> bool:
-    """双路召回最高分均低于阈值 → 低置信（触发式改写重试的门禁，2026-09-07 决策）。
-
-    语义：任一路"强命中"即不打扰——trgm 词面强命中或向量语义强命中任一存在，
-    就没必要花一次 LLM 调用改写；严格小于阈值（等于阈值视为有信号）。
-    """
-    return (max_trgm_sim < REWRITE_TRIGGER_TRGM_SIM
-            and max_vec_sim < REWRITE_TRIGGER_VEC_SIM)
-
-
-def _clean_rewrite(text: str, original: str) -> str:
-    """清洗 LLM 改写输出：取首行、剥引号与"改写："类前缀、限长 64 字。
-
-    空串/与原查询等价/过短 → 返回空串（调用方不重试）。
-    """
-    if not text:
-        return ""
-    line = text.strip().splitlines()[0].strip()
-    line = line.strip('"“”\'「」《》')
-    for prefix in ("改写：", "改写:", "查询：", "检索："):
-        if line.startswith(prefix):
-            line = line[len(prefix):].strip()
-    line = line.rstrip("。").strip('"“”')
-    if not line or line == original or len(line) < 2:
-        return ""
-    return line[:64]
-
-
-async def _rewrite_query_for_recall(query: str, username: str = "") -> str:
-    """低置信时的一次 LLM 查询改写（口语 → 条文术语风格检索表述），失败一律返回空串。
-
-    改写只用于召回重试；重排仍用用户原话（cross-encoder 需要真实问题语义）。
-    post_chat_completion 自带主/备模型降级；任何失败 fail-open，检索主流程不受影响。
-    username 供扣费（2026-09-09 主人拍板：内部 LLM 调用计入计费）。
-    """
-    try:
-        from ..services.chat_support import post_chat_completion
-        from ..core.config import HTTP_TIMEOUT_SHORT
-        ok, data = await post_chat_completion(
-            {"model": None,
-             "messages": [{"role": "user", "content":
-                           "把用户的口语问题改写成《民法典》条文术语风格的检索查询，"
-                           "只输出改写后的查询本身，不要解释、不要引号。\n"
-                           f"用户问题：{query}"}],
-             "temperature": 0, "max_tokens": 80},
-            timeout=HTTP_TIMEOUT_SHORT)
-        if not ok:
-            logger.debug(f"检索改写上游失败（跳过重试）: {str(data)[:120]}")
-            return ""
-        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-        # 计入计费（2026-09-09 主人拍板）：检索改写属用户请求触发，本路径无既有指标走全量入口
-        _usage = data.get("usage") or {}
-        if username and (_usage.get("prompt_tokens") or _usage.get("completion_tokens")):
-            from ..services.llm_streaming import record_token_usage
-            record_token_usage(_usage, username, "")
-        return _clean_rewrite(content, query)
-    except Exception as e:
-        logger.debug(f"检索改写异常（跳过重试）: {type(e).__name__}")
-        return ""
 
 
 async def _recall_two_ways(conn, search_query: str, recall_limit: int,
@@ -381,13 +333,119 @@ async def _recall_two_ways(conn, search_query: str, recall_limit: int,
     max_trgm_sim 在关键词补充前取值：ILIKE 命中固定 similarity=0.5，混入会虚高
     触发判断（词面命中是弱信号，不该被当成"高置信"压制改写重试）。
     """
-    trgm = await _recall_pg_trgm(conn, search_query, recall_limit, permissions)
+    # trgm 只占本机 PG，embedding 是外部 HTTP，二者互不依赖，可并行启动。
+    trgm, embedding = await asyncio.gather(
+        _recall_pg_trgm(conn, search_query, recall_limit, permissions),
+        _generate_embedding(search_query),
+    )
     max_trgm = max((c["similarity"] for c in trgm), default=0.0)
     await _keyword_fill(conn, search_query, recall_limit, trgm, permissions)
-    embedding = await _generate_embedding(search_query)
     vector = await _recall_pg_vector(conn, embedding, recall_limit, permissions)
     max_vec = max((c["similarity"] for c in vector), default=0.0)
+    _LAST_EMBEDDING.set(embedding)  # 供章内扩召复用，免二次 embedding 调用
     return trgm, vector, max_trgm, max_vec
+
+
+# 章内余弦扩召（2026-09-13）：top1 定章 → 章内成员按与查询向量余弦择优入池，
+# 让 CE×RRF 公平裁决（实现与实测数据见 kb_expand.expand_chapter）。
+_LAST_EMBEDDING: contextvars.ContextVar = contextvars.ContextVar("kb_last_embedding",
+                                                                default=None)
+
+
+async def _recall_and_fuse(conn, query: str, search_query: str, recall_limit: int,
+                           permissions: list | None, username: str,
+                           diagnostics: dict | None) -> tuple:
+    """双路召回 → 低置信改写重试 → RRF 融合，返回 (recall_lists, merged, retried)。
+
+    改写重试只在双路都低置信时触发，延迟只付给失败查询。_LAST_LEGS 与各阶段
+    埋点在本函数内写，调用方不需要感知召回细节。
+    """
+    recall_started = time.perf_counter()
+    trgm, vector, max_trgm, max_vec = await _recall_two_ways(
+        conn, search_query, recall_limit, permissions)
+    # 第 5 位是向量腿故障标志（2026-09-14 审计 P1）：embedding 生成失败时
+    # _recall_pg_vector 静默返回空——不记标志，监测侧无法区分「没召回到」
+    # 与「这一路挂了」（RC-1b 单腿故障规则依赖它）
+    _vec_failed = _LAST_EMBEDDING.get() is None
+    _LAST_LEGS.set((len(trgm), len(vector), max_trgm, max_vec, _vec_failed))
+    if diagnostics is not None:
+        diagnostics.update({
+            "trgm": chunk_keys(trgm),
+            "vector": chunk_keys(vector),
+        })
+    record_span(
+        "recall",
+        latency_ms=round((time.perf_counter() - recall_started) * 1000),
+        result_count=len(trgm) + len(vector),
+        attributes={
+            "trgm_hits": len(trgm),
+            "vec_hits": len(vector),
+            "vec_failed": _vec_failed,
+            "recall_limit": recall_limit,
+        },
+    )
+    recall_lists = [trgm, vector]
+    retried = False
+    fusion_started = time.perf_counter()
+    rewritten = ""
+    if _is_low_confidence(max_trgm, max_vec):
+        rewritten = await _rewrite_query_for_recall(query, username=username)
+    if rewritten:
+        logger.info(f"检索低置信（trgm={max_trgm:.2f}, vec={max_vec:.2f}），触发改写重试: "
+                    f"{search_query[:40]}... → {rewritten[:40]}...")
+        retry_started = time.perf_counter()
+        trgm2, vec2, _, _ = await _recall_two_ways(
+            conn, rewritten, recall_limit, permissions)
+        record_span(
+            "recall_retry",
+            latency_ms=round((time.perf_counter() - retry_started) * 1000),
+            result_count=len(trgm2) + len(vec2),
+            attributes={"trgm_hits": len(trgm2), "vec_hits": len(vec2)},
+        )
+        recall_lists.extend([trgm2, vec2])
+        if diagnostics is not None:
+            diagnostics.update({
+                "trgm_retry": chunk_keys(trgm2),
+                "vector_retry": chunk_keys(vec2),
+            })
+        merged = _rrf_merge(trgm, vector, trgm2, vec2,
+                            weights=(RRF_TRGM_WEIGHT, 1.0, RRF_TRGM_WEIGHT, 1.0))
+        retried = True
+    else:
+        merged = _rrf_merge(trgm, vector, weights=(RRF_TRGM_WEIGHT, 1.0))
+    record_span(
+        "fusion",
+        latency_ms=round((time.perf_counter() - fusion_started) * 1000),
+        result_count=len(merged),
+        attributes={"rewrite_retry": retried, "rrf_trgm_weight": RRF_TRGM_WEIGHT},
+    )
+    if diagnostics is not None:
+        diagnostics["rrf"] = chunk_keys(merged)
+    return recall_lists, merged, retried
+
+
+async def _expand_and_guard(conn, merged: list, search_query: str,
+                            permissions: list | None, rerank_top: int,
+                            method: str) -> tuple:
+    """邻接/章级扩召 + 固定条保护，返回 (merged, method)。
+
+    扩召会往池子里插新块，guard 先记下扩展前的靠前条目，扩展后压回窗口内，
+    避免扩召把原 RRF 高分条挤出候选。
+    """
+    guard = []
+    if NEIGHBOR_ENABLED:
+        guard = merged[:NEIGHBOR_GUARD]
+        merged = await _expand_neighbors(conn, merged, permissions)
+        method += "+neighbor"
+    if CHAPTER_EXPAND_ENABLED:
+        guard = guard or merged[:NEIGHBOR_GUARD]
+        merged = await _expand_chapter(
+            conn, merged, _LAST_EMBEDDING.get(), permissions)
+        method += "+chapter"
+    merged = _promote_pinned(merged, search_query)
+    if guard:
+        merged = _apply_neighbor_guard(merged, guard, rerank_top)
+    return merged, method
 
 
 async def _search_two_legs(conn, query: str, search_query: str,
@@ -400,30 +458,57 @@ async def _search_two_legs(conn, query: str, search_query: str,
     不默认全量开。method 标签带 rewrite_retry，供评测统计触发率与改写收益。
     """
     recall_limit = max(RECALL_LIMIT, top_k)
-    trgm, vector, max_trgm, max_vec = await _recall_two_ways(
-        conn, search_query, recall_limit, permissions)
-    retried = False
-    if _is_low_confidence(max_trgm, max_vec):
-        rewritten = await _rewrite_query_for_recall(query, username=username)
-        if rewritten:
-            logger.info(f"检索低置信（trgm={max_trgm:.2f}, vec={max_vec:.2f}），触发改写重试: "
-                        f"{search_query[:40]}... → {rewritten[:40]}...")
-            trgm2, vec2, _, _ = await _recall_two_ways(
-                conn, rewritten, recall_limit, permissions)
-            merged = _rrf_merge(trgm, vector, trgm2, vec2)
-            retried = True
-        else:
-            merged = _rrf_merge(trgm, vector)
-    else:
-        merged = _rrf_merge(trgm, vector)
+    rerank_top = await get_rerank_top(RERANK_TOP)
+    diagnostics = {} if diagnostics_enabled() else None
+    recall_lists, merged, retried = await _recall_and_fuse(
+        conn, query, search_query, recall_limit, permissions, username, diagnostics)
     method = "trgm+vector" + ("+rewrite_retry" if retried else "")
     if not merged:
-        return {"results": [], "method": method}
-    top_candidates = merged[:RERANK_TOP]
+        return {
+            "results": [],
+            "method": method,
+            **({"diagnostics": diagnostics} if diagnostics is not None else {}),
+        }
+    merged, method = await _expand_and_guard(
+        conn, merged, search_query, permissions, rerank_top, method)
+    top_candidates = _select_rerank_candidates(merged, recall_lists, rerank_top)
+    if diagnostics is not None:
+        diagnostics["rerank_candidates"] = chunk_keys(top_candidates)
+    rerank_started = time.perf_counter()
     reranked = await _rerank_local(query, top_candidates)
+    record_span(
+        "rerank",
+        latency_ms=round((time.perf_counter() - rerank_started) * 1000),
+        result_count=len(reranked or []),
+        attributes={"candidate_count": len(top_candidates), "rerank_top": rerank_top},
+    )
     if reranked:
-        return {"results": reranked[:top_k], "method": method + "+rrf+local_rerank"}
-    return {"results": top_candidates[:top_k], "method": method + "+rrf"}
+        if RERANK_BLEND > 0:
+            reranked = _blend_rrf_ce(top_candidates, reranked, RERANK_BLEND)
+        if CE_BAND_ENABLED:
+            # 保护带只动 TopK 窗口内的成员，且条件是「CE 更高 + 单腿靠前」，
+            # 不改变其余条目的融合序；被挤出的必然是窗口内融合分最低那条。
+            # 形参必须是单腿召回列表：传融合后的 merged 会让 _best_leg_rank 对
+            # dict 切片直接抛 TypeError（2026-09-19 审查 agents P2-2 实测复现）。
+            reranked = _promote_high_ce(reranked, recall_lists, top_k,
+                                        CE_BAND_LEG_TOP, CE_BAND_MARGIN)
+            method += "+ce_band"
+        final_results = reranked[:top_k]
+        if diagnostics is not None:
+            diagnostics["final"] = chunk_keys(final_results)
+        return {
+            "results": final_results,
+            "method": method + "+rrf+local_rerank",
+            **({"diagnostics": diagnostics} if diagnostics is not None else {}),
+        }
+    final_results = top_candidates[:top_k]
+    if diagnostics is not None:
+        diagnostics["final"] = chunk_keys(final_results)
+    return {
+        "results": final_results,
+        "method": method + "+rrf",
+        **({"diagnostics": diagnostics} if diagnostics is not None else {}),
+    }
 
 
 async def search_knowledge(query: str, top_k: int = 5, permissions: list | None = None,
@@ -448,146 +533,32 @@ async def search_knowledge(query: str, top_k: int = 5, permissions: list | None 
     if _search_query != query:
         logger.info(f"搜索前置口语映射: {query[:30]}... → {_search_query[:60]}...")
 
+    # ===== 法条编号归一化（2026-09-12 修复）=====
+    # normalize_article_ref 早已实现却从未接入检索链路（全仓仅单测调用），
+    # 导致用户写"第533条"而库内是"第五百三十三条"时 trgm 词面路与 ILIKE
+    # 关键词路双双失配（实测 similarity 0.0065 vs 0.0556，相差 8.5 倍），
+    # 只剩向量一路投票，正确条文极易被挤出召回池。
+    _normalized = normalize_article_ref(_search_query)
+    if _normalized != _search_query:
+        logger.info(f"法条编号归一化: {_search_query[:30]}... → {_normalized[:60]}...")
+        _search_query = _normalized
+
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        return await _search_two_legs(conn, query, _search_query, top_k, permissions,
-                                      username=username)
+    _t0 = time.perf_counter()
+    async with pool.acquire(timeout=5) as conn:
+        res = await _search_two_legs(conn, query, _search_query, top_k, permissions,
+                                     username=username)
+    record_retrieval(query, res, _LAST_LEGS.get(), (time.perf_counter() - _t0) * 1000)
+    return res
 
 
 # web_search 子系统已拆至 web_search.py（2026-09-07：tools.py 超 600 行硬限，按子系统边界拆分），
 # 此处 re-export 保持既有 import 路径兼容（stream_utils/dispatch_tool/历史测试）。
 from .web_search import (  # noqa: F401
     _SEARCH_MAX_PER_WINDOW, _check_search_rate, _instant_answer,
-    _search_rate_state, web_search,
+    web_search,
 )
 
-# ============================================================
-# 项目知识库搜索（求职场景用，Embedding 向量召回 + pg_trgm 兜底）
-# ============================================================
-async def _generate_embedding(text: str):
-    """调用 Ollama Embedding 生成向量。
-
-    URL 读配置 EMBEDDING_API_URL（2026-09-07 审查 P2：配置项原先存在但此路径
-    硬编码两个 URL 不用）；自动派生另一台主机名做兜底——容器内 localhost 连接
-    拒绝是即时的，主机上 host.docker.internal 会黑洞等超时，故配置值优先。
-    超时收窄到 5s：正常嵌入 <1s，给慢机留裕量即可，不该拖住整条检索。
-    """
-    import httpx
-    from ..core.config import EMBEDDING_API_URL, EMBEDDING_MODEL
-    urls = [EMBEDDING_API_URL]
-    alt_url = EMBEDDING_API_URL.replace("localhost", "host.docker.internal")
-    if alt_url != EMBEDDING_API_URL:
-        urls.append(alt_url)
-    for url in urls:
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
-                resp = await client.post(
-                    url,
-                    json={"model": EMBEDDING_MODEL, "prompt": text[:512]}
-                )
-                resp.raise_for_status()
-                return resp.json()["embedding"]
-        except Exception:
-            continue
-    return None
-
-
-async def _project_embedding_search(pool, query: str, top_k: int) -> list:
-    """项目知识库 Embedding 向量召回（Ollama）；失败或无结果返回 []，由调用方降级"""
-    try:
-        emb = await _generate_embedding(query)
-        if not emb:
-            return []
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT chunk_key, source, heading, content, "
-                "1 - (embedding <=> $1::vector) as sim "
-                "FROM knowledge_chunks WHERE source = 'project' "
-                "AND embedding IS NOT NULL "
-                "ORDER BY embedding <=> $1::vector "
-                "LIMIT $2",
-                json.dumps(emb), max(top_k * 2, 10)
-            )
-        return [{
-            "heading": r["heading"],
-            "content": r["content"][:800],
-            "similarity": round(r["sim"], 4) if r["sim"] else 0
-        } for r in rows if r["sim"] and r["sim"] > 0.3]
-    except Exception as e:
-        logger.warning(f"Embedding 检索失败，降级: {e}")
-        return []
-
-
-async def _project_keyword_fill(pool, query: str, results: list, top_k: int) -> None:
-    """项目知识库关键词 ILIKE 兜底：提取 2-4 字中文片段（长词优先），补满 top_k 即停"""
-    keywords = set()
-    raw = query.replace("?", "").replace("？", "").replace("的", "").replace("怎么", "")
-    # 按空格拆分
-    for part in raw.split():
-        if len(part) >= 2:
-            keywords.add(part)
-    # 滑动窗口提取 2-4 字片段
-    for i in range(len(raw)):
-        for j in range(2, 5):
-            if i + j <= len(raw):
-                kw = raw[i:i+j]
-                if len(kw) >= 2:
-                    keywords.add(kw)
-    # 优先用长关键词
-    keywords = sorted(keywords, key=len, reverse=True)[:8]
-
-    if not keywords:
-        return
-    async with pool.acquire() as conn:
-        for kw in keywords:
-            more = await conn.fetch(
-                "SELECT chunk_key, source, heading, content, 0.5 as sim "
-                "FROM knowledge_chunks WHERE source = 'project' "
-                "AND content ILIKE $1 LIMIT $2",
-                f"%{kw}%", top_k - len(results)
-            )
-            for r in more:
-                heading, content = r["heading"], r["content"][:800]
-                if not any(e["heading"] == heading and e["content"][:50] == content[:50] for e in results):
-                    results.append({"heading": heading, "content": content, "similarity": 0.5})
-            if len(results) >= top_k:
-                break
-
-
-async def search_project_knowledge(query: str, top_k: int = 5):
-    """
-    搜索项目知识库 — 当访客询问项目技术细节时调用。
-    知识库涵盖：支付系统架构、并发安全、异常处理、技术栈等。
-    优先使用 Embedding 向量检索，降级到 pg_trgm + ILIKE。
-    """
-    from ..core.db import get_pool
-    pool = await get_pool()
-    results = await _project_embedding_search(pool, query, top_k)
-    method = "embedding" if results else "pg_trgm"
-
-    # 第二优先/降级：pg_trgm 相似度检索（embedding 部分命中时为 hybrid 补充）
-    if len(results) < top_k:
-        if results:
-            method = "hybrid"
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT chunk_key, source, heading, content, "
-                "similarity(content, $1) as sim "
-                "FROM knowledge_chunks WHERE source = 'project' "
-                "AND content % $1 "
-                "ORDER BY sim DESC LIMIT $2",
-                query, max(top_k * 3, 15)
-            )
-            for r in rows:
-                heading, content = r["heading"], r["content"][:800]
-                sim = round(r["sim"], 4) if r["sim"] else 0
-                if not any(e["heading"] == heading and e["content"][:50] == content[:50] for e in results):
-                    results.append({"heading": heading, "content": content, "similarity": sim})
-
-    # 关键词补充兜底（拆分为 2-4 字片段，提高中文匹配率）
-    if len(results) < top_k:
-        await _project_keyword_fill(pool, query, results, top_k)
-
-    results = sorted(results, key=lambda x: x["similarity"], reverse=True)[:top_k]
-    logger.info(f"项目知识库检索: query={query[:30]}, method={method}, results={len(results)}")
-    return {"results": results, "method": method}
+# 通用查询 Embedding 客户端（求职助手下线后由 project_kb.py 迁入，2026-09-20）；
+# 本模块向量腿 _recall_two_ways 直接调用，re-export 保持 patch/import 路径兼容。
+from .kb_embedding import _generate_embedding  # noqa: F401

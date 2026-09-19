@@ -22,8 +22,24 @@ _OCR_LOCK = threading.Lock()
 _MAX_PDF_PAGES = 200        # PDF 最大处理页数
 _MAX_OCR_IMAGES = 50        # 单文档最大 OCR 图片数（内嵌图/整页渲染共用）
 _PARSE_DEADLINE_S = 60.0    # 单文档解析 wall-clock 预算
+# AG-1（2026-09-19 审查）：zip 炸弹防护——20MB 上传可声明 GB 级解压成员，
+# 图片数与 deadline 都拦不住 z.read() 一次读爆内存；单成员解压后大小上限
+# 80MB（手机原图 <20MB，留足冗余），超限成员跳过不落内存
+_MAX_IMAGE_BYTES = 80 * 1024 * 1024
 # ponytail: deadline 是协作式检查（页/图粒度），单次 OCR 无法抢占，
 # 实际耗时最多超出预算一次单页 OCR；如需硬中断改子进程隔离。
+
+
+def _read_member_limited(z: zipfile.ZipFile, name: str, limit: int) -> bytes | None:
+    """AG-1（2026-09-19 审查）：流式限读 zip 成员，解压量超 limit 返回 None。
+
+    file_size 是 zip 头部声明值，攻击者可谎报小值，只有按真实读取字节封顶
+    才能防住真炸弹；返回超限标记让调用方决定跳过文案。
+    """
+    with z.open(name) as mf:
+        data = mf.read(limit + 1)
+    return None if len(data) > limit else data
+
 
 # ============================================================
 # 图片 OCR 引擎（RapidOCR 优先，Tesseract 降级）
@@ -79,7 +95,7 @@ def _ocr_image(img: Image.Image, label: str = "") -> str:
                 # Tesseract 降级
                 if img.mode != 'L':
                     img = img.convert('L')
-                from PIL import ImageEnhance, ImageFilter
+                from PIL import ImageEnhance
                 enhancer = ImageEnhance.Contrast(img)
                 img = enhancer.enhance(1.5)
                 text = pytesseract.image_to_string(img, lang='chi_sim+eng', config='--psm 6')
@@ -125,16 +141,18 @@ def _render_pages_ocr(filepath: str) -> str:
     受页数上限与 deadline 约束（2026-09-07 审查 P1）。
     """
     parts = []
+    rendered = 0  # 实际渲染页数（截断标注用：每页渲染即一张位图，原恒标 0 失真）
     started = time.monotonic()
     with fitz.open(filepath) as doc:
         for page_num, page in enumerate(doc):
             if page_num + 1 > _MAX_PDF_PAGES:
-                parts.append(_truncation_note(_MAX_PDF_PAGES, 0, time.monotonic() - started, "页数超限"))
+                parts.append(_truncation_note(_MAX_PDF_PAGES, rendered, time.monotonic() - started, "页数超限"))
                 break
             if time.monotonic() - started > _PARSE_DEADLINE_S:
-                parts.append(_truncation_note(page_num, 0, time.monotonic() - started, "解析超时"))
+                parts.append(_truncation_note(page_num, rendered, time.monotonic() - started, "解析超时"))
                 break
             pix = page.get_pixmap(dpi=150)
+            rendered += 1
             ocr_text = _ocr_image_bytes(pix.tobytes("png"), "png", f"第{page_num+1}页")
             if ocr_text and ocr_text.strip():
                 parts.append(ocr_text)
@@ -155,13 +173,15 @@ async def parse_pdf(filepath: str) -> str:
         stop_reason = ""
         with fitz.open(filepath) as doc:
             for page_num, page in enumerate(doc):
+                # deadline 检查先于计数自增（2026-09-10 审查 P3：原顺序把未处理的
+                # 当前页也计入 page_count，"处理了 N 页"标注虚高 1）
+                if time.monotonic() - started > _PARSE_DEADLINE_S:
+                    stop_reason = "解析超时"
+                    break
                 page_count += 1
                 if page_count > _MAX_PDF_PAGES:
                     stop_reason = "页数超限"
                     page_count = _MAX_PDF_PAGES
-                    break
-                if time.monotonic() - started > _PARSE_DEADLINE_S:
-                    stop_reason = "解析超时"
                     break
                 # 1. 提取文本
                 text = page.get_text()
@@ -219,13 +239,16 @@ async def parse_image(filepath: str) -> str:
     def _ocr():
         try:
             if _HAS_RAPID:
-                result, elapse = _RAPID_ENGINE(filepath)
+                # RapidOCR/ONNX 推理不支持并发，独立图片入口也必须与文档内 OCR
+                # 共用同一把锁，否则并发上传会重入原生推理。
+                with _OCR_LOCK:
+                    result, elapse = _RAPID_ENGINE(filepath)
                 if result:
                     texts = [f"[{conf:.2f}] {text}" for box, text, conf in result if text.strip()]
                     return "\n".join(texts) if texts else "[图片中未识别到文字]"
                 return "[图片中未识别到文字]"
             else:
-                from PIL import Image, ImageEnhance, ImageFilter
+                from PIL import Image, ImageEnhance
                 with Image.open(filepath) as raw_img:  # P1 #6：显式关闭文件句柄
                     if raw_img.mode != 'L':
                         img = raw_img.convert('L')
@@ -249,7 +272,6 @@ async def parse_image(filepath: str) -> str:
 # ============================================================
 try:
     from docx import Document as DocxDocument
-    from docx.opc.constants import RELATIONSHIP_TYPE as RT
     _HAS_DOCX = True
 except ImportError:
     _HAS_DOCX = False
@@ -302,7 +324,12 @@ async def parse_docx(filepath: str) -> str:
                     if time.monotonic() - started > _PARSE_DEADLINE_S:
                         ocr_results.append("[截断：图片 OCR 超时，其余未解析]")
                         break
-                    img_bytes = z.read(media_path)
+                    # AG-1：真实解压字节封顶，超限成员不进内存
+                    img_bytes = _read_member_limited(z, media_path, _MAX_IMAGE_BYTES)
+                    if img_bytes is None:
+                        ocr_results.append(
+                            f"[跳过 {media_path}：解压后超过 {_MAX_IMAGE_BYTES // (1024 * 1024)}MB 上限]")
+                        continue
                     ext = os.path.splitext(media_path)[1].lstrip('.')
                     label = f"文档插图{idx+1}"
                     ocr_text = _ocr_image_bytes(img_bytes, ext, label)

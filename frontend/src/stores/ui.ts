@@ -6,9 +6,20 @@ function applyTheme(theme: Theme): void {
   document.body.setAttribute('data-theme', theme)
 }
 
+const THEMES = new Set<Theme>([Theme.Classic, Theme.Glass, Theme.Dark])
+
+function read_theme(): Theme {
+  try {
+    const value = localStorage.getItem(StorageKey.Theme) as Theme | null
+    return value && THEMES.has(value) ? value : Theme.Classic
+  } catch {
+    return Theme.Classic
+  }
+}
+
 export const useUiStore = defineStore('ui', {
   state: () => ({
-    theme: (localStorage.getItem(StorageKey.Theme) as Theme) || Theme.Classic,
+    theme: read_theme(),
     settingsOpen: false,
     walletOpen: false,
   }),
@@ -17,8 +28,13 @@ export const useUiStore = defineStore('ui', {
       applyTheme(this.theme)
     },
     setTheme(theme: Theme) {
+      if (!THEMES.has(theme)) return
       this.theme = theme
-      localStorage.setItem(StorageKey.Theme, theme)
+      try {
+        localStorage.setItem(StorageKey.Theme, theme)
+      } catch {
+        // 隐私模式或存储禁用时仅保留内存态。
+      }
       applyTheme(theme)
     },
     openSettings() {

@@ -18,9 +18,9 @@ describe('sessionToMarkdown', () => {
   it('含标题、角色小节与消息正文', () => {
     const md = sessionToMarkdown(session, 'zh')
     expect(md).toContain('# 成都5日游')
-    expect(md).toContain('## 🧑 我')
+    expect(md).toContain('## 用户')
     expect(md).toContain('帮我规划成都行程')
-    expect(md).toContain('## 🤖 助手')
+    expect(md).toContain('## 助手')
     expect(md).toContain('好的，以下是行程…')
   })
 

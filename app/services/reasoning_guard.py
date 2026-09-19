@@ -3,6 +3,7 @@
 抽取自 app/routes/v2.py（2026-09 重构，行为等价纯移动）。
 """
 import re
+from typing import List
 
 from ..core.logging import setup_logging
 
@@ -33,7 +34,7 @@ _REASONING_LEAK_PATTERNS = [
     "多Agent", "多 Agent", "讨论摘要", "自然口吻", "口吻整合",
     "各领域专家", "专家意见", "专家讨论",
     # ---- 工具调用计划复述（模型思考时写出内部函数名/调用签名 → 泄露）----
-    "web_search", "search_knowledge", "search_project_knowledge",
+    "web_search", "search_knowledge",
     "fetch_weather_async", "call_sub_agent",
     "query_weather", "query_hotel", "query_route", "query_food",
     # ---- 负面信号：工具失败 / 异常 ----
@@ -104,59 +105,71 @@ def reasoning_leaked(text: str) -> bool:
     return _REASONING_SUPPRESS_RE.search(text) is not None or _KEY_SHAPE_RE.search(text) is not None
 
 
-def sanitize_reasoning(text: str, persona_id: str = "") -> str:
-    """过滤思考过程中的敏感内容；命中强泄露指纹返回空串（调用方跳过发送）
+def _keep_lines(lines: List[str]) -> str:
+    """逐行弱指纹剔除：命中泄露词的非空行丢弃，其余连同换行原样保留
 
-    仅对 旅游/法律/综合 模式生效；求职助手（me）不过滤（其内容正常，
-    不涉及工具失败/系统设定泄露）。
-    策略：
-    1. 整段检测：命中系统设定/失败等强指纹 → 整段不展示（返回空串）
-    2. 否则逐行剔除敏感碎片，保留正常推理（含重复用户输入，可接受）
+    保留行尾换行（旧实现 .strip() 会把块间换行吃掉，行与行在展示端粘连）。
     """
-    if not text:
-        return ""
-    # 求职助手不过滤（用户明确要求）
-    if persona_id == "me":
-        return text
-    if reasoning_leaked(text):
-        return ""
-    lines = text.split("\n")
-    kept = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            kept.append(line)
-            continue
-        if _REASONING_LEAK_RE.search(stripped):
-            continue
-        kept.append(line)
-    return "\n".join(kept).strip()
+    return "".join(
+        line + "\n" for line in lines
+        if not (line.strip() and _REASONING_LEAK_RE.search(line.strip()))
+    )
 
 
 class ReasoningStreamGuard:
-    """流式思考过滤（跨块安全）：强指纹命中即整流抑制，其余逐块行过滤
+    """流式思考过滤（跨块安全）：按「完整行」检测放行，强指纹命中即整流抑制
 
-    ponytail: 跨块检测靠 _OVERLAP 字符尾部重叠拼接，可捕获 ≤(重叠+1) 字符指纹的
-    任意两块切分（现有最长指纹约 22 字符）；分成 3 块以上的极端长指纹理论可绕过，
-    升级路径是整段缓冲按行送检。
+    ponytail: 2026-09-10 凌晨真实泄露复盘——旧实现逐 delta 过滤，指纹被块边界
+    切开（如 query_ho|tel）即整体绕过，实测 478 字符提示词复述漏出 477 字符。
+    现改为行缓冲：不见换行不放行，指纹无论怎么切都必须在完整行上现形；行尾
+    残余由 flush() 在流尾冲刷（stream_llm_throttled 统一调用）。
+    已知代价：整段无换行的超长单行会缓冲到流尾才处理（思考展示本就是辅助信息，
+    思考模型正常输出带换行，可接受）。
     """
     _OVERLAP = 24
 
     def __init__(self, persona_id: str = ""):
         self._persona_id = persona_id
-        self._carry = ""   # 上一块未参与拼接检测的原始尾部（用于跨块指纹拼接）
+        self._buf = ""    # 已收未判的原始文本（行缓冲，含未完成的尾行）
+        self._carry = ""  # buf 尾部 _OVERLAP 字符（强指纹跨块拼接检测窗）
         self._dead = False  # 强指纹命中后的整流抑制开关
 
+    def _suppress_hit(self, text: str) -> bool:
+        """强指纹检测：系统设定/失败信号/模型身份/Key 形状，命中即整流抑制"""
+        return (
+            _REASONING_SUPPRESS_RE.search(text) is not None
+            or _KEY_SHAPE_RE.search(text) is not None
+        )
+
     def feed(self, chunk: str) -> str:
-        """输入一个思考增量，返回可安全展示的文本（可能为空串）"""
+        """输入一个思考增量，返回可安全展示的「完整行」文本（可能为空串）"""
         if self._dead or not chunk:
             return ""
-        if self._persona_id == "me":
-            return chunk  # 求职助手不过滤（与 sanitize_reasoning 豁免一致）
-        scan = self._carry + chunk
-        if _REASONING_SUPPRESS_RE.search(scan) or _KEY_SHAPE_RE.search(scan):
+        # 强指纹跨块预判：任意 ≤(OVERLAP+1) 字符的指纹无论在块内还是跨块都落窗
+        if self._suppress_hit(self._carry + chunk):
             self._dead = True
             logger.warning("思考内容命中强泄露指纹（含跨块拼接），后续思考整流抑制")
             return ""
-        self._carry = scan[-self._OVERLAP:]
-        return sanitize_reasoning(chunk, self._persona_id)
+        self._buf += chunk
+        self._carry = self._buf[-self._OVERLAP:]
+        if "\n" not in self._buf:
+            return ""  # 尾行未完成：继续缓冲（这是旧版泄露的根源场景）
+        *lines, self._buf = self._buf.split("\n")
+        return _keep_lines(lines)
+
+    def flush(self) -> str:
+        """流结束冲刷：缓冲中的最后一行（无换行尾）补检后放行；调用后守卫作废
+
+        尾行按原文返回（不补换行），保持流内容保真。
+        """
+        if self._dead or not self._buf:
+            return ""
+        tail, self._buf = self._buf, ""
+        stripped = tail.strip()
+        if self._suppress_hit(tail):
+            self._dead = True
+            logger.warning("流尾冲刷命中强泄露指纹，该行不展示")
+            return ""
+        if stripped and _REASONING_LEAK_RE.search(stripped):
+            return ""
+        return tail

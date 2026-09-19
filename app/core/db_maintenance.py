@@ -26,10 +26,9 @@ CACHE_HARD_MAX_DAYS = 180       # 语义缓存硬过期：命中再高超过 180
 BATCH_SIZE = 500                # 每批处理条数
 
 
-def _utc_naive_now() -> datetime:
-    """UTC 当前时间（naive）。所有时间列均为无时区 TIMESTAMP 且 DB 会话为 UTC，
-    用本地 now() 会在容器时区被改写时产生漂移，统一取 UTC 后去 tzinfo。"""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+def _utc_now() -> datetime:
+    """返回 aware UTC 当前时间，匹配迁移后的 timestamptz 时间列。"""
+    return datetime.now(timezone.utc)
 
 
 async def compress_old_conversations():
@@ -41,10 +40,10 @@ async def compress_old_conversations():
     4. 插入压缩后的记录
     """
     pool = await get_pool()
-    cutoff = _utc_naive_now() - timedelta(days=COMPRESS_AFTER_DAYS)
+    cutoff = _utc_now() - timedelta(days=COMPRESS_AFTER_DAYS)
     logger.info(f"开始压缩 {cutoff.date()} 之前的对话记忆...")
 
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=5) as conn:
         # 获取需要压缩的对话列表（分组统计）
         # P1 修复：排除已压缩的摘要记录（role='system'）——否则摘要记录（created_at
         # 用 last_msg 旧时间，恒 < cutoff）下一轮被再次选中，msg_count=1 走单条删除
@@ -63,6 +62,7 @@ async def compress_old_conversations():
             return
 
         total_compressed = 0
+        next_pause_at = BATCH_SIZE * 5
         for row in rows:
             if row["msg_count"] < 2:
                 # 只有一条消息的直接删除（同样排除摘要记录，双保险）
@@ -76,9 +76,12 @@ async def compress_old_conversations():
 
             total_compressed += await _compress_one_conversation(conn, row, cutoff)
 
-            # 每批暂停一下，避免长时间锁表
-            if total_compressed % (BATCH_SIZE * 5) == 0:
+            # 每批暂停一下，避免长时间锁表。用下一暂停点比较而非取模：
+            # 单对话 msg_count 跨过 BATCH_SIZE*5 整数倍时取模恒不为 0，
+            # 节流会整轮失效（2026-09-15 审查 P2）
+            if total_compressed >= next_pause_at:
                 await asyncio.sleep(0.1)
+                next_pause_at += BATCH_SIZE * 5
 
         logger.info(f"对话压缩完成，共压缩 {total_compressed} 条消息，{len(rows)} 个对话")
 
@@ -147,8 +150,8 @@ async def clean_expired_profiles():
     - 删除 90 天未更新的画像
     """
     pool = await get_pool()
-    cutoff = _utc_naive_now() - timedelta(days=PROFILE_EXPIRE_DAYS)
-    async with pool.acquire() as conn:
+    cutoff = _utc_now() - timedelta(days=PROFILE_EXPIRE_DAYS)
+    async with pool.acquire(timeout=5) as conn:
         result = await conn.execute("""
             DELETE FROM user_profiles
             WHERE updated_at < $1
@@ -163,9 +166,9 @@ async def clean_stale_cache():
     - 删除 60 天未命中且创建超过 7 天的缓存
     """
     pool = await get_pool()
-    cutoff = _utc_naive_now() - timedelta(days=CACHE_CLEAN_DAYS)
-    async with pool.acquire() as conn:
-        hard_cutoff = _utc_naive_now() - timedelta(days=CACHE_HARD_MAX_DAYS)
+    cutoff = _utc_now() - timedelta(days=CACHE_CLEAN_DAYS)
+    async with pool.acquire(timeout=5) as conn:
+        hard_cutoff = _utc_now() - timedelta(days=CACHE_HARD_MAX_DAYS)
         result = await conn.execute("""
             DELETE FROM semantic_cache
             WHERE (created_at < $1 AND hit_count < 2) OR created_at < $2
@@ -174,26 +177,29 @@ async def clean_stale_cache():
         logger.info(f"清理低频语义缓存: {deleted} 条（硬过期阈值 {CACHE_HARD_MAX_DAYS} 天）")
 
 
-async def run_maintenance():
-    """执行全部维护任务"""
-    logger.info("开始数据库维护...")
+async def _run_maintenance_step(label: str, task) -> None:
+    """单步维护隔离：一个步骤失败不能阻断后续清理。"""
     try:
-        await compress_old_conversations()
-        await clean_expired_profiles()
-        await clean_stale_cache()
-        # 2026-09-05：补偿结算"钱包繁忙转待结算"的扣费单（见 payment/deferred.py），
-        # 独立 try/except 同上。（原 recover_stale_processing 调用已随死代码删除：
-        # 全仓无路径会把订单写成 processing，2026-09-07 审查）
-        try:
-            from ..payment.deferred import settle_pending_deductions
-            settled = await settle_pending_deductions()
-            if settled:
-                logger.info(f"待结算扣费单已补偿结算: {settled} 张")
-        except Exception as e:
-            logger.warning(f"待结算扣费补偿跳过（不影响其他维护）: {e}")
-        logger.info("数据库维护完成")
+        await task()
     except Exception as e:
-        logger.error(f"数据库维护失败: {e}", exc_info=True)
+        logger.error(f"数据库维护步骤失败: {label}: {e}", exc_info=True)
+
+
+async def run_maintenance():
+    """执行全部维护任务；每个步骤独立隔离，失败不阻断后续步骤。"""
+    logger.info("开始数据库维护...")
+    await _run_maintenance_step("对话压缩", compress_old_conversations)
+    await _run_maintenance_step("画像清理", clean_expired_profiles)
+    await _run_maintenance_step("缓存清理", clean_stale_cache)
+
+    async def _settle():
+        from ..payment.deferred import settle_pending_deductions
+        settled = await settle_pending_deductions()
+        if settled:
+            logger.info(f"待结算扣费单已补偿结算: {settled} 张")
+
+    await _run_maintenance_step("待结算补偿", _settle)
+    logger.info("数据库维护完成")
 
 
 async def maintenance_loop(interval_hours: int = 24):
@@ -206,19 +212,23 @@ async def maintenance_loop(interval_hours: int = 24):
     并发进入，后果只是重复压缩（幂等），不丢数据——升级路径是 token 续期锁。
     """
     while True:
-        redis = await get_redis()
-        token = uuid.uuid4().hex
-        if await redis.set("lock:db_maintenance", token, nx=True, ex=3600):
-            try:
-                await run_maintenance()
-            finally:
-                # 仅持有者可释放（Lua 比对 token），防误删他人锁
-                await redis.eval(
-                    "if redis.call('get', KEYS[1]) == ARGV[1] then "
-                    "return redis.call('del', KEYS[1]) else return 0 end",
-                    1, "lock:db_maintenance", token,
-                )
-        else:
-            logger.info("本轮维护由其他实例执行，跳过")
+        try:
+            redis = await get_redis()
+            token = uuid.uuid4().hex
+            if await redis.set("lock:db_maintenance", token, nx=True, ex=3600):
+                try:
+                    await run_maintenance()
+                finally:
+                    # 仅持有者可释放（Lua 比对 token），防误删他人锁
+                    await redis.eval(
+                        "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                        "return redis.call('del', KEYS[1]) else return 0 end",
+                        1, "lock:db_maintenance", token,
+                    )
+            else:
+                logger.info("本轮维护由其他实例执行，跳过")
+        except Exception as e:
+            # 单次 Redis/锁异常不能终止后台维护协程；下一周期继续尝试。
+            logger.warning(f"数据库维护循环异常（下轮重试）: {e}")
         logger.info(f"下次维护在 {interval_hours} 小时后")
         await asyncio.sleep(interval_hours * 3600)

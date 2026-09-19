@@ -12,5 +12,9 @@ try:
     from opentelemetry.sdk.resources import SERVICE_NAME, Resource
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     OTEL_AVAILABLE = True
-except Exception:
+except Exception as exc:
+    import logging
+    logging.getLogger(__name__).warning(
+        "OpenTelemetry 导入失败，追踪降级: %s", type(exc).__name__
+    )
     OTEL_AVAILABLE = False

@@ -42,7 +42,7 @@
         --border-color: #dfe5de;
         --text-primary: #242e27;
         --text-secondary: #54635a;
-        --text-muted: #86928a;
+        --text-muted: #5f6e66;
         --shadow-sm: 0 1px 2px rgba(36,46,39,0.04), 0 2px 8px rgba(36,46,39,0.03);
         --shadow-md: 0 4px 20px rgba(36,46,39,0.06);
         --shadow-lg: 0 12px 40px rgba(36,46,39,0.10);
@@ -83,7 +83,7 @@
         --border-color: rgba(255,255,255,0.4);
         --text-primary: #23233f;
         --text-secondary: #565672;
-        --text-muted: #8b8fa3;
+        --text-muted: #62677e;
         --shadow-sm: 0 4px 12px rgba(91,91,214,0.06);
         --shadow-md: 0 8px 32px rgba(91,91,214,0.08);
         --shadow-lg: 0 20px 60px rgba(91,91,214,0.10);
@@ -143,8 +143,7 @@
     }
     body[data-theme="glass"] .wallet-btn,
     body[data-theme="glass"] .logout-btn,
-    body[data-theme="glass"] .map-btn,
-    body[data-theme="glass"] .me-btn {
+    body[data-theme="glass"] .map-btn {
         backdrop-filter: blur(8px);
         -webkit-backdrop-filter: blur(8px);
     }
@@ -162,7 +161,7 @@
         --border-color: #334155;
         --text-primary: #f1f5f9;
         --text-secondary: #94a3b8;
-        --text-muted: #64748b;
+        --text-muted: #4b5768;
         --shadow-sm: 0 1px 3px rgba(0,0,0,0.3);
         --shadow-md: 0 4px 20px rgba(0,0,0,0.3);
         --shadow-lg: 0 10px 40px rgba(0,0,0,0.4);
@@ -331,7 +330,7 @@
         --border-color: #dfe5de;
         --text-primary: #242e27;
         --text-secondary: #54635a;
-        --text-muted: #86928a;
+        --text-muted: #5f6e66;
         --shadow-sm: 0 1px 2px rgba(36,46,39,0.04), 0 2px 8px rgba(36,46,39,0.03);
         --shadow-md: 0 4px 20px rgba(36,46,39,0.06);
         --radius-lg: 20px;
@@ -500,25 +499,6 @@
     }
     .map-btn:hover { background: var(--primary-light); border-color: var(--primary); color: var(--primary); }
 
-    /* ---------- 求职助手按钮 ---------- */
-    .me-btn {
-        background: var(--primary);
-        border: 1px solid var(--primary);
-        color: #fff;
-        padding: 6px 14px;
-        border-radius: 30px;
-        font-size: 13px;
-        cursor: pointer;
-        transition: var(--transition);
-        text-decoration: none;
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
-        white-space: nowrap;
-        font-weight: 500;
-    }
-    .me-btn:hover { background: var(--primary-dark); border-color: var(--primary-dark); transform: translateY(-1px); }
-
     /* ---------- 模式徽标（顶部居中） ---------- */
     .mode-badge {
         display: none;
@@ -540,34 +520,7 @@
     }
     .mode-badge.show { display: block; }
 
-    /* 求职模式下部分样式覆盖 */
-    .chat-area.me-mode .chat-header {
-        background: rgba(238, 242, 255, 0.85);
-    }
-    .chat-area.me-mode .chat-header .title {
-        color: #1e40af;
-    }
-    .chat-area.me-mode .input-wrapper input:focus,
-    .chat-area.me-mode .input-wrapper textarea:focus {
-        border-color: #2563eb;
-        box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.08);
-    }
-    .chat-area.me-mode .chat-input-area button {
-        background: #2563eb;
-    }
-    .chat-area.me-mode .chat-input-area button:hover:not(:disabled) {
-        background: #1d4ed8;
-    }
-    .chat-area.me-mode .sidebar {
-        background: #eef2ff;
-        border-right-color: #c7d2fe;
-    }
-    /* 求职模式下隐藏地图按钮（地图属于旅行功能） */
-    .chat-area.me-mode .map-btn {
-        display: none;
-    }
-
-    /* ---------- 求职欢迎卡片 ---------- */
+    /* ---------- 欢迎卡片（人格空会话面板共用） ---------- */
     .welcome-card {
         max-width: 560px;
         margin: 40px auto;
@@ -588,39 +541,6 @@
         font-size: 14px;
         color: var(--text-muted);
         margin-bottom: 20px;
-    }
-    .welcome-card .info-grid {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 8px;
-        text-align: left;
-        margin: 16px 0;
-        font-size: 14px;
-        background: var(--bg-chat);
-        border-radius: 8px;
-        padding: 16px;
-    }
-    .welcome-card .info-grid .label {
-        color: var(--text-muted);
-        font-weight: 500;
-    }
-    .welcome-card .info-grid .value {
-        color: var(--text-primary);
-    }
-    .welcome-card .tag-list {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 6px;
-        justify-content: center;
-        margin: 12px 0;
-    }
-    .welcome-card .tag {
-        background: #eef2ff;
-        color: #1d4ed8;
-        padding: 3px 12px;
-        border-radius: 20px;
-        font-size: 12px;
-        font-weight: 500;
     }
     .welcome-card .hint {
         font-size: 13px;

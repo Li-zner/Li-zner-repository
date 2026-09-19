@@ -90,6 +90,7 @@ class CdcWorker:
     def __init__(self):
         self.journal = CdcJournal(os.getenv("CDC_JOURNAL_DIR", "cdc_journal"))
         self.last_id = self.journal.last_id
+        self.last_txid = self.journal.last_txid
         self.running = False
         self._lock_ok = False
         self._lock_token: Optional[str] = None
@@ -97,6 +98,7 @@ class CdcWorker:
         self._last_checkpoint = 0.0
         self._last_cleanup = 0.0         # 事件清理计时（#15）
         self._last_partition_check = 0.0  # 分区维护计时（安全网删区）
+        self._renew_task: Optional[asyncio.Task] = None
 
     async def _try_lock(self, redis) -> Optional[str]:
         """NX + EX 获取 leader 锁，返回 token；失败返回 None（P1 #5 校验持有者）"""
@@ -113,19 +115,57 @@ class CdcWorker:
         ok = await redis.eval(lua, 1, LOCK_KEY, token, LOCK_TTL)
         return ok == 1
 
+    async def _renew_lock_loop(self, redis) -> None:
+        """独立续期循环：长批次清理/分区维护期间也不会让 leader 锁过期。"""
+        while self.running and self._lock_ok:
+            await asyncio.sleep(max(1.0, LOCK_TTL / 3))
+            if not self.running or not self._lock_ok:
+                return
+            try:
+                if await self._renew_lock(redis, self._lock_token):
+                    self._last_renew = time.time()
+                    continue
+            except Exception as exc:
+                logger.warning(f"CDC leader 锁续期异常: {exc}")
+            self._lock_ok = False
+            self._lock_token = None
+            logger.warning("CDC leader 锁续期失败，停止消费并重新竞选")
+            return
+
+    def _start_renew_loop(self, redis) -> None:
+        """启动或重启 leader 锁续期任务。"""
+        if self._renew_task is None or self._renew_task.done():
+            self._renew_task = asyncio.create_task(self._renew_lock_loop(redis))
+
+    async def _stop_renew_loop(self) -> None:
+        """停止续期任务，避免关停后残留后台协程。"""
+        if not self._renew_task:
+            return
+        self._renew_task.cancel()
+        try:
+            await self._renew_task
+        except asyncio.CancelledError:  # noqa: silent-except 豁免：正常取消续期任务
+            pass
+        self._renew_task = None
+
     async def _poll_once(self, pool) -> int:
         """拉取一批新事件并落盘，返回处理条数"""
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=5) as conn:
             rows = await conn.fetch(
-                "SELECT id, table_name, op_type, pk_value, row_before, row_after, created_at "
-                "FROM cdc_events WHERE id > $1 ORDER BY id LIMIT $2",
-                self.last_id, BATCH_SIZE,
+                "SELECT id, txid, table_name, op_type, pk_value, row_before, row_after, created_at "
+                "FROM cdc_events "
+                "WHERE (txid, id) > ($1, $2) "
+                "AND (txid = 0 OR txid < "
+                "txid_snapshot_xmin(txid_current_snapshot())::bigint) "
+                "ORDER BY txid, id LIMIT $3",
+                self.last_txid, self.last_id, BATCH_SIZE,
             )
         if not rows:
             return 0
         # At-least-once（#13）：先全部落盘，全部成功后再一次性推进 last_id（P0 #1）。
         # 若中途失败，last_id 停在上一批，重放已写部分会重复，但绝不丢事件；消费端按事件 id 去重。
         # 因此删除已处理事件（cleanup）只删 id <= last_id，安全。
+        events = []
         for r in rows:
             event = {
                 "id": r["id"],
@@ -136,8 +176,10 @@ class CdcWorker:
                 "after": parse_jsonb(r["row_after"]),
                 "ts": format_ts(r["created_at"]),
             }
-            await self.journal.append(event, r["id"])
+            events.append((event, r["id"], r["txid"] or 0))
+        await self.journal.append_batch(events)
         self.last_id = rows[-1]["id"]
+        self.last_txid = rows[-1]["txid"] or 0
         cdc_events_processed_total.inc(len(rows))
         return len(rows)
 
@@ -157,10 +199,11 @@ class CdcWorker:
     async def _update_lag(self, pool):
         """更新滞后指标：仅当存在待处理事件时计算（P1 #10 防无事件时虚假告警）"""
         try:
-            async with pool.acquire() as conn:
+            async with pool.acquire(timeout=5) as conn:
                 row = await conn.fetchrow(
                     "SELECT MAX(created_at) AS max_ts, COUNT(*) AS pending "
-                    "FROM cdc_events WHERE id > $1", self.last_id)
+                    "FROM cdc_events WHERE (txid, id) > ($1, $2)",
+                    self.last_txid, self.last_id)
             if row:
                 pending = row["pending"] or 0
                 if pending > 0 and row["max_ts"]:
@@ -184,16 +227,18 @@ class CdcWorker:
         if self.last_id <= 0:  # 尚未处理 → 无过期事件
             return
         try:
-            async with pool.acquire() as conn:
+            async with pool.acquire(timeout=5) as conn:
                 for _ in range(CLEANUP_MAX_BATCHES):
                     n = await conn.fetchval(
                         "WITH doomed AS ("
-                        " SELECT id FROM cdc_events WHERE id <= $1 ORDER BY id LIMIT $2"
+                        " SELECT id FROM cdc_events "
+                        "WHERE txid < $1 OR (txid = $1 AND id <= $2) "
+                        "ORDER BY txid, id LIMIT $3"
                         "), deleted AS ("
                         " DELETE FROM cdc_events USING doomed "
                         " WHERE cdc_events.id = doomed.id RETURNING 1"
                         ") SELECT count(*) FROM deleted",
-                        self.last_id, CLEANUP_BATCH_SIZE,
+                        self.last_txid, self.last_id, CLEANUP_BATCH_SIZE,
                     )
                     if not n:
                         break
@@ -209,7 +254,7 @@ class CdcWorker:
         未覆盖时间段的漏建分区，需人工介入）。
         """
         try:
-            async with pool.acquire() as conn:
+            async with pool.acquire(timeout=5) as conn:
                 # 1) 补建缺失分区（IF NOT EXISTS 幂等；父表未分区时这里报错并整体跳过）
                 for stmt in _ensure_partition_statements(datetime.now(timezone.utc)):
                     await conn.execute(stmt)
@@ -231,12 +276,22 @@ class CdcWorker:
                         continue
                     if not _is_stale_month_partition(name, now):
                         continue
-                    max_id = await conn.fetchval(f"SELECT COALESCE(MAX(id), 0) FROM {name}")
-                    if max_id > self.last_id:
-                        logger.info(f"分区 {name} 已过期但 max(id)={max_id} > 处理水位 {self.last_id}，跳过")
+                    # 2026-09-12 修复（外部复核 P0）：消费顺序是 (txid,id)，仅看
+                    # MAX(id) 会漏掉"低 id、高 txid"的未处理晚提交事件——DROP 前必须
+                    # 按完整游标确认分区内不存在未处理事件
+                    pending = await conn.fetchval(
+                        f"SELECT EXISTS(SELECT 1 FROM {name} "
+                        "WHERE (txid, id) > ($1, $2))",
+                        self.last_txid, self.last_id,
+                    )
+                    if pending:
+                        logger.info(
+                            f"分区 {name} 已过期但存在 (txid,id) > "
+                            f"({self.last_txid},{self.last_id}) 的未处理事件，跳过 DROP")
                         continue
                     await conn.execute(f"DROP TABLE {name}")
-                    logger.info(f"已 DROP 过期分区 {name}（max_id={max_id} <= 水位 {self.last_id}）")
+                    logger.info(f"已 DROP 过期分区 {name}（无未处理事件，游标 "
+                                f"({self.last_txid},{self.last_id}) 之前）")
         except Exception as e:
             logger.warning(f"分区维护失败（下轮重试）: {e}")
 
@@ -252,7 +307,7 @@ class CdcWorker:
             while self.running:
                 try:
                     _pool = await init_pool()
-                    async with _pool.acquire() as conn:
+                    async with _pool.acquire(timeout=5) as conn:
                         await ensure_schema(conn)
                     pool = _pool          # 仅 schema 校验成功才赋值，供 finally 判断
                     logger.info("CDC 事件表与触发器已确保")
@@ -270,20 +325,13 @@ class CdcWorker:
                         if token is not None:
                             self._lock_token = token
                             self._lock_ok = True
+                            self._start_renew_loop(redis)
                             logger.info("CDC worker 成为 leader")
                     if not self._lock_ok:
                         await asyncio.sleep(POLL_INTERVAL)  # 非 leader，稍后重试
                         continue
 
                     now = time.time()
-                    if now - self._last_renew > LOCK_TTL / 2:
-                        if not await self._renew_lock(redis, self._lock_token):
-                            # 锁已丢失（过期被其它实例接管）：立即停止消费退回竞选，防双写（P1 #43）
-                            logger.warning("CDC leader 锁续期失败（已被接管或过期），停止消费并重新竞选")
-                            self._lock_ok = False
-                            self._lock_token = None
-                            continue
-                        self._last_renew = now
 
                     try:
                         await self._poll_once(pool)
@@ -291,8 +339,13 @@ class CdcWorker:
                         cdc_errors_total.inc()
                         logger.warning(f"CDC 轮询失败: {e}")
 
+                    if not self._lock_ok:
+                        continue
+
                     if now - self._last_checkpoint >= CHECKPOINT_EVERY:
-                        await self.journal.save_checkpoint(self.last_id)
+                        await self.journal.save_checkpoint(self.last_id, self.last_txid)
+                        retention = int(os.getenv("CDC_JOURNAL_RETENTION_DAYS", "30"))
+                        self.journal.prune_old_files(retention)
                         self._last_checkpoint = now
                         await self._update_lag(pool)
 
@@ -310,20 +363,31 @@ class CdcWorker:
                     logger.warning(f"CDC worker 循环异常: {e}")
                 await asyncio.sleep(POLL_INTERVAL)
         finally:
+            await self._stop_renew_loop()
             # 退出前落盘 + 关闭句柄（P1 #6：防句柄泄漏）；schema 未就绪(pool=None)无写入，跳过 checkpoint
-            if pool is not None:
-                try:
-                    await self.journal.save_checkpoint(self.last_id)
-                except Exception as e:
-                    logger.warning(f"CDC checkpoint 保存失败: {e}")
+            if pool is not None and self._lock_ok:
+                await self._save_checkpoint_safe()
             self.journal.close()
             logger.info("CDC worker 已停止")
 
-    async def stop(self):
-        """优雅停止：落 checkpoint 并关闭文件句柄"""
-        self.running = False
+    async def _save_checkpoint_safe(self):
+        """落 checkpoint（异常仅告警不中断收尾）。
+
+        2026-09-11 规则审查 P1：必须同时落 txid 水位——journal 单调守卫按
+        (txid,id) 比较，只传 last_id 会使 last_txid 退化为 0 而恒被拒绝，
+        断点续传退化为全量重放。
+        """
         try:
-            await self.journal.save_checkpoint(self.last_id)
+            await self.journal.save_checkpoint(self.last_id, self.last_txid)
         except Exception as e:
             logger.warning(f"CDC checkpoint 保存失败: {e}")
+
+    async def stop(self):
+        """优雅停止：落 checkpoint 并关闭文件句柄（仅 leader 落盘，2026-09-12 修复）"""
+        self.running = False
+        if self._lock_ok:
+            try:
+                await self.journal.save_checkpoint(self.last_id, self.last_txid)
+            except Exception as e:
+                logger.warning(f"CDC checkpoint 保存失败: {e}")
         self.journal.close()

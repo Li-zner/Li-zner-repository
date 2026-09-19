@@ -12,7 +12,7 @@ TOOL_WEATHER = {
     "type": "function",
     "function": {
         "name": "query_weather",
-        "description": "查询指定城市的实时天气",
+        "description": "查询指定城市的实时天气和未来三天预报",
         "parameters": {
             "type": "object",
             "properties": {
@@ -90,26 +90,6 @@ TOOL_SEARCH_KNOWLEDGE = {
     }
 }
 
-
-# ============================================================
-# 项目知识库搜索工具（求职/项目介绍场景使用）
-# ============================================================
-
-TOOL_SEARCH_PROJECT_KNOWLEDGE = {
-    "type": "function",
-    "function": {
-        "name": "search_project_knowledge",
-        "description": "搜索项目知识库，查找关于支付系统、并发安全、技术架构等项目的详细信息。当访客问到支付体系、并发能力、技术栈等具体项目技术细节时调用此工具",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "搜索关键词或问题描述，如'支付系统架构'、'并发能力'、'异常处理'"}
-            },
-            "required": ["query"]
-        }
-    }
-}
-
 # ============================================================
 # 联网搜索工具
 # ============================================================
@@ -118,7 +98,7 @@ TOOL_WEB_SEARCH = {
     "type": "function",
     "function": {
         "name": "web_search",
-        "description": "联网搜索实时信息。当用户询问以下内容时必须调用此工具：\n- 餐厅/商家的营业时间、排队情况、联系电话\n- 近期食客评价、评分、推荐菜\n- 交通路线、预订方式、外卖信息\n- 当前热点、新闻、活动信息\n- 任何需要实时/最新数据的查询\n- 你的知识库中不确定的信息",
+        "description": "联网搜索实时信息。仅用于旅行场景的餐厅营业时间、排队情况、近期评价、交通预订、当前活动等实时数据，不得用于法律知识或不确定信息的补全。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -140,7 +120,6 @@ ALL_TOOLS = [
     TOOL_FOOD,
     TOOL_SEARCH_KNOWLEDGE,
     TOOL_WEB_SEARCH,
-    TOOL_SEARCH_PROJECT_KNOWLEDGE,
 ]
 
 TRAVEL_TOOLS = [TOOL_WEATHER, TOOL_HOTEL, TOOL_ROUTE, TOOL_FOOD]

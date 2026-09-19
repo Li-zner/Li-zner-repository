@@ -61,12 +61,6 @@ CREATE INDEX idx_kb_emb  ON knowledge_chunks USING ivfflat (embedding public.vec
 
 ## 踩坑提示
 
-- 知识库构建脚本的条号正则曾漏「千」「零」导致整编缺失——数据脚本必须全量幂等校验。
+- 知识库构建脚本的条号正则曾漏「千」「零」导致整编缺失——数据脚本必须全量幂等校验
+  （见 `mcp_assets/servers/civil-code-rag/import_civil_books.py` 修复版）。
 - 导入去重：按 chunk_key/md5 幂等，清理时「保留带 embedding 的，其次内容长的」。
-
-## 库内关联
-
-- 链路位置：[[AI应用资产/RAG构建|RAG 构建]]第 4 环「检索」的已验证实现（召回求全、精排留 Host）
-- 踩坑来源：[[skill/避坑检查清单/SKILL|避坑检查清单]] #28/#29（条号正则 / pg_trgm 中文短查询）
-- 验收：[[AI应用验收工具/README|AI 应用验收工具·阶段 4]]（真实查询 / 参数变体 / 边界守卫）
-- 图谱：[[图谱/MOC-RAG与知识工程|MOC-RAG 与知识工程]]、[[图谱/MOC-MCP生态|MOC-MCP 生态]]

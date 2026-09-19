@@ -1,7 +1,3 @@
-<!-- ============================================================
-  可复用资产：redis_lock_ratelimit_server.py | 来源：agent_gateway 生产机制 → MCP Server 封装（stdio）
-  实战验证：verify_all.py 五阶段验收可跑 | 依赖：mcp sdk + redis/pg（按 server） | 提取：2026-09-06
-  ============================================================ -->
 """
 MCP 资产 001 — Redis 分布式锁与限流 Server（stdio 传输）
 

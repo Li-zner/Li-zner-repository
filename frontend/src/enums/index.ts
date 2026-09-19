@@ -19,7 +19,6 @@ export enum StorageKey {
   MapHistory = 'map_history',
   MapFavorites = 'map_favorites',
   MapUserLocation = 'map_user_location',
-  AutoPrompt = 'travel_auto_prompt',
   Theme = 'gw_theme',
 }
 

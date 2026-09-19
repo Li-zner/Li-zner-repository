@@ -31,7 +31,6 @@ const TOOL_NAME_KEYS: Record<string, string> = {
   call_sub_agent: 'tool_sub_agent',
   web_search: 'tool_web_search',
   search_knowledge: 'tool_knowledge_search',
-  search_project_knowledge: 'tool_project_search',
 }
 
 export function toolDisplayName(code: string): string {
@@ -58,7 +57,6 @@ export function cleanReasoning(text: string): string {
     .replace(/call_sub_agent/g, t('tool_sub_agent'))
     .replace(/web_search/g, t('tool_web_search'))
     .replace(/search_knowledge/g, t('tool_knowledge_search'))
-    .replace(/search_project_knowledge/g, t('tool_project_search'))
     .replace(/"departure"\s*:\s*"[^"]*"/g, '')
     .replace(/"destination"\s*:\s*"[^"]*"/g, '')
     .replace(/"preference"\s*:\s*"[^"]*"/g, '')

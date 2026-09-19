@@ -17,8 +17,8 @@ import os
 _ENV_PATHS = [
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
     # 可按需追加你的权威源，例如 WSL 安全目录：
-    # r"\\wsl.localhost\Ubuntu\srv\secrets\.env",
-    # "/srv/secrets/.env",
+    # r"\\wsl.localhost\Ubuntu\etc\agent_gateway\.env",
+    # "/etc/agent_gateway/.env",
 ]
 
 _env = {}

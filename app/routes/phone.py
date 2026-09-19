@@ -30,6 +30,90 @@ router = APIRouter()
 # 1000 个号 = 5000 条/小时计费短信 + 短信轰炸；本键兜底单 IP 日总量
 SMS_IP_DAY_LIMIT = 20
 
+# 验证码校验 Lua：锁检查、错误计数和成功消费必须在同一脚本内完成，
+# 防止并发请求同时越过错误次数限制或重放同一验证码。
+_VERIFY_CODE_LUA = """
+local function secure_equal(left, right)
+    if string.len(left) ~= string.len(right) then return false end
+    local diff = 0
+    for i = 1, string.len(left) do
+        diff = bit.bor(diff, bit.bxor(string.byte(left, i), string.byte(right, i)))
+    end
+    return diff == 0
+end
+if redis.call('GET', KEYS[1]) then return 'locked' end
+local stored = redis.call('GET', KEYS[2])
+if not stored then return 'expired' end
+if not secure_equal(stored, ARGV[1]) then
+    local count = redis.call('INCR', KEYS[3])
+    if count == 1 then redis.call('EXPIRE', KEYS[3], tonumber(ARGV[3])) end
+    if count >= tonumber(ARGV[2]) then
+        redis.call('SET', KEYS[1], '1', 'EX', tonumber(ARGV[3]))
+        redis.call('DEL', KEYS[3])
+    end
+    return 'invalid'
+end
+redis.call('DEL', KEYS[3])
+redis.call('DEL', KEYS[2])
+return 'ok'
+"""
+
+# 改名迁移 Lua：日额度键、文件归属反向索引和文件元数据在单个脚本内完成迁移。
+# 旧键暂时保留，直到数据库事务确认成功后再清理，便于提交失败时可靠回滚。
+_MIGRATE_IDENTITY_LUA = """
+local src_user = ARGV[1]
+local dst_user = ARGV[2]
+local update_meta = ARGV[3] == '1'
+local function merge_counter(src_key, dst_key)
+    local src = redis.call('GET', src_key)
+    if not src then return end
+    local src_ttl = redis.call('TTL', src_key)
+    local dst = redis.call('GET', dst_key)
+    local src_num = tonumber(src)
+    local dst_num = tonumber(dst)
+    if not dst or not dst_num or (src_num and src_num > dst_num) then
+        if src_ttl > 0 then redis.call('SET', dst_key, src, 'EX', src_ttl)
+        else redis.call('SET', dst_key, src) end
+    elseif src_ttl > 0 and redis.call('TTL', dst_key) < 0 then
+        redis.call('EXPIRE', dst_key, src_ttl)
+    end
+end
+merge_counter(KEYS[1], KEYS[2])
+merge_counter(KEYS[3], KEYS[4])
+local fids = redis.call('SMEMBERS', KEYS[5])
+local migrated = 0
+for _, fid in ipairs(fids) do
+    redis.call('SADD', KEYS[6], fid)
+    local meta_key = 'file:' .. fid .. ':meta'
+    local raw = redis.call('GET', meta_key)
+    if raw then
+        local ok, meta = pcall(cjson.decode, raw)
+        if update_meta and ok and type(meta) == 'table' and meta['uploaded_by'] == src_user then
+            meta['uploaded_by'] = dst_user
+            local ttl = redis.call('TTL', meta_key)
+            local encoded = cjson.encode(meta)
+            if ttl > 0 then redis.call('SET', meta_key, encoded, 'EX', ttl)
+            else redis.call('SET', meta_key, encoded) end
+            migrated = migrated + 1
+        end
+    end
+end
+local set_ttl = redis.call('TTL', KEYS[5])
+if set_ttl > 0 then
+    local dst_ttl = redis.call('TTL', KEYS[6])
+    if dst_ttl < 0 or dst_ttl < set_ttl then redis.call('EXPIRE', KEYS[6], set_ttl) end
+end
+return migrated
+"""
+
+_MARK_IDENTITY_MIGRATION_LUA = """
+redis.call('SET', KEYS[1], 'src:' .. ARGV[2], 'EX', tonumber(ARGV[3]))
+redis.call('SET', KEYS[2], 'dst:' .. ARGV[1], 'EX', tonumber(ARGV[3]))
+return 1
+"""
+
+_USER_RENAME_INTENT_TTL_SECONDS = 24 * 3600
+
 
 class PhoneSendCodeRequest(BaseModel):
     """发送验证码请求"""
@@ -39,8 +123,8 @@ class PhoneSendCodeRequest(BaseModel):
 class PhoneRegisterRequest(BaseModel):
     """手机号注册请求"""
     phone: str = Field(..., pattern=r'^1\d{10}$')
-    code: str = Field(..., min_length=1)
-    password: str = ""
+    code: str = Field(..., min_length=1, max_length=12)
+    password: str = Field(default="", max_length=256)
     agree: bool = False
     display_name: str = ""
     email: str = ""
@@ -50,13 +134,13 @@ class PhoneRegisterRequest(BaseModel):
 class PhoneLoginRequest(BaseModel):
     """手机号验证码登录请求"""
     phone: str = Field(..., pattern=r'^1\d{10}$')
-    code: str = Field(..., min_length=1)
+    code: str = Field(..., min_length=1, max_length=12)
 
 
 class BindPhoneRequest(BaseModel):
     """绑定手机号请求"""
     phone: str = Field(..., pattern=r'^1\d{10}$')
-    code: str = Field(..., min_length=1)
+    code: str = Field(..., min_length=1, max_length=12)
 
 
 # ---------- 验证码防爆破（P0 #6：防短信轰炸 / 暴力枚举）----------
@@ -91,34 +175,27 @@ async def _check_sms_rate_ip(ip: str):
         raise HTTPException(429, "今日发送次数已达上限，请明日再试")
 
 
-async def _record_sms_attempt(phone: str, success: bool):
-    """记录验证码校验结果：失败累计，达到上限锁定；成功清零"""
-    r = await get_redis()
-    attempt_key = f"phone_code_attempts:{phone}"
-    if success:
-        await r.delete(attempt_key)
-        return
-    count = await r.incr(attempt_key)
-    if count == 1:
-        await r.expire(attempt_key, SMS_ATTEMPT_LOCK_SECONDS)
-    if count >= SMS_ATTEMPT_LIMIT:
-        await r.setex(f"phone_code_lock:{phone}", SMS_ATTEMPT_LOCK_SECONDS, "1")
-        await r.delete(attempt_key)
-
-
 async def _verify_phone_code(phone: str, code: str):
-    """校验验证码（含错误次数防爆破）；成功时删除验证码与错误计数"""
+    """原子校验验证码（含错误次数防爆破）；成功时消费验证码与错误计数"""
     r = await get_redis()
-    if await r.get(f"phone_code_lock:{phone}"):
+    status = await r.eval(
+        _VERIFY_CODE_LUA,
+        3,
+        f"phone_code_lock:{phone}",
+        f"phone_code:{phone}",
+        f"phone_code_attempts:{phone}",
+        str(code),
+        SMS_ATTEMPT_LIMIT,
+        SMS_ATTEMPT_LOCK_SECONDS,
+    )
+    if status == "locked":
         raise HTTPException(429, "验证码错误次数过多，已锁定 15 分钟")
-    stored = await r.get(f"phone_code:{phone}")
-    if not stored:
+    if status == "expired":
         raise HTTPException(400, "验证码已过期，请重新发送")
-    if stored != code:
-        await _record_sms_attempt(phone, False)
+    if status == "invalid":
         raise HTTPException(400, "验证码错误")
-    await _record_sms_attempt(phone, True)
-    await r.delete(f"phone_code:{phone}")
+    if status != "ok":
+        raise HTTPException(503, "验证码服务暂不可用，请稍后重试")
 
 
 @router.post("/api/phone/send-code")
@@ -129,9 +206,8 @@ async def send_phone_code(payload: PhoneSendCodeRequest, request: Request):
     await _check_sms_rate_ip(_client_ip(request))
     # 发送频率限制（P0 #6 防短信轰炸：1 分钟 1 次 / 1 小时 5 次）
     await _check_sms_rate(phone)
-    # 生成随机6位验证码
-    import random
-    code = str(random.randint(100000, 999999))
+    # 生成随机6位验证码（2026-09-12 清欠 P2：改 CSPRNG，与全文件 secrets 用法一致）
+    code = str(secrets.randbelow(900000) + 100000)
     # 存入 Redis（有效期走配置常量，P2 #10）
     r = await get_redis()
     await r.setex(f"phone_code:{phone}", SMS_CODE_EXPIRE_SECONDS, code)
@@ -142,11 +218,12 @@ async def send_phone_code(payload: PhoneSendCodeRequest, request: Request):
         # 日志脱敏（kefa 红线：日志禁明文手机号，2026-09-07 审查 P1）
         logger.info(f"验证码已发送: phone={_mask_phone(phone)}")
         return {"message": "验证码已发送", "phone": phone}
-    else:
-        # 短信发送失败 → 仅在日志记录发送失败，不泄露验证码
-        logger.warning(f"短信发送失败，降级到演示模式: phone={_mask_phone(phone)}")
-        logger.info(f"[演示] 验证码已发送至演示日志（不返回客户端）")
-        return {"message": "验证码已发送（演示模式）", "phone": phone}
+    # 发送失败（生产缺短信密钥 fail-closed / 上游故障）→ 明确 503，
+    # 不谎报"已发送"让用户干等永不到达的验证码（2026-09-10 审查 P2）；
+    # 同时清掉已写入的验证码，不在 Redis 留一枚用户收不到的有效码
+    await r.delete(f"phone_code:{phone}")
+    logger.warning(f"短信发送失败: phone={_mask_phone(phone)}")
+    raise HTTPException(503, "短信服务暂不可用，请稍后重试")
 
 
 @router.post("/api/phone/register")
@@ -164,6 +241,8 @@ async def phone_register(payload: PhoneRegisterRequest):
 
     if not agree:
         raise HTTPException(400, "请阅读并同意用户协议")
+    # 上次改名可能停在提交后的恢复窗口，先按数据库终态收敛 Redis 身份数据。
+    await _recover_identity_migration(phone)
     # 默认密码随机化（2026-09-07 审查 P1）：原硬编码 123456789 + 手机号可作账号
     # 密码直登 → 知道手机号即可无短信登录所有未改密账号。随机密码不可登录，
     # 用户走验证码登录；如需密码登录在「设置」自行设置。
@@ -177,7 +256,7 @@ async def phone_register(payload: PhoneRegisterRequest):
     await _verify_phone_code(phone, code)
     # 检查手机号是否已注册
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=5) as conn:
         existing = await conn.fetchrow("SELECT username FROM users WHERE phone=$1", phone)
         if existing:
             raise HTTPException(400, "该手机号已注册")
@@ -218,12 +297,14 @@ async def phone_login(payload: PhoneLoginRequest):
     """
     phone = payload.phone
     code = payload.code
+    # 手机号即改名后的用户名，登录前先收敛可能遗留的改名迁移。
+    await _recover_identity_migration(phone)
     # 校验验证码（含错误次数防爆破，P0 #6）
     await _verify_phone_code(phone, code)
     # 查找或自动创建用户（自动注册放事务内，P0 #12：INSERT 成功后仅签发 token 阶段失败会回滚）
     pool = await get_pool()
     is_new = False
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=5) as conn:
         user = await conn.fetchrow(
             "SELECT username, hashed_password, is_active FROM users WHERE phone=$1", phone)
         if user and not user["is_active"]:
@@ -263,34 +344,142 @@ async def phone_login(payload: PhoneLoginRequest):
     return {"access_token": token["access_token"], "refresh_token": token["refresh_token"], "token_type": "bearer", "username": username, "is_new": is_new, "default_password_hint": is_new}
 
 
-@router.post("/api/user/bind-phone")
-async def bind_phone(payload: BindPhoneRequest, current_user: dict = Depends(get_current_user)):
-    """绑定手机号到当前账号：验验证码 → 写入 phone 并解除 GitHub 试用额度限制（A24）
+async def _cascade_rename_user(conn, old_username: str, new_username: str):
+    """改名级联：user_id 引用表逐表迁移（无外键，同事务手动维护）。
 
-    用户名策略（用户定稿 2026-09-09）：绑定成功且目标用户名（手机号本身，无前缀）
-    未被占时，username 同步改绑并级联所有 user_id 引用表（无外键，同事务手动维护）；
-    目标用户名被占则仅绑定不改名。绑定后 GitHub 登录走 github_id 回访同一账号。
+    user_usage 以 username 为键（09-09 补：漏了它则改名后当日用量归零重计）。
     """
-    phone = payload.phone
-    code = payload.code
-    # 校验验证码（含错误次数防爆破，P0 #6）
-    await _verify_phone_code(phone, code)
-    username = current_user["username"]
-    new_username = phone
+    for table in ("conversation_memories", "invoices", "payment_orders",
+                  "transaction_logs", "user_profiles", "user_wallets",
+                  "message_ratings", "audit_logs", "payment_attempts"):
+        await conn.execute(
+            f"UPDATE {table} SET user_id = $1 WHERE user_id = $2",
+            new_username, old_username,
+        )
+    await conn.execute(
+        "UPDATE user_usage SET username = $1 WHERE username = $2",
+        new_username, old_username,
+    )
+
+
+def _identity_daily_keys(username: str) -> tuple[str, str]:
+    """构造用户当日请求数/Tokens 两个 Redis 键，供改名迁移复用。"""
+    from datetime import datetime, timezone as _tz
+    today = datetime.now(_tz.utc).strftime("%Y-%m-%d")
+    return f"daily_req:{username}:{today}", f"daily_token:{username}:{today}"
+
+
+async def _mark_identity_migration(old_username: str, new_username: str) -> None:
+    """原子写入双向迁移意图，任一路由可据用户名找到并恢复未完成迁移。"""
+    r = await get_redis()
+    await r.eval(
+        _MARK_IDENTITY_MIGRATION_LUA,
+        2,
+        f"user_rename_intent:{old_username}",
+        f"user_rename_intent:{new_username}",
+        old_username,
+        new_username,
+        _USER_RENAME_INTENT_TTL_SECONDS,
+    )
+
+
+async def _migrate_identity_data(old_username: str, new_username: str,
+                                 update_meta: bool = True) -> int:
+    """原子迁移日额度、文件归属索引和文件元数据，旧键保留到事务确认。"""
+    r = await get_redis()
+    old_req, old_token = _identity_daily_keys(old_username)
+    new_req, new_token = _identity_daily_keys(new_username)
+    migrated = await r.eval(
+        _MIGRATE_IDENTITY_LUA,
+        6,
+        old_req,
+        new_req,
+        old_token,
+        new_token,
+        f"file_owner:{old_username}",
+        f"file_owner:{new_username}",
+        old_username,
+        new_username,
+        "1" if update_meta else "0",
+    )
+    return int(migrated or 0)
+
+
+async def _cleanup_identity_migration(old_username: str, new_username: str) -> None:
+    """迁移确认后原子清理源键、反向索引和双向意图，避免旧身份继续生效。"""
+    r = await get_redis()
+    old_req, old_token = _identity_daily_keys(old_username)
+    await r.delete(
+        old_req,
+        old_token,
+        f"file_owner:{old_username}",
+        f"user_rename_intent:{old_username}",
+        f"user_rename_intent:{new_username}",
+    )
+
+
+async def _prepare_identity_migration(old_username: str, new_username: str) -> int:
+    """数据库提交前执行 Redis 迁移；脚本报错时保留意图，交给恢复流程裁决。"""
+    await _mark_identity_migration(old_username, new_username)
+    return await _migrate_identity_data(old_username, new_username, update_meta=False)
+
+
+async def _recover_identity_migration(username: str) -> None:
+    """按数据库最终用户名裁决未完成迁移：已改名则完成，未改名则回滚。"""
+    r = await get_redis()
+    intent = await r.get(f"user_rename_intent:{username}")
+    if not intent:
+        return
+    direction, _, other = str(intent).partition(":")
+    if not other or direction not in ("src", "dst"):
+        logger.error(f"用户名迁移意图损坏: user={username}")
+        raise HTTPException(503, "账号迁移状态异常，请稍后重试")
+    old_username, new_username = (
+        (username, other) if direction == "src" else (other, username)
+    )
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        # 该手机号不能已被其他账号绑定
-        occupied = await conn.fetchval(
-            "SELECT 1 FROM users WHERE phone = $1 AND username <> $2", phone, username
+    async with pool.acquire(timeout=5) as conn:
+        rows = await conn.fetch(
+            "SELECT username FROM users WHERE username = ANY($1::text[])",
+            [old_username, new_username],
         )
-        if occupied:
-            raise HTTPException(400, "该手机号已被其他账号绑定")
-        renamed = False
-        taken = await conn.fetchval(
-            "SELECT 1 FROM users WHERE username = $1 AND username <> $2",
-            new_username, username,
-        )
-        # 绑定 + 解除限制 + 改名级联同一事务：任一步失败整体回滚，防账号与数据引用撕裂
+    existing = {row["username"] for row in rows}
+    if new_username in existing and old_username not in existing:
+        await _migrate_identity_data(old_username, new_username)
+        await _cleanup_identity_migration(old_username, new_username)
+        logger.warning(f"已恢复数据库中已生效的改名迁移: {old_username} -> {new_username}")
+        return
+    if old_username in existing and new_username not in existing:
+        await _migrate_identity_data(new_username, old_username)
+        await _cleanup_identity_migration(new_username, old_username)
+        logger.warning(f"已回滚数据库中未生效的改名迁移: {new_username} -> {old_username}")
+        return
+    logger.error(f"用户名迁移状态不明确: old={old_username}, new={new_username}")
+    raise HTTPException(503, "账号迁移状态异常，请稍后重试")
+
+
+async def _finalize_identity_migration(old_username: str, new_username: str) -> int:
+    """数据库提交后再次合并迁移并清理旧键，覆盖提交窗口内的旧身份写入。"""
+    migrated = await _migrate_identity_data(old_username, new_username)
+    await _cleanup_identity_migration(old_username, new_username)
+    return migrated
+
+
+async def _apply_phone_binding(conn, phone: str, username: str,
+                               new_username: str) -> tuple[bool, bool]:
+    """在同一数据库事务中绑定手机号并准备 Redis 改名，返回改名与迁移状态。"""
+    occupied = await conn.fetchval(
+        "SELECT 1 FROM users WHERE phone = $1 AND username <> $2", phone, username
+    )
+    if occupied:
+        raise HTTPException(400, "该手机号已被其他账号绑定")
+    renamed = False
+    redis_prepared = False
+    taken = await conn.fetchval(
+        "SELECT 1 FROM users WHERE username = $1 AND username <> $2",
+        new_username, username,
+    )
+    try:
         async with conn.transaction():
             if taken:
                 result = await conn.execute(
@@ -306,21 +495,44 @@ async def bind_phone(payload: BindPhoneRequest, current_user: dict = Depends(get
                     new_username, phone, username,
                 )
                 if "UPDATE 1" in result and renamed:
-                    for table in ("conversation_memories", "invoices", "payment_orders",
-                                  "transaction_logs", "user_profiles", "user_wallets",
-                                  "message_ratings", "audit_logs"):
-                        await conn.execute(
-                            f"UPDATE {table} SET user_id = $1 WHERE user_id = $2",
-                            new_username, username,
-                        )
-                    # user_usage 以 username 为键（09-09 补：改名级联此前漏了它，
-                    # 改名后当日用量计数归零重计）
-                    await conn.execute(
-                        "UPDATE user_usage SET username = $1 WHERE username = $2",
-                        new_username, username,
-                    )
-        if "UPDATE 0" in result:
-            raise HTTPException(400, "该账号已绑定其他手机号")
+                    await _cascade_rename_user(conn, username, new_username)
+                    await _prepare_identity_migration(username, new_username)
+                    redis_prepared = True
+    except asyncpg.UniqueViolationError as exc:
+        # 唯一索引是并发绑定的最终防线；转成明确业务错误而不是 500。
+        raise HTTPException(400, "该手机号已被其他账号绑定") from exc
+    except Exception:
+        # 提交结果不确定时只保留 Redis 迁移状态和双向意图，不能在这里猜测
+        # 数据库是否已提交并删除意图；下一次登录/绑号按数据库终态收敛。
+        logger.exception(
+            f"改名事务异常，保留恢复意图: {username} -> {new_username}"
+        )
+        raise
+    if "UPDATE 0" in result:
+        raise HTTPException(400, "该账号已绑定其他手机号")
+    return renamed, redis_prepared
+
+
+@router.post("/api/user/bind-phone")
+async def bind_phone(payload: BindPhoneRequest, current_user: dict = Depends(get_current_user)):
+    """绑定手机号到当前账号：验验证码 → 写入 phone 并解除 GitHub 试用额度限制（A24）
+
+    用户名策略（用户定稿 2026-09-09）：绑定成功且目标用户名（手机号本身，无前缀）
+    未被占时，username 同步改绑并级联所有 user_id 引用表；
+    目标用户名被占则仅绑定不改名。绑定后 GitHub 登录走 github_id 回访同一账号。
+    """
+    phone = payload.phone
+    code = payload.code
+    username = current_user["username"]
+    await _recover_identity_migration(username)
+    # 校验验证码（含错误次数防爆破，P0 #6）
+    await _verify_phone_code(phone, code)
+    new_username = phone
+    pool = await get_pool()
+    async with pool.acquire(timeout=5) as conn:
+        renamed, redis_prepared = await _apply_phone_binding(
+            conn, phone, username, new_username
+        )
     # 改名后旧 JWT 的 sub 指向旧用户名，签发新 token 对；缓存键随用户名变化，新旧都失效
     final_username = new_username if renamed else username
     pair = create_token_pair(final_username)
@@ -328,6 +540,19 @@ async def bind_phone(payload: BindPhoneRequest, current_user: dict = Depends(get
     await invalidate_user_cache(username)
     if renamed:
         await invalidate_user_cache(new_username)
+        if redis_prepared:
+            try:
+                migrated = await _finalize_identity_migration(username, new_username)
+                if migrated:
+                    logger.info(f"已迁移文件归属 {migrated} 个: {username} -> {new_username}")
+            except Exception as exc:
+                # 不签发半迁移身份；意图仍在，用户可用手机号验证码登录触发恢复。
+                logger.exception(
+                    f"改名迁移收尾失败，等待后续自动恢复: {username} -> {new_username}"
+                )
+                raise HTTPException(
+                    503, "账号迁移收尾失败，请使用手机号验证码登录"
+                ) from exc
     # 验证码已由 _verify_phone_code 校验并删除
     from ..core.audit import audit
     await audit(final_username, "phone_bind", {"phone": phone})
@@ -355,8 +580,6 @@ async def sms_check_config(current_user: dict = Depends(get_current_user)):
     # 脱敏显示
     key_id = ALIBABA_CLOUD_ACCESS_KEY_ID
     key_id_masked = key_id[:4] + "****" + key_id[-4:] if len(key_id) > 8 else "未配置"
-    secret = ALIBABA_CLOUD_ACCESS_KEY_SECRET
-    secret_masked = secret[:2] + "****" + secret[-2:] if len(secret) > 4 else "未配置"
     return {
         "access_key_id": key_id_masked,
         "access_key_secret_configured": bool(ALIBABA_CLOUD_ACCESS_KEY_SECRET),

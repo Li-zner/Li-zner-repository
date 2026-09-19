@@ -13,30 +13,67 @@ from fastapi import HTTPException
 
 from ..models.schemas import CreateTaskRequest
 from ..core.task_manager import (
-    create_task, get_task, update_status, set_cancelled,
+    create_task, get_task, request_cancel, cancel_task_if_active,
     claim_idempotency, release_idempotency_claim, save_idempotent, read_accumulated_result,
+    CLAIM_IN_PROGRESS,
 )
 from ..agents.runner import run_agent_task
 from ..core.redis import get_redis
-from ..core.quota import is_quota_exhausted
+from ..core.quota import reserve_used_questions, rollback_used_questions, QuotaDependencyError
 from ..core.logging import setup_logging
 
 logger = setup_logging()
 
 # ---------- 后台任务并发上限（P1 #18：防恶意用户无限创建任务拖垮 LLM/DB）----------
+# 2026-09-14 审计 P1：进程内计数在 4 实例部署下全局上限失效（实例数 x 50），
+# 改 Redis 原子计数共享全局槽位；Redis 故障 fail-open（放行 + 告警，不阻断任务创建）
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "50"))
-_task_active_count = 0
-_task_count_lock = asyncio.Lock()
+_TASK_SLOT_KEY = "task:active_slots"
+MAX_CONCURRENT_TASKS_PER_USER = int(os.getenv("MAX_CONCURRENT_TASKS_PER_USER", "5"))
+_USER_TASK_SLOT_PREFIX = "task:active_slots:user:"
 
 
-async def _try_reserve_task_slot() -> bool:
-    """尝试预留一个后台任务并发槽位；已满返回 False（调用方返回 429）"""
-    global _task_active_count
-    async with _task_count_lock:
-        if _task_active_count >= MAX_CONCURRENT_TASKS:
+async def _try_reserve_task_slot() -> bool | None:
+    """尝试预留一个全局后台任务槽位（Redis INCR/DECR 原子计数）；已满返回 False"""
+    try:
+        r = await get_redis()
+        count = await r.incr(_TASK_SLOT_KEY)
+        if count > MAX_CONCURRENT_TASKS:
+            await r.decr(_TASK_SLOT_KEY)  # 原子回滚，不占槽
             return False
-        _task_active_count += 1
+        await r.expire(_TASK_SLOT_KEY, 86400)  # 全实例都停时可自愈清零
         return True
+    except Exception as e:
+        logger.warning(f"任务槽位 Redis 计数失败（fail-open 放行）: {e}")
+        return None
+
+
+async def _try_reserve_user_task_slot(username: str) -> bool | None:
+    """预留单用户任务槽，防一个账号占满全局后台任务并发。"""
+    key = f"{_USER_TASK_SLOT_PREFIX}{username}"
+    try:
+        r = await get_redis()
+        count = await r.incr(key)
+        if count > MAX_CONCURRENT_TASKS_PER_USER:
+            await r.decr(key)
+            return False
+        await r.expire(key, 86400)
+        return True
+    except Exception as e:
+        logger.warning(f"用户任务槽位 Redis 计数失败（fail-open 放行）: {e}")
+        return None
+
+
+async def _release_user_task_slot(username: str) -> None:
+    """回收单用户任务槽，防计数下溢。"""
+    key = f"{_USER_TASK_SLOT_PREFIX}{username}"
+    try:
+        r = await get_redis()
+        count = await r.decr(key)
+        if count < 0:
+            await r.set(key, 0)
+    except Exception as e:
+        logger.warning(f"用户任务槽位释放失败（TTL 自愈）: {e}")
 
 
 def _task_conversation_id(task: dict) -> str:
@@ -68,52 +105,68 @@ def ensure_task_access(task: dict, username: str, role: str) -> None:
         raise HTTPException(status_code=404, detail="task not found")
 
 
-async def _task_quota_gate(username: str, role: str) -> None:
+async def _task_quota_gate(username: str, role: str) -> bool:
     """任务端点按用户配额（2026-09-07 审查 P2）：任务路径原先只有全局 50 槽位、
     无任何按用户限额，登录用户可刷 LLM 配额。QPS + 日 req/token 三项与
     ensure_chat_allowed 同口径（UTC 日切）；并发槽位不适用后台任务（长生命周期
     占位会误伤正常排队），不纳入。
     """
-    from ..middleware.rate_limit import check_qps, get_daily_usage, update_daily_usage, _ROLE_LIMITS
-    from ..core.config import DAILY_REQUEST_LIMIT, DAILY_TOKEN_LIMIT
+    from ..middleware.rate_limit import (
+        check_qps, reserve_daily_request,
+    )
     if not await check_qps(username, role):
         raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    usage = await get_daily_usage(username, today)
-    limits = {"daily_req": DAILY_REQUEST_LIMIT, "daily_token": DAILY_TOKEN_LIMIT}
-    if role == "admin":
-        limits = _ROLE_LIMITS["admin"]
-    if usage["request_count"] >= limits["daily_req"]:
+    reserved = await reserve_daily_request(username, today, role)
+    if reserved == 1:
         raise HTTPException(status_code=429, detail="今日请求次数已达上限")
-    if usage["token_sum"] >= limits["daily_token"]:
+    if reserved == 2:
         raise HTTPException(status_code=429, detail="今日 Token 消耗已达上限")
-    # 任务本身计一次日请求（LLM 消耗由 record_token_usage 统一累计 token）
-    await update_daily_usage(username, today, inc_request=1, inc_token=0)
+    # Redis 降级时未写入计数，调用方不得在失败路径误减已有额。
+    return reserved == 0
 
 
 async def _release_task_slot() -> None:
-    """回收后台任务并发槽位（任务结束或启动失败时调用）"""
-    global _task_active_count
-    async with _task_count_lock:
-        _task_active_count = max(0, _task_active_count - 1)
+    """回收全局后台任务槽位（任务结束或启动失败时调用）"""
+    try:
+        r = await get_redis()
+        n = await r.decr(_TASK_SLOT_KEY)
+        if n < 0:
+            await r.set(_TASK_SLOT_KEY, 0)  # 防下溢：异常重建等场景兜回 0
+    except Exception as e:
+        logger.warning(f"任务槽位释放失败（TTL 自愈）: {e}")
 
 
 async def _launch_agent_task(**kwargs) -> None:
     """启动后台 Agent 任务，任务结束后自动释放并发槽位（防止计数泄漏）"""
+    run_kwargs = {
+        key: value for key, value in kwargs.items()
+        if not key.startswith("release_")
+    }
+
     async def _wrapped() -> None:
         """任务协程包装：无论成败都释放并发槽位，防计数泄漏"""
         try:
-            await run_agent_task(**kwargs)
+            await run_agent_task(**run_kwargs)
         finally:
-            await _release_task_slot()
-    try:
-        # spawn 持强引用：裸 create_task 的后台任务可被 GC 中途回收（2026-09-07 审查 P2）
-        from ..core.concurrency import spawn
-        spawn(_wrapped(), name=f"agent-task:{kwargs.get('task_id', '')}")
-    except Exception:
-        # 调度失败（事件循环关闭等极少数场景）：回收槽位避免泄漏
-        await _release_task_slot()
-        raise
+            if kwargs.get("release_global_slot"):
+                await _release_task_slot()
+            if kwargs.get("release_user_slot"):
+                await _release_user_task_slot(kwargs.get("username", ""))
+    # spawn 持强引用：裸 create_task 的后台任务可被 GC 中途回收（2026-09-07 审查 P2）
+    from ..core.concurrency import spawn
+    spawn(_wrapped(), name=f"agent-task:{kwargs.get('task_id', '')}")
+
+
+async def _persist_task_fields(task_id: str, persona_id: str,
+                               file_ids: list, lang: str) -> None:
+    """写入恢复任务所需的 persona/file/lang 字段。"""
+    r = await get_redis()
+    await r.hset(f"task:{task_id}", mapping={
+        "persona_id": persona_id or "",
+        "file_ids": json.dumps(file_ids or []),
+        "lang": lang or "",
+    })
 
 
 async def create_agent_task(req: CreateTaskRequest, current_user: dict) -> dict:
@@ -124,35 +177,46 @@ async def create_agent_task(req: CreateTaskRequest, current_user: dict) -> dict:
     """
     username = current_user["username"]
     role = current_user.get("role", "user")
-    # GitHub 试用额度防御：任务端点也走 LLM，受限用户同样拦截（admin 豁免）
-    if role != "admin" and is_quota_exhausted(current_user):
-        raise HTTPException(status_code=402, detail="免费额度已用完，请绑定手机号后继续使用")
-    # QPS + 日配额门禁（2026-09-07 审查 P2）
-    await _task_quota_gate(username, role)
-
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     # 幂等：同一 username+conversation + 相同消息 10秒内复用（P0 #5：键含 username 防跨用户串号；
-    # P1 #42：SET NX 原子占位替代 GET 后再创建的竞态窗口）
+    # P1 #42：SET NX 原子占位替代 GET 后再创建的竞态窗口）。
+    # 2026-09-14 审计 P1：占位等待超时返回 CLAIM_IN_PROGRESS——创建方仍在建或已崩溃，
+    # 此时并发再建第二个任务正是幂等占位要防的事，改拒绝（409）让 TTL 自愈后重试
     existing = await claim_idempotency(f"{username}:{req.conversation_id}", req.message)
+    if existing == CLAIM_IN_PROGRESS:
+        raise HTTPException(status_code=409, detail="相同请求正在创建中，请稍候重试")
     if existing:
         return {"task_id": existing, "idempotent": True}
 
-    # 后台任务并发上限（P1 #18：防恶意用户无限创建任务）
-    if not await _try_reserve_task_slot():
-        # 槽位已满：释放刚才的幂等占位，避免悬空 __creating__ 让后续请求多等 1s
-        await release_idempotency_claim(f"{username}:{req.conversation_id}", req.message)
-        raise HTTPException(status_code=429, detail="系统任务已满，请稍后再试")
-
+    slot_reserved = False
+    user_slot_reserved = False
+    quota_reserved = False
+    daily_reserved = False
     try:
+        # 先复用幂等结果再计配額，避免重复请求重复增加日请求数。
+        daily_reserved = await _task_quota_gate(username, role)
+        # 三态（2026-09-14 审计 P1）：额度耗尽 402；DB 故障 503（不再误报为额度用尽）
+        try:
+            _reserved = await reserve_used_questions(current_user)
+        except QuotaDependencyError:
+            raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后再试")
+        if not _reserved:
+            raise HTTPException(status_code=402, detail="免费额度已用完，请绑定手机号后继续使用")
+        quota_reserved = True
+        slot_state = await _try_reserve_task_slot()
+        if slot_state is False:
+            raise HTTPException(status_code=429, detail="系统任务已满，请稍后再试")
+        slot_reserved = slot_state is True
+        user_slot_state = await _try_reserve_user_task_slot(username)
+        if user_slot_state is False:
+            raise HTTPException(status_code=429, detail="当前账号任务过多，请稍后再试")
+        user_slot_reserved = user_slot_state is True
         task_id = await create_task(req.conversation_id, req.message, owner=username)
-        # 在 task 存储中保留恢复所需字段（persona_id / file_ids / lang），供 /resume 透传
-        # （P0 #6；lang 原先未持久化，resume 恒回中文，2026-09-07 审查 P2）
-        _r = await get_redis()
-        await _r.hset(f"task:{task_id}", mapping={
-            "persona_id": req.persona_id or "",
-            "file_ids": json.dumps(req.file_ids or []),
-            "lang": req.lang or "",
-        })
-        save_idempotent(f"{username}:{req.conversation_id}", req.message, task_id)
+        await _persist_task_fields(
+            task_id, req.persona_id, req.file_ids or [], req.lang)
+        await save_idempotent(
+            f"{username}:{req.conversation_id}", req.message, task_id,
+        )
 
         # 启动后台任务（任务结束自动释放并发槽位）
         await _launch_agent_task(
@@ -160,10 +224,23 @@ async def create_agent_task(req: CreateTaskRequest, current_user: dict) -> dict:
             user_query=req.message,
             persona_id=req.persona_id, file_ids=req.file_ids, lang=req.lang,
             user_perms=task_user_perms(current_user),
+            release_global_slot=slot_reserved,
+            release_user_slot=user_slot_reserved,
         )
+        slot_reserved = False
+        user_slot_reserved = False
     except Exception:
         await release_idempotency_claim(f"{username}:{req.conversation_id}", req.message)
-        await _release_task_slot()
+        if slot_reserved:
+            await _release_task_slot()
+        if quota_reserved:
+            # 仅在成功预留后归还，覆盖槽位满、建任务失败等所有未产出路径。
+            await rollback_used_questions(username)
+        if daily_reserved:
+            from ..middleware.rate_limit import rollback_daily_request
+            await rollback_daily_request(username, today)
+        if user_slot_reserved:
+            await _release_user_task_slot(username)
         raise
 
     return {"task_id": task_id, "idempotent": False}
@@ -204,15 +281,35 @@ async def cancel_agent_task(task_id: str, task: dict) -> dict:
     # timeout 也是终态（2026-09-07 审查 P2）：漏判会对已超时任务再置 cancelled
     if task["status"] in ("completed", "cancelled", "error", "timeout"):
         return {"status": task["status"], "message": "任务已终结，无需取消"}
-    set_cancelled(task_id)
     partial = await read_accumulated_result(task_id)
-    await update_status(task_id, "cancelled", partial)
+    if not await request_cancel(task_id):
+        # 2026-09-12 修复（外部复核 P1）：标记写失败时明确报错，
+        # 不让取消被当作成功而任务继续执行
+        raise HTTPException(status_code=503, detail="取消服务暂不可用，请稍后重试")
+    changed = await cancel_task_if_active(task_id, partial)
+    if not changed:
+        latest = await get_task(task_id) or {}
+        return {
+            "status": latest.get("status", "unknown"),
+            "message": "任务已终结，无需取消",
+        }
     return {"status": "cancelled", "message": "已取消"}
+
+
+async def _persist_resumed_task(task_id: str, task: dict) -> tuple:
+    """复制旧任务的 persona/file/lang 到新任务，返回启动参数。"""
+    persona_id = task.get("persona_id") or ""
+    file_ids_raw = task.get("file_ids") or ""
+    file_ids = json.loads(file_ids_raw) if file_ids_raw else []
+    lang = task.get("lang") or "zh"
+    await _persist_task_fields(task_id, persona_id, file_ids, lang)
+    return persona_id, file_ids, lang
 
 
 async def resume_agent_task(task_id: str, task: dict, username: str,
                             user_perms: list | tuple | None = (),
-                            role: str = "user") -> dict:
+                            role: str = "user",
+                            quota_user: dict | None = None) -> dict:
     """重新生成（创建新任务，丢弃旧草稿）；仅已取消的任务可恢复
 
     user_perms 默认仅公开（fail-closed，不可变 () 而非 []/None，理由见
@@ -222,36 +319,70 @@ async def resume_agent_task(task_id: str, task: dict, username: str,
     if task["status"] != "cancelled":
         return {"error": "只有已取消的任务才能恢复", "status": task["status"]}
 
-    # 恢复也是一次新 LLM 任务：试用额度与日配额复查（原 create 有、resume 漏）
-    await _task_quota_gate(username, role)
+    resume_scope = f"resume:{task_id}"
+    existing = await claim_idempotency(resume_scope, task["user_message"])
+    if existing == CLAIM_IN_PROGRESS:
+        # 与 create 同口径（2026-09-14 审计 P1）：占位超时拒绝而非并发再建
+        raise HTTPException(status_code=409, detail="相同请求正在创建中，请稍候重试")
+    if existing:
+        return {"task_id": existing, "idempotent": True, "previous_task_id": task_id}
 
-    # 后台任务并发上限（P1 #18）
-    if not await _try_reserve_task_slot():
-        raise HTTPException(status_code=429, detail="系统任务已满，请稍后再试")
-
+    slot_reserved = False
+    user_slot_reserved = False
+    quota_reserved = False
+    daily_reserved = False
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
+        # 恢复也是一次新 LLM 任务：试用额度与日配额复查（原 create 有、resume 漏）
+        daily_reserved = await _task_quota_gate(username, role)
+        quota_view = quota_user or {
+            "username": username, "role": role, "quota_limited": False,
+        }
+        # 三态（2026-09-14 审计 P1）：额度耗尽 402；DB 故障 503
+        try:
+            _reserved = await reserve_used_questions(quota_view)
+        except QuotaDependencyError:
+            raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后再试")
+        if not _reserved:
+            raise HTTPException(status_code=402, detail="免费额度已用完，请绑定手机号后继续使用")
+        quota_reserved = True
+        slot_state = await _try_reserve_task_slot()
+        if slot_state is False:
+            raise HTTPException(status_code=429, detail="系统任务已满，请稍后再试")
+        slot_reserved = slot_state is True
+        user_slot_state = await _try_reserve_user_task_slot(username)
+        if user_slot_state is False:
+            raise HTTPException(status_code=429, detail="当前账号任务过多，请稍后再试")
+        user_slot_reserved = user_slot_state is True
         new_task_id = await create_task(_task_conversation_id(task), task["user_message"],
                                         owner=username)
-        # 从原任务透传恢复字段（兼容旧任务未存字段的情况），并写入新任务 hash 供后续 resume 透传
-        persona_id = task.get("persona_id") or ""
-        file_ids_raw = task.get("file_ids") or ""
-        file_ids = json.loads(file_ids_raw) if file_ids_raw else []
-        lang = task.get("lang") or "zh"
-        _r = await get_redis()
-        await _r.hset(f"task:{new_task_id}", mapping={
-            "persona_id": persona_id,
-            "file_ids": json.dumps(file_ids),
-            "lang": lang,
-        })
+        persona_id, file_ids, lang = await _persist_resumed_task(new_task_id, task)
 
+        # 2026-09-12 清欠 P2：幂等落地必须先于 launch——launch 的 _wrapped 结束时会
+        # 释放槽位，若 save 抛异常再走 except 释放即同槽位双释放（超限放行）；
+        # 且先落幂等映射可让并发 resume 在新任务启动前就复用
+        await save_idempotent(resume_scope, task["user_message"], new_task_id)
         await _launch_agent_task(
             task_id=new_task_id, username=username, conversation_id=_task_conversation_id(task),
             user_query=task["user_message"],
             persona_id=persona_id, file_ids=file_ids, lang=lang,
             user_perms=user_perms,
+            release_global_slot=slot_reserved,
+            release_user_slot=user_slot_reserved,
         )
+        slot_reserved = False
+        user_slot_reserved = False
     except Exception:
-        await _release_task_slot()
+        await release_idempotency_claim(resume_scope, task["user_message"])
+        if slot_reserved:
+            await _release_task_slot()
+        if quota_reserved:
+            await rollback_used_questions(username)
+        if daily_reserved:
+            from ..middleware.rate_limit import rollback_daily_request
+            await rollback_daily_request(username, today)
+        if user_slot_reserved:
+            await _release_user_task_slot(username)
         raise
 
     return {"task_id": new_task_id, "previous_task_id": task_id}

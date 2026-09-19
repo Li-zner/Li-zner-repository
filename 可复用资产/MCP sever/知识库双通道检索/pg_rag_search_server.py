@@ -1,11 +1,7 @@
-<!-- ============================================================
-  可复用资产：pg_rag_search_server.py | 来源：agent_gateway 生产机制 → MCP Server 封装（stdio）
-  实战验证：verify_all.py 五阶段验收可跑 | 依赖：mcp sdk + redis/pg（按 server） | 提取：2026-09-06
-  ============================================================ -->
 """
 MCP 资产 002 — 知识库双通道检索 Server（stdio 传输）
 
-从 agent_gateway 民法典 RAG 实战泛化（对应 harness 踩坑清单 #28/#29）：
+从 agent_gateway 民法典 RAG（mcp_assets/civil-code-rag + 踩坑清单 #28/#29）泛化：
 对任意 PostgreSQL 知识表做「pg_trgm 关键词 + 向量语义」双通道召回，表结构可配置。
 
 召回逻辑（求全）：

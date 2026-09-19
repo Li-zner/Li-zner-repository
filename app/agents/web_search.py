@@ -4,46 +4,41 @@
 tools.py 保留 re-export，外部 import 路径不变。行为等价纯移动。
 """
 import asyncio
-import time
 
 import httpx
 
 from ..core.config import HTTP_TIMEOUT_MEDIUM
 from ..core.logging import setup_logging
+from ..core.redis import get_redis
 
 logger = setup_logging()
 
 
-# web_search 本地限流（P1 #13/#40：防高频调用导致外部搜索 API 封 IP）
-# 按 user_key 独立计数（P1：改全局限流为用户级，避免多用户并发互相误伤）。
-_search_rate_lock = asyncio.Lock()
-_search_rate_state: dict = {}   # user_key -> (window_start, count)
+# web_search 分布式限流（P1 #13/#40：防高频调用导致外部搜索 API 封 IP）
 _SEARCH_WINDOW_SECONDS = 10.0
 _SEARCH_MAX_PER_WINDOW = 10
-# 计数字典键数上限：超过即触发惰性清扫（防每用户一个键无界增长，P2 修复）
-_SEARCH_STATE_MAX_KEYS = 512
+_SEARCH_RATE_LUA = """
+local current = redis.call('INCR', KEYS[1])
+if current == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+if current > tonumber(ARGV[2]) then
+    return 0
+end
+return 1
+"""
 
 
 async def _check_search_rate(user_key: str = ""):
-    """web_search 本地限流：每 user_key 每 10 秒最多 10 次。
-
-    user_key 缺省为 ""（未透传用户时降到全局兜底），透传 username 后按用户隔离。
-    键数超阈值时惰性清扫已过窗口的旧计数（活跃用户的窗口未过期不受影响）。
-    """
+    """web_search 分布式限流：每 user_key 每 10 秒最多 10 次。"""
     key = user_key or "_global"
-    async with _search_rate_lock:
-        now = time.time()
-        if len(_search_rate_state) > _SEARCH_STATE_MAX_KEYS:
-            expired = [k for k, (ws, _c) in _search_rate_state.items()
-                       if now - ws > _SEARCH_WINDOW_SECONDS]
-            for k in expired:
-                del _search_rate_state[k]
-        window_start, count = _search_rate_state.get(key, (0.0, 0))
-        if now - window_start > _SEARCH_WINDOW_SECONDS:
-            window_start, count = now, 0
-        if count >= _SEARCH_MAX_PER_WINDOW:
-            raise RuntimeError("搜索过于频繁，请稍后再试")
-        _search_rate_state[key] = (window_start, count + 1)
+    redis = await get_redis()
+    allowed = await redis.eval(
+        _SEARCH_RATE_LUA, 1, f"search:rate:{key}",
+        int(_SEARCH_WINDOW_SECONDS), _SEARCH_MAX_PER_WINDOW,
+    )
+    if allowed != 1:
+        raise RuntimeError("搜索过于频繁，请稍后再试")
 
 
 async def web_search(query: str, max_results: int = 5, user_key: str = ""):
@@ -63,7 +58,9 @@ async def web_search(query: str, max_results: int = 5, user_key: str = ""):
         def _ddg_text() -> list:
             # 同步阻塞搜索放线程池，避免卡住事件循环
             with DDGS() as ddgs:
-                return ddgs.text(query, region='cn-zh', max_results=max_results) or []
+                # 显式超时（2026-09-10 审查 P2）：不依赖库默认值，与全局超时口径一致
+                return ddgs.text(query, region='cn-zh', max_results=max_results,
+                                 timeout=10) or []
 
         raw = await asyncio.to_thread(_ddg_text)
         results = [{

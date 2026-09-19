@@ -12,6 +12,15 @@ const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
 
+function loginTarget(): string {
+  const value = route.query.redirect
+  return typeof value === 'string'
+    && value.startsWith('/')
+    && !value.startsWith('//')
+    ? value
+    : '/chat'
+}
+
 const tab = ref<'password' | 'phone'>('password')
 const username = ref('')
 const password = ref('')
@@ -38,7 +47,7 @@ async function submit() {
   loading.value = true
   try {
     await auth.login(username.value, password.value)
-    router.push('/chat')
+    router.push(loginTarget())
   } catch (e) {
     error.value = e instanceof Error ? e.message : t('login_error_2')
   } finally {
@@ -63,9 +72,14 @@ async function handleSendCode() {
   }
 }
 
+const phoneLoginBusy = ref(false)
+
 async function handlePhoneLogin() {
   error.value = ''
   info.value = ''
+  // 2026-09-12 清欠（D-F13）：busy 防重——连点会重复兑换验证码/重复注册请求
+  if (phoneLoginBusy.value) return
+  phoneLoginBusy.value = true
   try {
     // 填了密码走注册（需勾选协议），否则纯验证码登录（自动注册）
     const result = phonePassword.value
@@ -74,34 +88,33 @@ async function handlePhoneLogin() {
     saveTokens(result)
     await auth.loadProfile()
     if (result.default_password_hint) window.alert(t('default_pwd_hint'))
-    router.push('/chat')
+    router.push(loginTarget())
   } catch (e) {
     error.value = e instanceof Error ? e.message : t('operation_failed')
+  } finally {
+    phoneLoginBusy.value = false
   }
-}
-
-function goGithub() {
-  window.location.href = '/auth/github'
 }
 
 // 离开页面时清掉倒计时 interval（否则僵尸定时器持有组件引用）
 onUnmounted(() => { if (timer) clearInterval(timer) })
 
-onMounted(() => {
-  // GitHub 回调落地。后端 302 形态是 /?token=..&refresh_token=..——query 在 hash 之前，
-  // hash 路由的 route.query 看不到它，必须直接读 document.location.search；
-  // quota_limited / error 同理。
+onMounted(async () => {
+  // GitHub 回调落地。授权码放 hash fragment，避免进入服务端访问日志；
+  // 兼容旧版普通 query 回调，升级完成后可删除 search 回退。
   const q = route.query
   const search = new URLSearchParams(window.location.search)
-  const token = (typeof q.token === 'string' && q.token) || search.get('token') || ''
-  const refresh =
-    (typeof q.refresh_token === 'string' && q.refresh_token) || search.get('refresh_token') || ''
-  if (token && refresh) {
-    auth.loginWithTokens(token, refresh)
-    saveTokens({ access_token: token, refresh_token: refresh, token_type: 'bearer' })
-    // 抹掉文档级 query：token 不留在地址栏与历史记录
+  const oauthCode =
+    (typeof q.oauth_code === 'string' && q.oauth_code) || search.get('oauth_code') || ''
+  if (oauthCode) {
+    // 授权码只能兑换一次，先清除地址栏，再进行原子兑换。
     window.history.replaceState(null, '', window.location.pathname)
-    router.replace('/chat')
+    try {
+      await auth.exchangeOAuthCode(oauthCode)
+      router.replace(loginTarget())
+    } catch {
+      error.value = t('oauth_exchange_failed')
+    }
     return
   }
   const err = (typeof q.error === 'string' && q.error) || search.get('error') || ''
@@ -181,16 +194,14 @@ onMounted(() => {
           <span>{{ t('agree_prefix') }}</span>
           <a href="/user-agreement.html" target="_blank">《用户协议》</a>
         </label>
-        <button type="button" class="btn-primary" @click="handlePhoneLogin">{{ t('phone_login_btn') }}</button>
+        <button :disabled="phoneLoginBusy" type="button" class="btn-primary" @click="handlePhoneLogin">{{ t('phone_login_btn') }}</button>
         <div v-if="error" class="error-msg">{{ error }}</div>
       </div>
 
       <!-- GitHub 登录 -->
       <div class="github-section">
         <p>{{ t('or_third_party') }}</p>
-        <a href="/auth/github">
-          <button type="button" @click="goGithub">{{ t('github_login') }}</button>
-        </a>
+        <a href="/auth/github" class="gh-link">{{ t('github_login') }}</a>
       </div>
     </div>
   </div>

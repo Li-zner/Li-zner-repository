@@ -17,6 +17,17 @@ logger = setup_logging()
 PERSONA_DIR = Path(__file__).parent.parent.parent / "prompts"
 
 
+def is_civil_persona(persona_id) -> bool:
+    """是否属于「民法典行为族」：civil_code 及其内部派生（如 civil_code_eval）。
+
+    评测人格必须与线上民法典人格走完全相同的检索强制、路由裁决、零召回
+    拒答等硬规则，否则评测结论不反映真实链路行为。所有原先硬编码
+    `persona_id == "civil_code"` 的行为守卫统一改判此函数。
+    注意：只用于行为判断，不用于展示名/知识库加载（那些走 get_effective）。
+    """
+    return (persona_id or "").startswith("civil_code")
+
+
 class Persona:
     """一个人格（角色）"""
 
@@ -120,8 +131,10 @@ class PersonaManager:
         return self.current
 
     def list_personas(self) -> list[dict]:
-        """列出所有人格"""
-        return [p.to_dict() for p in self._personas.values()]
+        """列出所有人格（内部评测人格除外：id 以 _eval 结尾，仅供评测脚本
+        显式指定，用于给监控流量打来源标记，不应出现在用户可选列表里）"""
+        return [p.to_dict() for p in self._personas.values()
+                if not p.id.endswith("_eval")]
 
     def get_persona(self, persona_id: str) -> Optional[Persona]:
         return self._personas.get(persona_id)

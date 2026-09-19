@@ -12,11 +12,18 @@ export interface SseEvent {
 
 export type SseLineSink = (event: SseEvent | null, rawLine: string) => void
 
-/** 处理一行 SSE：data: [JSON] → 事件；data: [DONE] → null 事件；其余行忽略 */
+/**
+ * [DONE] 终止哨兵（2026-09-12 外部复核 P1）：原先 [DONE] 与坏 JSON 同返 null
+ * 不可区分，调用方无法识别「流被截断未正常终结」。哨兵单例供 === 判定。
+ */
+export const SSE_DONE: SseEvent = Object.freeze({ type: '[DONE]' })
+
+/** 处理一行 SSE：data: [JSON] → 事件；data: [DONE] → SSE_DONE；其余行忽略 → null */
 export function parseSseLine(line: string): SseEvent | null {
   if (!line.startsWith('data:')) return null
   const payload = line.slice(5).trim()
-  if (!payload || payload === '[DONE]') return null
+  if (!payload) return null
+  if (payload === '[DONE]') return SSE_DONE
   try {
     return JSON.parse(payload) as SseEvent
   } catch {

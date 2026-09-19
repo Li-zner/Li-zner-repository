@@ -16,22 +16,25 @@ from fastapi import HTTPException
 from ..models.schemas import ChatRequest
 from ..core.config import (
     DEEPSEEK_MODEL, DEEPSEEK_FLASH_MODEL, SUMMARY_THRESHOLD,
-    DAILY_REQUEST_LIMIT, DAILY_TOKEN_LIMIT,
 )
 from ..core.logging import setup_logging
 from ..core.metrics import gateway_requests_total
 from ..core.memory_manager import MemoryManager
 from ..core.persona_manager import get_persona_manager
 from ..core.constants import today_cn
-from ..core.quota import is_quota_exhausted
+from ..core.quota import reserve_used_questions
 from ..core.semantic_cache import SemanticCache, safe_set
 from ..core.stream_utils import build_file_context
 from ..core.redis import get_redis
 from ..core.concurrency import spawn
-from ..middleware.rate_limit import check_qps, check_concurrent, get_daily_usage, release_concurrent
+from ..middleware.rate_limit import (
+    check_qps, check_concurrent, get_daily_usage, release_concurrent,
+    _get_limits,
+)
 from ..agents.memory import compress_message_history
 from ..agents.orchestrator import build_shared_context
 from .chat_support import lang_instruction, safe_format_prompt
+from .rag_request_trace import finish_request, record_span, set_request_identity
 
 logger = setup_logging()
 
@@ -71,9 +74,12 @@ class ChatStreamCtx:
     civil_route_match: Optional[str] = None
     rebuild_lock: Optional[str] = None
     rebuild_renew_task: Optional[asyncio.Task] = None
+    concurrent_renew_task: Optional[asyncio.Task] = None
     partial_answer: str = ""
     saved_normally: bool = False
     finished: bool = False
+    has_history: bool = False
+    concurrent_lease: str = ""
 
 
 async def ensure_chat_allowed(current_user: dict) -> str:
@@ -91,25 +97,34 @@ async def ensure_chat_allowed(current_user: dict) -> str:
     if not await check_qps(username, user_role):
         gateway_requests_total.labels(method='POST', endpoint='/v2/chat/stream', status='429').inc()
         raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
-    if not await check_concurrent(username, user_role):
+    lease = await check_concurrent(username, user_role)
+    if lease is None:
         gateway_requests_total.labels(method='POST', endpoint='/v2/chat/stream', status='429').inc()
         raise HTTPException(status_code=429, detail="并发请求过多，请稍后再试")
+    current_user["_concurrent_lease"] = lease
 
     usage = await get_daily_usage(username, today)
-    limits = {"daily_req": DAILY_REQUEST_LIMIT, "daily_token": DAILY_TOKEN_LIMIT}
-    if user_role == "admin":
-        from ..middleware.rate_limit import _ROLE_LIMITS
-        limits = _ROLE_LIMITS["admin"]
+    # 角色限额是唯一权威源，禁止 SSE/Task 两条路径各维护一份默认阈值。
+    limits = _get_limits(user_role)
     if usage["request_count"] >= limits["daily_req"]:
-        await release_concurrent(username)
+        await release_concurrent(username, lease)
         gateway_requests_total.labels(method='POST', endpoint='/v2/chat/stream', status='429').inc()
         raise HTTPException(status_code=429, detail="今日请求次数已达上限")
     if usage["token_sum"] >= limits["daily_token"]:
-        await release_concurrent(username)
+        await release_concurrent(username, lease)
         gateway_requests_total.labels(method='POST', endpoint='/v2/chat/stream', status='429').inc()
         raise HTTPException(status_code=429, detail="今日 Token 消耗已达上限")
-    if user_role != "admin" and is_quota_exhausted(current_user):
-        await release_concurrent(username)
+    # 三态（2026-09-14 审计 P1）：额度耗尽 402；DB 故障 503——不再把服务故障
+    # 误报成"免费额度已用尽"。fail-closed 语义不变，只是状态码如实区分。
+    from ..core.quota import QuotaDependencyError
+    try:
+        _reserved = await reserve_used_questions(current_user)
+    except QuotaDependencyError:
+        await release_concurrent(username, lease)
+        gateway_requests_total.labels(method='POST', endpoint='/v2/chat/stream', status='503').inc()
+        raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后再试")
+    if not _reserved:
+        await release_concurrent(username, lease)
         raise HTTPException(status_code=402, detail="免费额度已用完，请绑定手机号后继续使用")
     return today
 
@@ -151,19 +166,11 @@ async def _assemble_messages(req: ChatRequest, mm: MemoryManager, system_content
 
 
 def _rewrite_user_query(user_query: str, persona_id: str) -> str:
-    """民法典非民事领域提示（原附城市语境逻辑随"出发地"功能移除）"""
-    if persona_id == "civil_code":
-        hints = {
-            "七天无理由退货": "【提示：此问题受《消费者权益保护法》调整，不属于民法典。请引用《消费者权益保护法》回答，不要引用民法典。】",
-            "退货": "【提示：退货问题受《消费者权益保护法》调整，请考虑适用该法。】",
-            "假货": "【提示：假货问题受《消费者权益保护法》调整（假一赔三），请考虑适用该法。】",
-            "被公司辞退": "【提示：劳动纠纷受《劳动合同法》调整，不属于民法典。】",
-            "工伤": "【提示：工伤问题受《工伤保险条例》调整，不属于民法典。】",
-        }
-        for kw, hint in hints.items():
-            if kw in user_query:
-                user_query = hint + "\n" + user_query
-                break
+    """保留查询改写扩展点；民法典领域裁决由硬路由和法域映射统一处理。
+
+    旧实现会在用户问题前注入消保法、劳动法等提示词，诱导模型引用非民法典内容。
+    该逻辑已移除，避免模型绕开“只依据民法典回答”的产品契约。
+    """
     return user_query
 
 
@@ -184,8 +191,13 @@ async def build_stream_ctx(req: ChatRequest, current_user: dict, today: str) -> 
     except Exception as _pf_err:
         logger.warning(f"画像加载失败（按无画像处理）: {_pf_err}")
         user_profile = ""
+    # 人格/模型链先解析：缓存上下文需要带真实人格与所选模型维度（2026-09-19 审查 core P2-5）
+    persona, persona_id, selected_model, model_try_list, system_content = _build_system_prompt(req, today_str)
+    # 独立首轮问答允许跨会话复用；有历史时上层会跳过缓存，避免上下文串答。
     _cache_ctx = SemanticCache.build_cache_ctx(
-        getattr(req, "persona_id", "") or "", user_profile
+        username, persona_id, user_profile, "",
+        user_query=req.query, lang=getattr(req, "lang", "") or "",
+        model=selected_model,
     )
 
     ctx = ChatStreamCtx(
@@ -193,17 +205,25 @@ async def build_stream_ctx(req: ChatRequest, current_user: dict, today: str) -> 
         today=today, conv_id=conv_id, mm=mm, user_profile=user_profile,
         cache_ctx=_cache_ctx, lang_instr=lang_instr, current_user=current_user,
         today_str=today_str,
+        concurrent_lease=current_user.get("_concurrent_lease", ""),
     )
 
-    persona, persona_id, selected_model, model_try_list, system_content = _build_system_prompt(req, today_str)
     ctx.persona, ctx.persona_id = persona, persona_id
     ctx.selected_model, ctx.model_try_list = selected_model, model_try_list
+    set_request_identity(
+        persona=persona_id,
+        selected_model=selected_model,
+        provider="qwen" if selected_model.startswith("qwen") else "deepseek",
+    )
 
-    shared_context = build_shared_context(req.query, user_profile or "")
+    shared_context = build_shared_context(user_profile or "")
     system_content += f"\n{shared_context}"
     system_content += lang_instr
 
     ctx.messages = await _assemble_messages(req, mm, system_content, username)
+    ctx.has_history = any(
+        msg.get("role") in ("user", "assistant") for msg in ctx.messages
+    )
     ctx.user_query = _rewrite_user_query(req.query, persona_id)
     return ctx
 
@@ -211,17 +231,44 @@ async def build_stream_ctx(req: ChatRequest, current_user: dict, today: str) -> 
 async def finalize_answer(ctx: ChatStreamCtx, answer: str, write_cache: bool = True) -> None:
     """保存对话并累计用量（generate 内多处 finalize 尾的统一封装）
 
-    行为等价：save_messages + 可选写语义缓存 + update_daily_usage + inc_used_questions。
+    行为等价：save_messages + 可选写语义缓存 + update_daily_usage。
     write_cache=False 用于 max_steps 截断的不完整回答（Bug #2：残缺答案禁止入缓存）。
+
+    2026-09-14 逐行审查加固：全部 10 个调用点都在回答内容（含 answer_complete/[DONE]）
+    送达之后才调本函数——台账收口失败（Redis/PG 抖动）绝不能让上层再降级出第二段
+    回答（C-F11 缺陷族的单点根治）。故整体 try/except：失败记 warning，不影响用户。
     """
     from ..middleware.rate_limit import update_daily_usage
-    from ..core.quota import inc_used_questions
-    await ctx.mm.save_messages(
-        {"role": "user", "content": ctx.req.query},
-        {"role": "assistant", "content": answer},
-    )
-    if write_cache:
-        # safe_set 兜底：后台任务异常不能无人认领（与 runner/router 同一封装）
-        spawn(safe_set(ctx.req.query, answer, cache_ctx=ctx.cache_ctx), name="semantic-cache-set")
-    await update_daily_usage(ctx.username, ctx.today, inc_request=1, inc_token=0)
-    spawn(inc_used_questions(ctx.username), name="inc-used-questions")
+    try:
+        # 答案侧监测采集（2026-09-13 MVP）：所有 finalize 路径（生成/缓存/法条拦截）
+        # 都过此处，是「输入→检索→输出」链输出侧的唯一收口。失败静默不影响主流程。
+        try:
+            from .answer_trace import record_answer
+            record_answer(ctx.user_query or ctx.req.query, answer, ctx.username,
+                          persona=ctx.persona_id or "civil_code")
+        except Exception as e:  # 监测采集绝不影响回答主流程，但留痕可查
+            import logging
+            logging.getLogger(__name__).debug(
+                f"答案 trace 采集失败（不影响主流程）: {type(e).__name__}: {e}")
+        try:
+            record_span(
+                "answer",
+                result_count=len(answer or ""),
+                attributes={"answer_len": len(answer or "")},
+            )
+            finish_request(status="success")
+        except Exception as e:
+            logger.debug(f"请求级 trace 收尾失败（不影响主流程）: {type(e).__name__}: {e}")
+        await ctx.mm.save_messages(
+            {"role": "user", "content": ctx.req.query},
+            {"role": "assistant", "content": answer},
+        )
+        if write_cache and not ctx.has_history:
+            # safe_set 兜底：后台任务异常不能无人认领（与 runner/router 同一封装）
+            spawn(safe_set(ctx.req.query, answer, cache_ctx=ctx.cache_ctx), name="semantic-cache-set")
+        await update_daily_usage(ctx.username, ctx.today, inc_request=1, inc_token=0)
+    except Exception as fin_err:
+        # 台账失败只告警：此刻回答已送达前端，重抛会触发上层降级出重复回答
+        logger.warning(
+            f"finalize 台账收口失败（回答已送达，历史/用量可能缺失）: "
+            f"{type(fin_err).__name__}: {fin_err}")

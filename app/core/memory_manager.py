@@ -1,6 +1,7 @@
 import json
 import os
 import asyncio
+import uuid
 from typing import List, Dict
 from ..core.redis import get_redis
 from ..core.db import get_pool
@@ -11,12 +12,48 @@ from ..agents.memory import generate_summary
 
 logger = setup_logging()
 
+# 滚动摘要按会话串行（2026-09-10 审查 P2）：并发压缩各自基于同一旧摘要生成，
+# 后写者覆盖前者溢出内容（原文在 PG，仅摘要完整性受损）。进程内按 conv 键加锁；
+# ponytail: 多实例间仍是 last-writer-wins，彻底解决需 Redis 分布式锁——
+# 当前单进程内是最小正确修法。锁带引用计数（2026-09-14 审计 P2）：最后一位
+# 使用者退出即从字典移除，防锁字典随会话数无界增长（原实现每会话永留一把锁）。
+class _KeyedLock:
+    """按会话键的锁 + 在用计数：refs>0 期间不被回收，保证等待者持同一把锁"""
+
+    __slots__ = ("lock", "refs")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.refs = 0
+
+
+_summary_locks: dict = {}
+
+
+def _get_summary_lock(key: str) -> _KeyedLock:
+    kl = _summary_locks.get(key)
+    if kl is None:
+        kl = _KeyedLock()
+        _summary_locks[key] = kl
+    kl.refs += 1  # 取锁与计数同协程同步执行（无 await），事件循环内原子
+    return kl
+
+
+def _release_summary_lock(key: str, kl: _KeyedLock) -> None:
+    kl.refs -= 1
+    if kl.refs <= 0 and _summary_locks.get(key) is kl:
+        _summary_locks.pop(key, None)
+
 # ============================================================
 # 限流队列：控制 PG 写入并发，防止连接池耗尽
-# 连接池 max=50，并发写放大到 12（原 5 太低，拖慢落库）
 # ============================================================
-# 最多 12 个并发 PG 写入；与连接池上限联动（P1 #42：防连接池耗尽）
-_PG_WRITE_SEMAPHORE = asyncio.Semaphore(max(1, min(12, int(os.getenv("DB_POOL_MAX_SIZE", "50")) // 4)))
+# 上限 12，并按连接池规模联动取值（P1 #42：防连接池耗尽）。注意默认口径：
+# db.py 的 DB_POOL_MAX_SIZE 默认 10（部署配置从未显式设置），故默认并发写为
+# 10 // 4 = 2 而非 12；要拿到 12 需同时把 DB_POOL_MAX_SIZE 调到 48 以上，
+# 调大是否有益需按实测落库延迟决定（2026-09-19 审查 core P2-3）。
+_PG_WRITE_SEMAPHORE = asyncio.Semaphore(
+    max(1, min(12, int(os.getenv("DB_POOL_MAX_SIZE", "10")) // 4))
+)
 
 
 class MemoryManager:
@@ -85,7 +122,7 @@ return 1
 
     async def _fetch_from_pg(self, limit: int, offset: int = 0) -> List[Dict]:
         pool = await get_pool()
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=5) as conn:
             rows = await conn.fetch(
                 "SELECT role, content FROM conversation_memories "
                 "WHERE user_id = $1 AND conversation_id = $2 "
@@ -125,63 +162,137 @@ return 1
         spawn(self._save_to_pg(user_msg, assistant_msg), name=f"save_pg:{self.conv_id}")
 
     # ---------- 条数限制 + 滚动压缩摘要 ----------
-    # 原子裁剪：LLEN/LRANGE/LTRIM 三步合一。拆开执行时并发 append 会挤动下标，
-    # 一条消息可能既被 LTRIM 裁掉又没进 overflow 列表（热缓存丢消息，P2 修复）
-    _TRIM_LUA = """
-local llen = redis.call('LLEN', KEYS[1])
-local keep = tonumber(ARGV[1])
-if llen <= keep then return nil end
-local overflow = redis.call('LRANGE', KEYS[1], 0, llen - keep - 1)
-redis.call('LTRIM', KEYS[1], -keep, -1)
-return overflow
+    # 摘要成功前不裁剪热历史。Lua 先比对列表头仍是同一批 overflow，
+    # 再原子 LTRIM；并发 append 只会追加尾部，不会造成错裁。
+    _TRIM_VERIFIED_LUA = """
+local count = #ARGV
+if count == 0 then return 0 end
+local current = redis.call('LRANGE', KEYS[1], 0, count - 1)
+if #current ~= count then return 0 end
+for i = 1, count do
+    if current[i] ~= ARGV[i] then return 0 end
+end
+redis.call('LTRIM', KEYS[1], count, -1)
+return 1
 """
 
     async def _trim_and_compress(self, redis):
-        """保留最近 HISTORY_LIMIT 条；溢出的旧消息异步压缩为滚动摘要"""
+        """保留最近 HISTORY_LIMIT 条；摘要成功后才裁剪旧消息。"""
         try:
-            overflow = await redis.eval(self._TRIM_LUA, 1, self._history_key, HISTORY_LIMIT)
+            total = await redis.llen(self._history_key)
+            if total <= HISTORY_LIMIT:
+                return
+            overflow = await redis.lrange(
+                self._history_key, 0, total - HISTORY_LIMIT - 1
+            )
             if overflow:
-                spawn(self._compress_overflow(overflow), name=f"compress:{self.conv_id}")
+                spawn(
+                    self._compress_and_trim(overflow),
+                    name=f"compress:{self.conv_id}",
+                )
         except Exception as e:
             logger.warning(f"对话历史条数裁剪失败: {e}")
 
-    async def _compress_overflow(self, overflow_msgs):
-        """滚动摘要：旧摘要 + 本次溢出 → LLM 重新生成摘要（失败不阻塞主流程）"""
+    async def _compress_and_trim(self, overflow_msgs: list) -> None:
+        """生成摘要成功后，按原 overflow 前缀条件裁剪热历史。"""
+        compressed = await self._compress_overflow(overflow_msgs)
+        if not compressed:
+            return
+        redis = await get_redis()
+        await redis.eval(
+            self._TRIM_VERIFIED_LUA,
+            1, self._history_key, *overflow_msgs,
+        )
+
+    async def _compress_overflow(self, overflow_msgs) -> bool:
+        """滚动摘要：旧摘要 + 本次溢出 → LLM 重新生成摘要（失败不阻塞主流程）。
+
+        按会话加锁串行：并发压缩各自基于同一旧摘要生成会互相覆盖（后写者丢前者的
+        溢出内容）；排队等锁后重读最新摘要再合并，两批溢出都不丢。
+        """
+        lock = _get_summary_lock(self._summary_key)
+        acquired = False
         try:
-            redis = await get_redis()
-            old = await redis.get(self._summary_key)
-            old_text = old.decode() if isinstance(old, bytes) else (old or "")
-            combined = []
-            if old_text and old_text.strip():
-                combined.append({"role": "system", "content": f"此前摘要：{old_text}"})
-            combined.extend(json.loads(m) for m in overflow_msgs)
-            new_summary = await generate_summary(combined, username=self.user_id)
-            if new_summary and new_summary.strip():
-                await redis.set(self._summary_key, new_summary, ex=HISTORY_SUMMARY_TTL)
-        except Exception as e:
-            logger.warning(f"生成滚动摘要失败（不影响主流程）: {e}")
+            await lock.lock.acquire()
+            acquired = True
+            try:
+                redis = await get_redis()
+                old = await redis.get(self._summary_key)
+                old_text = old.decode() if isinstance(old, bytes) else (old or "")
+                combined = []
+                if old_text and old_text.strip():
+                    combined.append({"role": "system", "content": f"此前摘要：{old_text}"})
+                combined.extend(json.loads(m) for m in overflow_msgs)
+                new_summary = await generate_summary(combined, username=self.user_id)
+                if new_summary and new_summary.strip():
+                    await redis.set(self._summary_key, new_summary, ex=HISTORY_SUMMARY_TTL)
+                    return True
+                return False
+            except Exception as e:
+                logger.warning(f"生成滚动摘要失败（不影响主流程）: {e}")
+                return False
+        finally:
+            if acquired:
+                lock.lock.release()
+            # 等待锁期间被取消也必须归还引用计数，避免锁字典永久泄漏。
+            _release_summary_lock(self._summary_key, lock)
 
     async def _save_to_pg(self, user_msg: Dict, assistant_msg: Dict):
-        """异步写入 PostgreSQL（带限流与错误处理）"""
-        async with _PG_WRITE_SEMAPHORE:  # 限流：最多5个并发写入
+        """异步写入 PostgreSQL（带限流与错误处理）。
+
+        2026-09-14 审计 P1：PG 写失败原先只记日志——Redis 热缓存 TTL 到期后该轮
+        长期记忆永久丢失。补有限重试（共 3 次，1s/2s 退避），覆盖连接池抖动/
+        瞬时断连等瞬态故障；重试在本 spawn 任务内 sleep，不阻塞回答主流程。
+        ponytail: 仍非持久 outbox——进程在 3 次重试窗口内崩溃仍会丢，彻底解决
+        需落盘 outbox + 独立投递循环（登记待专项）。
+        """
+        async with _PG_WRITE_SEMAPHORE:  # 限流：最多 12 个并发写入（见定义处，P1 #42）
             pool = await get_pool()
-            try:
-                async with pool.acquire() as conn:
-                    async with conn.transaction():
-                        await conn.execute(
-                            "INSERT INTO conversation_memories "
-                            "(user_id, conversation_id, role, content) VALUES ($1, $2, $3, $4)",
-                            self.user_id, self.conv_id, "user", user_msg["content"]
-                        )
-                        await conn.execute(
-                            "INSERT INTO conversation_memories "
-                            "(user_id, conversation_id, role, content) VALUES ($1, $2, $3, $4)",
-                            self.user_id, self.conv_id, "assistant", assistant_msg["content"]
-                        )
-                    # 画像更新必须在事务之外执行（P0 #41）：画像失败不会回滚已提交的对话记忆
-                    await self._update_profile_async(conn, user_msg["content"], assistant_msg["content"])
-            except Exception as e:
-                logger.warning(f"PG 写入失败（不影响主流程）: {e}")
+            last_err = None
+            committed = False
+            user_uid = uuid.uuid4().hex
+            assistant_uid = uuid.uuid4().hex
+            for attempt in range(3):
+                try:
+                    async with pool.acquire(timeout=5) as conn:
+                        async with conn.transaction():
+                            await conn.execute(
+                                "INSERT INTO conversation_memories "
+                                "(user_id, conversation_id, role, content, message_uid) "
+                                "VALUES ($1, $2, $3, $4, $5) "
+                                # 唯一索引是部分的（WHERE message_uid IS NOT NULL），
+                                # 冲突子句必须带上同一谓词，否则 PG 推断不到索引 → 42P10
+                                "ON CONFLICT (message_uid) "
+                                "WHERE message_uid IS NOT NULL DO NOTHING",
+                                self.user_id, self.conv_id, "user",
+                                user_msg["content"], user_uid,
+                            )
+                            await conn.execute(
+                                "INSERT INTO conversation_memories "
+                                "(user_id, conversation_id, role, content, message_uid) "
+                                "VALUES ($1, $2, $3, $4, $5) "
+                                "ON CONFLICT (message_uid) "
+                                "WHERE message_uid IS NOT NULL DO NOTHING",
+                                self.user_id, self.conv_id, "assistant",
+                                assistant_msg["content"], assistant_uid,
+                            )
+                    committed = True
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt < 2:
+                        await asyncio.sleep(1 * (attempt + 1))  # 退避 1s / 2s
+            if not committed:
+                logger.warning(f"PG 写入失败（重试 3 次后放弃，本轮长期记忆可能丢失）: {last_err}")
+                return
+            # 画像更新独立于记忆写入重试：画像失败不得触发整批消息再次 INSERT。
+            async with pool.acquire(timeout=5) as conn:
+                try:
+                    await self._update_profile_async(
+                        conn, user_msg["content"], assistant_msg["content"]
+                    )
+                except Exception as e:
+                    logger.warning(f"用户画像更新失败（对话记忆已保存）: {e}")
 
     # ---------- L3：用户画像更新 ----------
     # （save_user_location 已随"出发地"手动输入功能一并移除；画像城市仍由
@@ -219,14 +330,27 @@ return overflow
             await conn.execute(
                 "INSERT INTO user_profiles (user_id, profile) VALUES ($1, $2) "
                 "ON CONFLICT (user_id) DO UPDATE "
-                "SET profile = user_profiles.profile || $2, updated_at = NOW()",
+                "SET profile = user_profiles.profile || $2::jsonb, updated_at = NOW()",
                 self.user_id, json.dumps(new_profile)
             )
+
+    @staticmethod
+    def _profile_to_dict(profile_data) -> dict:
+        """把 asyncpg 返回的 JSONB 文本或 dict 统一解析为字典。"""
+        if isinstance(profile_data, dict):
+            return profile_data
+        if isinstance(profile_data, str):
+            try:
+                parsed = json.loads(profile_data)
+            except (TypeError, ValueError):
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
 
     # ---------- 获取画像（按需读取）----------
     async def get_profile(self) -> str:
         pool = await get_pool()
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=5) as conn:
             row = await conn.fetchrow(
                 "SELECT profile, updated_at FROM user_profiles WHERE user_id = $1",
                 self.user_id
@@ -235,8 +359,10 @@ return overflow
                 # 跳过过期画像（90天未更新；DB 列为无时区 TIMESTAMP/UTC，本地 now() 会随时区漂移）
                 from datetime import datetime, timedelta, timezone
                 updated = row["updated_at"]
-                utc_naive_now = datetime.now(timezone.utc).replace(tzinfo=None)
-                if updated and (utc_naive_now - updated) > timedelta(days=90):
+                if updated and updated.tzinfo is None:
+                    # 兼容尚未应用 timestamptz 迁移的旧库；旧值语义本就是 UTC。
+                    updated = updated.replace(tzinfo=timezone.utc)
+                if updated and (datetime.now(timezone.utc) - updated) > timedelta(days=90):
                     # 原子条件删除（P1 #44）：带过期条件，避免"读-删"两步竞态与重复清理
                     await conn.execute(
                         "DELETE FROM user_profiles WHERE user_id = $1 "
@@ -244,9 +370,9 @@ return overflow
                         self.user_id
                     )
                     return ""
-                profile_data = row["profile"]
+                profile_data = self._profile_to_dict(row["profile"])
                 # 精简画像：只保留最近的3个城市
-                if isinstance(profile_data, dict):
+                if profile_data:
                     if "recent_cities" in profile_data:
                         profile_data["recent_cities"] = profile_data["recent_cities"][-3:]
                     # 友好格式化
@@ -266,5 +392,5 @@ return overflow
                     if parts:
                         return f"【用户画像】{' | '.join(parts)}"
                     return f"【用户画像】{json.dumps(profile_data, ensure_ascii=False)}"
-                return f"【用户画像】{json.dumps(profile_data, ensure_ascii=False)}"
+                return ""
             return ""

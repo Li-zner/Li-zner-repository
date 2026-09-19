@@ -1,7 +1,7 @@
 import os
 import asyncpg
 from contextlib import asynccontextmanager
-from ..core.config import DATABASE_URL, DB_ACQUIRE_TIMEOUT
+from ..core.config import DATABASE_URL, DB_ACQUIRE_TIMEOUT, DB_COMMAND_TIMEOUT
 from ..core.logging import setup_logging
 
 logger = setup_logging()
@@ -10,8 +10,11 @@ _pool = None
 
 
 _POOL_CONFIG = {
-    "min_size": int(os.getenv("DB_POOL_MIN_SIZE", "20")),
-    "max_size": int(os.getenv("DB_POOL_MAX_SIZE", "50")),
+    # 默认值按“多进程/多实例部署”优先，避免网关、控制台和 worker 各自
+    # 建立 20 条常驻连接把 PostgreSQL 连接预算一次性吃光。高负载实例通过
+    # DB_POOL_MIN_SIZE/DB_POOL_MAX_SIZE 显式调大。
+    "min_size": int(os.getenv("DB_POOL_MIN_SIZE", "2")),
+    "max_size": int(os.getenv("DB_POOL_MAX_SIZE", "10")),
 }
 
 # 校验：min_size > max_size 时 asyncpg 报错信息不明确，这里直接给出清晰错误（P0）
@@ -36,6 +39,7 @@ async def init_pool():
             min_size=_POOL_CONFIG["min_size"],
             max_size=_POOL_CONFIG["max_size"],
             timeout=DB_ACQUIRE_TIMEOUT,                   # 获取连接超时，防高并发无限阻塞（P0）
+            command_timeout=DB_COMMAND_TIMEOUT,           # 单条 SQL 执行上限，防半死连接永久占用
             max_inactive_connection_lifetime=300,          # 空闲连接 300s 回收，防连接无限占用（P0）
         )
     except Exception as e:
@@ -47,7 +51,6 @@ async def init_pool():
 
 async def get_pool():
     """获取已初始化的连接池（必须先在 lifespan 中调用 init_pool）"""
-    global _pool
     if _pool is None:
         raise RuntimeError("数据库连接池未初始化，请在 lifespan 中调用 init_pool()")
     return _pool
@@ -57,15 +60,17 @@ async def close_pool():
     """关闭连接池（在 lifespan 中调用）"""
     global _pool
     if _pool:
-        await _pool.close()
-        _pool = None
+        try:
+            await _pool.close()
+        finally:
+            _pool = None
 
 
 @asynccontextmanager
 async def get_db_conn():
-    """FastAPI 依赖项：从连接池获取一个连接（try/finally 确保业务异常时也归还连接，P1）"""
+    """异步上下文管理器：`async with get_db_conn() as conn`，不是 FastAPI 依赖。"""
     pool = await get_pool()
-    conn = await pool.acquire()
+    conn = await pool.acquire(timeout=DB_ACQUIRE_TIMEOUT)
     try:
         yield conn
     finally:

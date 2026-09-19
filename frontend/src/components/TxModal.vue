@@ -4,7 +4,7 @@ import { onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { getTransactions, type Transaction } from '../api/payment'
 
-const { t } = useI18n()
+const { t, te, locale } = useI18n()
 const emit = defineEmits<{ close: [] }>()
 const items = ref<Transaction[]>([])
 const loading = ref(false)
@@ -49,7 +49,9 @@ function fmtAmount(tx: Transaction): string {
 /** ISO 时间转本地可读；非法值原样兜底 */
 function fmtTime(iso: string): string {
   const d = new Date(iso)
-  return isNaN(+d) ? iso : d.toLocaleString('zh-CN', { hour12: false })
+  // locale.value 只有 'zh' | 'en'（types Locale），原先比 'en-US' 恒 false，
+  // 英文界面流水时间一直按中文排——09-12「locale 传入 fmtTime」实为空操作
+  return isNaN(+d) ? iso : d.toLocaleString(locale.value === 'en' ? 'en-US' : 'zh-CN', { hour12: false })
 }
 
 
@@ -83,7 +85,7 @@ onMounted(() => load(1, filter.value))
           <div v-for="tx in items" :key="tx.id" class="tx-item">
             <span class="tx-icon">{{ tx.tx_type === 'recharge' ? '💰' : tx.tx_type === 'consume' ? '💬' : '↩️' }}</span>
             <span class="tx-info">
-              <span class="tx-type">{{ t('tx_' + tx.tx_type) || tx.tx_type }}</span>
+              <span class="tx-type">{{ te('tx_' + tx.tx_type) ? t('tx_' + tx.tx_type) : tx.tx_type }}</span>
               <span class="tx-time">{{ fmtTime(tx.created_at) }}</span>
             </span>
             <span class="tx-amount" :class="tx.tx_type === 'consume' ? 'consume' : 'recharge'">

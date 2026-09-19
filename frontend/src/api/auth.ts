@@ -1,5 +1,5 @@
 /** 认证 / 用户信息 API（/api/login /api/logout /api/user/profile） */
-import { get, post, saveTokens, type TokenPair } from './http'
+import { get, getAuthMode, post, type TokenPair } from './http'
 
 export interface UserProfile {
   username: string
@@ -14,17 +14,24 @@ export interface UserProfile {
 }
 
 export async function login(username: string, password: string): Promise<TokenPair> {
-  const pair = await post<TokenPair>('/api/login', { username, password })
-  saveTokens(pair)
-  return pair
+  // 2026-09-12 清欠（D-F7）：落盘归 store 统一处理，API 层只负责请求
+  const headers = getAuthMode() === 'cookie' ? { 'X-Console-Auth': 'cookie' } : undefined
+  return post<TokenPair>('/api/login', { username, password }, headers)
+}
+
+/** GitHub OAuth 回调令牌：一次性授权码原子兑换，避免长期令牌进入 URL。 */
+export function exchangeOAuthCode(code: string): Promise<TokenPair> {
+  return post<TokenPair>('/api/oauth/exchange', { code })
 }
 
 /** 登出：撤销 refresh token（后端 jti 进黑名单），并清本地态 */
 export async function logout(refreshToken: string): Promise<void> {
   try {
-    await post('/api/logout', undefined, {
-      Authorization: `Bearer ${refreshToken}`,
-    })
+    await post(
+      '/api/logout',
+      undefined,
+      refreshToken ? { Authorization: `Bearer ${refreshToken}` } : undefined,
+    )
   } catch {
     /* 后端撤销失败不阻塞本地登出（token 自身到期失效） */
   }

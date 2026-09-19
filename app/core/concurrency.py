@@ -36,7 +36,13 @@ _background_tasks: set = set()
 
 def spawn(coro, name: str = "") -> asyncio.Task:
     """创建后台任务并持强引用（防 GC 中途回收）；完成后自移除，异常记日志不外抛"""
-    task = asyncio.get_running_loop().create_task(coro, name=name or None)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 同步失败时协程已创建未消费，显式关闭防 "never awaited" 告警
+        coro.close()
+        raise
+    task = loop.create_task(coro, name=name or None)
 
     def _done(t: asyncio.Task) -> None:
         _background_tasks.discard(t)
@@ -46,3 +52,24 @@ def spawn(coro, name: str = "") -> asyncio.Task:
     task.add_done_callback(_done)
     _background_tasks.add(task)
     return task
+
+
+async def drain_background_tasks(timeout: float = 10.0) -> int:
+    """等待全部 spawn 后台任务结束（进程关闭排空，2026-09-14 审计 P1）。
+
+    原先关闭流程只取消手工句柄——审计/缓存/计费等 spawn 任务可能未完成就被
+    Redis/PG 连接池关闭打断（丢审计、漏计费）。先给宽限期优雅收尾，超时再取消。
+    返回残留（被取消）任务数。
+    """
+    pending = {t for t in _background_tasks if not t.done()}
+    if not pending:
+        return 0
+    done, still_pending = await asyncio.wait(pending, timeout=timeout)
+    for t in still_pending:
+        t.cancel()
+    if still_pending:
+        # 取消后等一拍让清理路径跑完；仍不退出的任务随循环关闭终结
+        await asyncio.wait(still_pending, timeout=2.0)
+        logger.warning(f"关闭排空超时，强制取消 {len(still_pending)} 个后台任务")
+    logger.info(f"后台任务排空完成：{len(done)} 正常结束，{len(still_pending)} 取消")
+    return len(still_pending)

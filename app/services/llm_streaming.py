@@ -68,15 +68,27 @@ async def stream_llm_throttled(
                 _last_chunk_time = _now
         elif _ev["type"] == "tool_calls":
             yield ("tool_calls", {"delta": _ev["delta"]})
-    # 流尾冲刷残余缓冲（原版简单/推荐通道会丢弃 <40 字符的残余；统一实现改为冲刷，不丢内容）
+    # 流尾冲刷：思考守卫按完整行缓冲，最后一段无换行的尾行在此补检放行（防指纹
+    # 藏在流尾绕过）；answer 残余缓冲照旧冲刷（原版简单/推荐通道会丢弃 <40 字符）
+    if _reason_guard is not None:
+        _reason_tail = _reason_guard.flush()
+        if _reason_tail:
+            yield ("reasoning", _reason_tail)
     if _stream_buffer:
         yield ("answer", _stream_buffer)
 
 
 def _log_deduct_task_error(task: asyncio.Task) -> None:
-    """扣费后台任务的异常认领：记 warning，不打断对话，也不留未认领的 Task 异常"""
+    """扣费后台任务的异常认领：不打断对话，但**必须 error 级可告警**。
+
+    2026-09-19 审查 06-payment F7：此前是 warning，而这条路径失败意味着一笔费用
+    静默漏计（含 defer_deduction 占位单入库失败——钱已经花了，账没落）。全部扣费
+    入口（chat / runner / simple_task / orchestrator / sub_agents）都经
+    bill_token_usage 收口到这里，所以只在这一处提级。
+    """
     if not task.cancelled() and task.exception():
-        logger.warning(f"Token扣费后台任务失败（不影响对话）: {task.exception()}")
+        logger.error(f"Token扣费后台任务失败（该笔费用未落账，需对账）: "
+                     f"{task.exception()}")
 
 
 def bill_token_usage(usage: dict, username: str, session_id: str, remark: str):
@@ -116,7 +128,7 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _spawn_drain_bill(agen, username: str, conv_id: str, tag: str,
-                      fallback_text: str = "") -> None:
+                      fallback_text: str = "", model: str = "") -> None:
     """断连排空计费（2026-09-09 审查 P1 修复：断连漏扣费）。
 
     客户端断开时下游生成器收到 GeneratorExit/CancelledError，此刻上游流对象
@@ -135,7 +147,7 @@ def _spawn_drain_bill(agen, username: str, conv_id: str, tag: str,
             logger.warning(f"{tag} 断连排空中断（{type(e).__name__}），退化估算计费")
             usage = None
         if usage and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
-            record_token_usage(usage, username, conv_id)
+            record_token_usage(usage, username, conv_id, model=model)
             logger.info(f"{tag} 断连排空完成，按真实 usage 补计费")
         elif fallback_text:
             est = _estimate_tokens(fallback_text)
@@ -148,23 +160,31 @@ def _spawn_drain_bill(agen, username: str, conv_id: str, tag: str,
     spawn(_drain(), name=f"drain-bill:{tag}")
 
 
-def record_token_usage(_stream_usage: dict, username: str, conv_id: str, remark: str = ""):
+def record_token_usage(_stream_usage: dict, username: str, conv_id: str,
+                       remark: str = "", model: str = "", endpoint: str = "v2_chat"):
     """Token 精细计量 + 扣费（10元/万token，模拟模式）
 
     Prometheus 指标 + 日 token 计数 + 异步扣费；扣费失败经 done_callback 记 warning，不影响对话主流程。
     2026-09-06 自 chat_react 下沉至本模块：快速通道（answer_via_models）此前不透传
     usage 事件导致主流量漏扣费，现由透传点统一计量，ReAct/快速通道两路径共用。
     remark 供断连估算等特殊计费路径标注口径。
+    model 传实际应答模型（2026-09-10 审查 P2：原硬编码主模型名，flash/qwen 降级
+    实际发生的 token 全记主模型名下，监控口径失真）；缺省回落主模型名。
     """
-    from ..core.config import DEEPSEEK_MODEL as _dm
+    _dm = model or DEEPSEEK_MODEL
     prompt_tk = _stream_usage.get("prompt_tokens", 0)
     completion_tk = _stream_usage.get("completion_tokens", 0)
+    try:
+        from .rag_request_trace import add_token_usage
+        add_token_usage(prompt_tk, completion_tk)
+    except Exception:  # noqa: silent-except — trace 用量统计失败不影响流式
+        pass
     if prompt_tk or completion_tk:
         llm_tokens_total.labels(type='input').inc(prompt_tk)
         llm_tokens_total.labels(type='output').inc(completion_tk)
-        llm_tokens_detail.labels(model=_dm, endpoint='v2_chat', type='input').inc(prompt_tk)
-        llm_tokens_detail.labels(model=_dm, endpoint='v2_chat', type='output').inc(completion_tk)
-    llm_requests_total.labels(model=_dm, endpoint='v2_chat', status='success').inc()
+        llm_tokens_detail.labels(model=_dm, endpoint=endpoint, type='input').inc(prompt_tk)
+        llm_tokens_detail.labels(model=_dm, endpoint=endpoint, type='output').inc(completion_tk)
+    llm_requests_total.labels(model=_dm, endpoint=endpoint, status='success').inc()
     bill_token_usage(_stream_usage, username, conv_id,
                      remark=remark or f"AI对话消耗 {prompt_tk + completion_tk} tokens（输入 {prompt_tk} + 输出 {completion_tk}）")
 
@@ -188,17 +208,25 @@ async def answer_via_models(ctx: ChatStreamCtx, llm_messages: List[Dict], tag: s
                     _result_text += payload
                     yield ("answer", payload)
                 elif kind == "usage":
-                    record_token_usage(payload, ctx.username, ctx.conv_id)
+                    record_token_usage(payload, ctx.username, ctx.conv_id,
+                                       model=_model_try)
             if _result_text:
                 return
         except (GeneratorExit, asyncio.CancelledError):
             # 客户端断连（2026-09-09 审查 P1 修复：断连漏扣费）：此刻上游流未关闭，
             # 排空任务接管消费拿真实 usage 补计费后原样上抛，不吞取消
             _spawn_drain_bill(_agen, ctx.username, ctx.conv_id,
-                              f"fast-path[{_model_try}]", fallback_text=_result_text)
+                              f"fast-path[{_model_try}]", fallback_text=_result_text,
+                              model=_model_try)
             raise
         except Exception as _fast_err:
             await mark_key_result(ctx.api_key, False)
+            llm_requests_total.labels(model=_model_try, endpoint='v2_chat', status='error').inc()  # 2026-09-11 审查 P1：告警接线
+            # 已流出部分回答就不再换模型（2026-09-10 审查 P2）：换模型重答会与
+            # 已发出的半截回答拼接重复；按失败收尾交调用方兜底
+            if _result_text:
+                logger.warning(f"{tag} {_model_try} 中途失败（已出 {len(_result_text)} 字，不换模型重答）: {_fast_err}")
+                return
             if _model_try == ctx.selected_model:
                 logger.warning(f"{tag} {ctx.selected_model} 调用失败，降级到 {DEEPSEEK_FLASH_MODEL}: {_fast_err}")
             else:

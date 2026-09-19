@@ -49,13 +49,5 @@ python test_client.py                         # 完整验证（Redis 可选）
 ## 密钥轮换（生产必做）
 
 双 Key 并行期：新 JWT_SECRET + 旧值保留为 JWT_SECRET_OLD，解码时两个密钥都试
-（旧 token 仍可验）→ 旧 token 全过期后再移除旧 Key。完整轮换流程见
-`../../skill/密钥与配置治理/SKILL.md` 双 Key 并行期一节。
-
-## 库内关联
-
-- 轮换方法论：[[skill/密钥与配置治理/SKILL|密钥与配置治理]]（双 Key 并行期 / 唯一权威源 / 防漂移）
-- 上位视角：[[AI应用资产/安全审计|AI 应用安全审计]]（威胁模型中认证的位置）
-- 手写训练：[[skill/面试手写八段训练/SKILL|面试手写八段]]（第 2 段 JWT 签发与校验）
-- 验收：[[AI应用验收工具/README|AI 应用验收工具·阶段 1]]（篡改拒绝 / 刷新轮换 / 吊销生效）
-- 图谱：[[图谱/MOC-安全与密钥|MOC-安全与密钥]]、[[图谱/MOC-MCP生态|MOC-MCP 生态]]
+（旧 token 仍可验）→ 旧 token 全过期后再移除旧 Key。轮换脚本模式见
+agent_gateway `scripts/rotate_jwt_secret.sh`。

@@ -4,7 +4,7 @@ import pluginVue from 'eslint-plugin-vue'
 import tseslint from 'typescript-eslint'
 
 export default tseslint.config(
-  { ignores: ['dist/', 'node_modules/', 'coverage/', 'playwright-report/'] },
+  { ignores: ['dist/', 'dist-console/', 'node_modules/', 'coverage/', 'playwright-report/'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   ...pluginVue.configs['flat/recommended'],

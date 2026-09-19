@@ -66,19 +66,18 @@ async def send_sms(phone: str, code: str, ttl_minutes: int = 5) -> bool:
       SMS_TEMPLATE_CODE (短信模板编码)
     """
     if not ALIBABA_CLOUD_ACCESS_KEY_ID or not ALIBABA_CLOUD_ACCESS_KEY_SECRET:
-        # ----- 无阿里云配置 → 演示模式仅打印日志 -----
-        logger.info(f"[演示模式] 验证码 {code[:2]}**** 已生成（{_mask_phone(phone)}）")
-        logger.info(f"需配置 ALIBABA_CLOUD_ACCESS_KEY_ID/SECRET 以启用真实短信")
-        try:
-            import subprocess
-            subprocess.Popen(
-                ["powershell", "-Command",
-                 f'Write-Host "验证码: {code} (发送至 {phone})" -ForegroundColor Green'],
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-        except Exception as e:
-            logger.debug("演示模式弹窗显示失败（无桌面环境，忽略）")
-        return True
+        # P2 修复（fail-open 收口）：演示模式仅限 test/dev 环境；生产缺密钥直接失败——
+        # 原先无告警区分，用户收不到短信但业务按成功流转
+        from ..core.config import APP_ENV as app_env
+        if app_env in ("test", "dev", "local", "development"):
+            # ----- 无阿里云配置 → 演示模式仅打印日志 -----
+            # 2026-09-12 收尾清欠 P2：删除 Popen 弹窗——验证码经命令行内插属命令
+            # 注入埋雷，且验证码属敏感信息不应出现在任何进程命令行/屏幕
+            logger.info(f"[演示模式] 验证码 {code[:2]}**** 已生成（{_mask_phone(phone)}）")
+            logger.info("需配置 ALIBABA_CLOUD_ACCESS_KEY_ID/SECRET 以启用真实短信")
+            return True
+        logger.error("生产环境缺少阿里云短信密钥，拒绝演示模式发放验证码（fail-closed）")
+        return False
 
     try:
         # 构造请求参数
@@ -118,17 +117,10 @@ async def send_sms(phone: str, code: str, ttl_minutes: int = 5) -> bool:
                 return True
             else:
                 logger.error(f"短信发送失败: phone={_mask_phone(phone)}, Code={result.get('Code')}, Message={result.get('Message')}")
-                logger.error(f"   建议检查: 1) AccessKey 权限 2) SMS_TEMPLATE_CODE 3) 短信签名审核状态")
+                logger.error("   建议检查: 1) AccessKey 权限 2) SMS_TEMPLATE_CODE 3) 短信签名审核状态")
                 return False
 
     except Exception as e:
         logger.error(f"短信发送异常: {e}")
         return False
 
-
-async def send_admin_notification(message: str) -> bool:
-    """向管理员发送通知短信"""
-    if ADMIN_PHONE:
-        logger.info(f"[管理员通知] {ADMIN_PHONE}: {message}")
-        return True
-    return False

@@ -5,7 +5,7 @@ export default defineConfig({
   testDir: './e2e',
   timeout: 60_000,
   use: {
-    baseURL: 'http://localhost:4173',
+    baseURL: process.env.E2E_BASE_URL ?? 'http://localhost:4173',
     screenshot: 'only-on-failure',
   },
   webServer: {

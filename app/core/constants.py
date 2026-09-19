@@ -84,8 +84,13 @@ def clear_persona_cache():
 
 def today_cn() -> str:
     """中文当前日期（含星期），供各处 system prompt 的 {today} 注入统一使用。
-    strftime %A 会输出英文星期，中文助手场景统一为周X。"""
-    from datetime import datetime
+    strftime %A 会输出英文星期，中文助手场景统一为周X。
+
+    固定用 UTC+8（北京时间）：线上容器是 UTC 时区，datetime.now() 在北京时间
+    0-8 点间会注入昨天的日期（2026-09-10 线上实测：模型自称"今天是9月9日"）；
+    显式时区后与容器部署在哪个时区无关。修复 修复日志 P2 时区漂移挂账项。
+    """
+    from datetime import datetime, timezone, timedelta
     weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-    now = datetime.now()
+    now = datetime.now(timezone(timedelta(hours=8)))
     return f"{now.year}年{now.month:02d}月{now.day:02d}日 {weekdays[now.weekday()]}"

@@ -15,7 +15,6 @@
 """
 
 import re
-import json
 from pathlib import Path
 from typing import Optional
 
@@ -333,6 +332,7 @@ _WHITELIST_PATTERN = re.compile(
 _SAFETY_KEYWORDS = [
     "炸弹", "爆炸物", "制毒", "毒品", "冰毒", "枪支", "弹药", "恐怖袭击",
     "自杀方法", "自杀方式", "制作炸弹", "儿童色情", "爆破",
+    "tnt", "bomb", "explosive", "methamphetamine",
 ]
 
 
@@ -386,29 +386,38 @@ def route_query(query: str) -> RoutingResult:
     前置路由裁决：用户输入 → 裁决结果
 
     流程：
-    1. 检查是否明确引用民法典法条编号 → pass
-    2. 检查强制白名单（人格权编/总则编必答词，优先级最高）→ pass
-    3. 检查黑名单 → 灰色地带放行 / 纯排除拒答
-    4. 检查白名单 → pass
-    5. 口语映射后重新裁决
-    6. 通用安全关键词拦截
+    1. 通用安全关键词拦截（优先级高于所有业务白名单/黑名单）
+    2. 检查是否明确引用民法典法条编号 → pass
+    3. 检查强制白名单（人格权编/总则编必答词）→ pass
+    4. 检查黑名单 → 灰色地带放行 / 纯排除拒答
+    5. 检查白名单 → pass
+    6. 口语映射后重新裁决
     7. 默认 pass（给LLM判断）
     """
     if not query:
         return RoutingResult(action="pass")
 
-    # Step 0: 口语→术语映射（优先进行，使 mapped_query 在所有路径中可用；全部替换，P2 #39）
+    # Step 0: 安全关键词必须先于白名单和黑名单裁决，防止附加民事词后绕过拦截。
+    _normalized_safety = re.sub(r"\s+", "", query).lower()
+    for _kw in _SAFETY_KEYWORDS:
+        if _kw in _normalized_safety:
+            return RoutingResult(
+                action="reject", match_type="safety",
+                message="抱歉，这个问题涉及安全敏感内容，我无法回答。",
+            )
+
+    # Step 1: 口语→术语映射（优先进行，使 mapped_query 在所有路径中可用；全部替换，P2 #39）
     _mapped_query = query
     for _colloquial, _legal in sorted(_COLLOQUIAL_MAP.items(), key=lambda x: -len(x[0])):
         if _colloquial in _mapped_query:
             _mapped_query = _mapped_query.replace(_colloquial, _legal)
     _mq = dict(mapped_query=_mapped_query, has_mapping=(_mapped_query != query))
 
-    # Step 1: 检测是否引用了民法典法条编号
+    # Step 2: 检测是否引用了民法典法条编号
     if _CIVIL_CODE_ARTICLE_PATTERN.search(query):
         return _pass_result("article_ref", "民法典", **_mq)
 
-    # Step 2: 强制白名单（优先级高于黑名单）
+    # Step 3: 强制白名单（优先级高于黑名单）
     # 注：P0 #3 的"词边界匹配"方案经测试对中文不可靠（前后助词/动词导致漏判真实民事问题，
     #     如"被人偷拍了"），故保留子串匹配，改为移除过于宽泛的关键词（见 _FORCED_CIVIL_KEYWORDS）。
     #     完全防"附加词绕过"需语义级判断，已登记遗留。
@@ -416,30 +425,22 @@ def route_query(query: str) -> RoutingResult:
         if keyword in query:
             return _pass_result("forced_whitelist", "民法典", **_mq)
 
-    # Step 3: 黑名单（灰色地带放行混合回答，纯排除拒答）
+    # Step 4: 黑名单（灰色地带放行混合回答，纯排除拒答）
     r = _blacklist_result(query, **_mq)
     if r:
         return r
 
-    # Step 4: 检查白名单（民法典关键词）
+    # Step 5: 检查白名单（民法典关键词）
     if _WHITELIST_PATTERN.search(query):
         return _pass_result("whitelist", "民法典", **_mq)
 
-    # Step 5: 口语映射后重新裁决（映射已在 Step 0 完成，此处只检查映射后的结果）
+    # Step 6: 口语映射后重新裁决（映射已在 Step 1 完成，此处只检查映射后的结果）
     if _mq["has_mapping"]:
         if _WHITELIST_PATTERN.search(_mq["mapped_query"]) or _CIVIL_CODE_ARTICLE_PATTERN.search(_mq["mapped_query"]):
             return _pass_result("whitelist", "民法典", **_mq)
         r = _blacklist_result(_mq["mapped_query"], **_mq)
         if r:
             return r
-
-    # Step 6: 通用安全关键词拦截（P0 #14：防危险问题默认放行给 LLM）
-    for _kw in _SAFETY_KEYWORDS:
-        if _kw in query:
-            return RoutingResult(
-                action="reject", match_type="safety",
-                message="抱歉，这个问题涉及安全敏感内容，我无法回答。",
-            )
 
     # 默认放行（给LLM判断）
     return _pass_result("unknown", **_mq)

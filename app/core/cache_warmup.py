@@ -23,7 +23,7 @@ _HOT_ANSWERS = {
 async def warmup_semantic_cache():
     """启动预热：只写入有标准答案的固定问答（按匿名请求上下文键，保证可命中）"""
     logger.info("开始预热语义缓存...")
-    anon_ctx = SemanticCache.build_cache_ctx("", "")
+    anon_ctx = SemanticCache.build_cache_ctx("", "", "", "")
     for query, answer in _HOT_ANSWERS.items():
         try:
             await SemanticCache.set(query, answer, cache_ctx=anon_ctx)

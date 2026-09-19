@@ -27,31 +27,34 @@ async def delete_conversation(
 
     try:
         pool = await get_pool()
-        async with pool.acquire() as conn:
-            # 1. 删除对话消息
-            result = await conn.execute(
-                "DELETE FROM conversation_memories "
-                "WHERE user_id = $1 AND conversation_id = $2",
-                username, conversation_id
-            )
-            deleted_count = result.split()[-1]  # "DELETE X" → "X"
-            logger.info(f"删除对话消息: user={username}, conv={conversation_id}, deleted={deleted_count}")
+        async with pool.acquire(timeout=5) as conn:
+            # 2026-09-12 修复（外部复核 P1）：删除、剩余检查与画像清理放同一
+            # 事务——并发写入时"检查为空→删画像"的窗口会误删仍有对话的画像。
+            # 事务内语句使用同一快照并持有写锁，窗口闭合。
+            async with conn.transaction():
+                result = await conn.execute(
+                    "DELETE FROM conversation_memories "
+                    "WHERE user_id = $1 AND conversation_id = $2",
+                    username, conversation_id
+                )
+                deleted_count = result.split()[-1]  # "DELETE X" → "X"
+                logger.info(f"删除对话消息: user={username}, conv={conversation_id}, deleted={deleted_count}")
 
-            # 2. 清除画像（Bug #4 修复）：画像可能由多个对话共同生成，
-            # 删单个对话不能连带清空。仅当用户已无任何对话（画像成孤儿）才清理。
-            remaining_conv = await conn.fetchval(
-                "SELECT 1 FROM conversation_memories WHERE user_id = $1 LIMIT 1",
-                username
-            )
-            if not remaining_conv:
-                await conn.execute(
-                    "DELETE FROM user_profiles WHERE user_id = $1",
+                # 清除画像（Bug #4 修复）：画像可能由多个对话共同生成，
+                # 删单个对话不能连带清空。仅当用户已无任何对话（画像成孤儿）才清理。
+                remaining_conv = await conn.fetchval(
+                    "SELECT 1 FROM conversation_memories WHERE user_id = $1 LIMIT 1",
                     username
                 )
-                profile_cleared = True
-                logger.info(f"已清除用户画像（用户已无对话）: user={username}")
-            else:
-                logger.info(f"保留用户画像（用户仍有其他对话）: user={username}")
+                if not remaining_conv:
+                    await conn.execute(
+                        "DELETE FROM user_profiles WHERE user_id = $1",
+                        username
+                    )
+                    profile_cleared = True
+                    logger.info(f"已清除用户画像（用户已无对话）: user={username}")
+                else:
+                    logger.info(f"保留用户画像（用户仍有其他对话）: user={username}")
     except Exception as e:
         # 内部错误只留日志，响应给固定文案防信息泄露（P3 修复）
         logger.error(f"删除对话失败: {e}")

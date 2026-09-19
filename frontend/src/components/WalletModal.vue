@@ -2,6 +2,7 @@
 /** 充值弹窗（旧版 .payment-overlay 三步流：选额→伪码→成功）+ 交易流水入口 */
 import { ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import rechargeQr from '../assets/recharge-qr.png'
 import { createRechargeOrder, payOrder } from '../api/payment'
 import { useUiStore } from '../stores/ui'
 
@@ -115,8 +116,9 @@ async function completePayment() {
           <div class="qr-section">
             <div class="qr-amount">{{ amount.toFixed(2) }} {{ t('yuan') }}</div>
             <div class="qr-order-no">{{ t('order_no_prefix') }}{{ orderNo }}</div>
+            <!-- 模拟收款二维码：扫不扫都无所谓，点「关闭」即按现有模拟渠道结算 -->
             <div class="qr-box">
-              <span class="qr-code-text">{{ t('qr_demo_text') }} · {{ t('qr_no_scan') }}</span>
+              <img :src="rechargeQr" :alt="t('wallet_recharge')">
             </div>
             <div class="qr-tip">{{ t('qr_tip') }}</div>
             <div v-if="error" style="font-size:13px;color:#ef4444;margin-top:8px;">{{ error }}</div>
@@ -126,7 +128,21 @@ async function completePayment() {
 
         <template v-if="step === 3">
           <div class="success-section">
-            <span class="success-icon">✅</span>
+            <svg
+              class="success-icon"
+              width="64"
+              height="64"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <circle cx="12" cy="12" r="10"/>
+              <path d="M8 12l3 3 5-6"/>
+            </svg>
             <div class="success-title">{{ t('recharge_success') }}</div>
             <div class="success-details">
               <div class="detail-row">

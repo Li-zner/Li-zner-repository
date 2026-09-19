@@ -57,7 +57,7 @@ async function copyAll() {
     </details>
 
     <div v-if="isUser && message.files?.length" class="file-attach">
-      <span v-for="f in message.files" :key="f">📎 {{ f }}</span>
+      <span v-for="f in message.files" :key="f">{{ t('attachment_prefix') }}{{ f }}</span>
     </div>
 
     <div v-if="isUser" class="answer-box">{{ message.content }}</div>
@@ -67,10 +67,10 @@ async function copyAll() {
     <div class="bottom-row">
       <span class="msg-time">{{ timeText }}</span>
       <span v-if="done" class="msg-actions">
-        <button :title="t('copy_content')" @click.stop="copyAll">C</button>
+        <button :title="t('copy_content')" @click.stop="copyAll">{{ t('copy_short') }}</button>
         <template v-if="!isUser">
-          <button :title="t('delete_this_qa')" @click.stop="emit('delete', index)">D</button>
-          <button v-if="!message.rated" :title="t('rate_answer')" @click.stop="emit('rate', index)">R</button>
+          <button :title="t('delete_this_qa')" @click.stop="emit('delete', index)">{{ t('delete_short') }}</button>
+          <button v-if="!message.rated" :title="t('rate_answer')" @click.stop="emit('rate', index)">{{ t('rate_short') }}</button>
         </template>
       </span>
     </div>

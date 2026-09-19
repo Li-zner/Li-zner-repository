@@ -50,13 +50,13 @@ def safe_format_prompt(prompt: str, **kwargs) -> str:
 
 
 def hide_reasoning(persona_id: str, persona) -> bool:
-    """是否隐藏思考过程：人格配置 show_reasoning=False 或 求职助手(me) 不展示
+    """是否隐藏思考过程：人格配置 show_reasoning=False 时隐藏
 
     说明：show_reasoning 应作为人格配置布尔字段（P2 #24 完整迁移需改 core/persona_manager），
     当前用 getattr 兼容旧配置；未配置时默认展示思考。
     """
     show = getattr(persona, "show_reasoning", True) if persona else True
-    return (not show) or persona_id == "me"
+    return not show
 
 
 # ---------- DeepSeek API Key 轮询（Round Robin + 连续失败剔除）----------
@@ -108,7 +108,13 @@ async def post_chat_completion(payload: dict, timeout: float, prefer_flash: bool
     返回 (ok, data)；失败时 data 为 {"status":..., "body":...} 诊断信息。
     """
     import httpx
-    from ..core.config import DEEPSEEK_FLASH_MODEL, DEEPSEEK_MODEL, llm_endpoint
+    from ..core.config import (
+        DEEPSEEK_FLASH_MODEL,
+        DEEPSEEK_MODEL,
+        apply_llm_request_options,
+        llm_endpoint,
+    )
+    from ..middleware.circuit_breaker import get_breaker
     primary = payload.get("model") or DEEPSEEK_MODEL
     models = [DEEPSEEK_FLASH_MODEL, primary] if prefer_flash else [primary, DEEPSEEK_FLASH_MODEL]
     seen: set = set()
@@ -120,17 +126,27 @@ async def post_chat_completion(payload: dict, timeout: float, prefer_flash: bool
         attempt_timeout = (preferred_timeout or timeout) if idx == 0 else timeout
         base_url, api_key = llm_endpoint(model, os.getenv("DEEPSEEK_API_KEY", ""))
         body = dict(payload, model=model)
+        apply_llm_request_options(body, model)
         if model.startswith("qwen"):
             # 百炼兼容端点对带 temperature 的请求偶发 400（历史注释），
             # 随机温度抖动只用于 DeepSeek 侧，qwen 兜底时剥离
             body.pop("temperature", None)
         try:
-            async with httpx.AsyncClient(timeout=attempt_timeout) as client:
-                resp = await client.post(
-                    f"{base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                    json=body,
-                )
+            async def _post_once():
+                async with httpx.AsyncClient(timeout=attempt_timeout) as client:
+                    return await client.post(
+                        f"{base_url}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json=body,
+                    )
+
+            breaker = get_breaker(
+                f"llm-post:{model}", call_timeout=attempt_timeout + 5,
+            )
+            resp = await breaker.call(_post_once)
             if resp.status_code == 200:
                 await mark_key_result(api_key, True)
                 return True, resp.json()
@@ -140,3 +156,29 @@ async def post_chat_completion(payload: dict, timeout: float, prefer_flash: bool
             last = {"status": None, "body": str(e)[:200]}
             await mark_key_result(api_key, False)
     return False, last
+
+def display_safe_tool_result(result):
+    """tool_result SSE 事件对外文本消毒（2026-09-10 审查 P2）：
+
+    web_search 等第三方内容/错误串此前随 tool_result 事件直发前端，绕过安全过滤
+    （answer 路径同块均先滤）。返回消毒后的深拷贝，不影响喂给 LLM 的原对象。
+    """
+    import copy
+
+    from ..core.safety_filter import get_filter, sanitize_error_text
+
+    sf = get_filter()
+
+    def _clean(v):
+        if isinstance(v, str):
+            v = sanitize_error_text(v)
+            if sf.contains_sensitive(v):
+                return "[该内容已被安全过滤]"
+            return v
+        if isinstance(v, list):
+            return [_clean(x) for x in v]
+        if isinstance(v, dict):
+            return {k: _clean(x) for k, x in v.items()}
+        return v
+
+    return _clean(copy.deepcopy(result))

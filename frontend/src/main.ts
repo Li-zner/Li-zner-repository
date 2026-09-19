@@ -6,6 +6,7 @@ import router from './router'
 import './styles/app.css'
 import './styles/adapt.css'
 
+;(window as unknown as { __vueErrs: string[] }).__vueErrs = []
 const app = createApp(App)
 // 渲染错误持久化捕获：切人格空白问题的排查钩子（定位后可移除）
 app.config.errorHandler = (err, _instance, info) => {

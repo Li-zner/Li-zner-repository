@@ -11,6 +11,7 @@ const chat = useChatStore()
 /** 正在重命名的会话 id 与草稿（不用 window.prompt：部分环境禁用原生弹窗） */
 const renamingId = ref('')
 const renameDraft = ref('')
+const deletingId = ref('')
 
 function startRename(id: string, currentTitle: string) {
   renamingId.value = id
@@ -28,12 +29,20 @@ function onRenameEnter(e: KeyboardEvent, id: string) {
   commitRename(id)
 }
 
-function remove(id: string) {
+async function remove(id: string) {
   if (chat.sessions.length <= 1) {
-    window.alert('至少保留一个会话')
+    window.alert(t('keep_one_session'))
     return
   }
-  if (window.confirm('删除这个对话？')) chat.deleteSession(id)
+  if (!window.confirm(t('delete_this_conversation'))) return
+  deletingId.value = id
+  try {
+    await chat.deleteSession(id)
+  } catch {
+    window.alert(t('delete_session_failed'))
+  } finally {
+    deletingId.value = ''
+  }
 }
 
 /** 导出会话为 Markdown 文件 */
@@ -65,15 +74,29 @@ function exportSession(id: string) {
         >
       </template>
       <template v-else>
-        <span class="item-name" :title="s.title">{{ s.pinned ? '📌 ' : '' }}{{ s.title }}</span>
+        <span class="item-name" :title="s.title">{{ s.title }}</span>
         <button
           class="pin-btn"
+          :class="{ 'is-pinned': s.pinned }"
           :title="s.pinned ? t('unpin_session') : t('pin_session')"
           @click.stop="chat.togglePin(s.id)"
-        >{{ s.pinned ? '已顶' : '顶' }}</button>
-        <button class="rename-btn" :title="t('rename')" @click.stop="startRename(s.id, s.title)">R</button>
-        <button class="export-btn" :title="t('export_session')" @click.stop="exportSession(s.id)">E</button>
-        <button class="delete-btn" :title="t('delete_btn')" @click.stop="remove(s.id)">D</button>
+        >{{ s.pinned ? t('pinned_short') : t('pin_short') }}</button>
+        <button
+          class="rename-btn"
+          :title="t('rename')"
+          @click.stop="startRename(s.id, s.title)"
+        >{{ t('rename_short') }}</button>
+        <button
+          class="export-btn"
+          :title="t('export_session')"
+          @click.stop="exportSession(s.id)"
+        >{{ t('export_short') }}</button>
+        <button
+          class="delete-btn"
+          :title="t('delete_btn')"
+          :disabled="deletingId === s.id"
+          @click.stop="remove(s.id)"
+        >{{ t('delete_short') }}</button>
       </template>
     </div>
   </div>
@@ -93,7 +116,7 @@ function exportSession(id: string) {
   font-size: 12px;
   line-height: 1;
 }
-/* 置顶会话底色强调（📌 前缀 + 浅主色底） */
+/* 置顶会话使用浅主色底强调 */
 .history-item.pinned {
   background: var(--primary-light);
 }
@@ -112,6 +135,11 @@ function exportSession(id: string) {
 }
 .pin-btn:hover {
   color: var(--primary);
+}
+/* 单字按钮后置顶态靠颜色+加粗区分（文字本身同为「顶」/「P」） */
+.pin-btn.is-pinned {
+  color: var(--primary);
+  font-weight: 700;
 }
 .export-btn:hover {
   color: var(--primary);

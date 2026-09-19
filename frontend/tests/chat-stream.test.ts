@@ -28,6 +28,7 @@ function jsonStatus(status: number, detail: string): Response {
 }
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
   localStorage.clear()
 })
@@ -73,5 +74,62 @@ describe('streamChat 事件透传', () => {
     await expect(
       streamChat({ query: 'q', conversationId: 'c', onEvent: () => {} }),
     ).rejects.toMatchObject({ status: 402, message: '免费额度已用完' })
+  })
+
+  it('流截断（无 answer_complete 也无 [DONE]）抛 502（2026-09-12 截断检测回归）', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse([
+      'data: {"type": "answer_chunk", "content": "写到一半"}\n\n',
+      // 连接在此被掐断：没有 answer_complete / [DONE]
+    ])))
+    await expect(
+      streamChat({ query: 'q', conversationId: 'c', onEvent: () => {} }),
+    ).rejects.toMatchObject({ status: 502 })
+  })
+
+  it('answer_complete 已到但 [DONE] 丢失不误报（内容完整时容忍协议尾缺失）', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse([
+      'data: {"type": "answer_complete", "content": "完整回答"}\n\n',
+    ])))
+    const events: Record<string, unknown>[] = []
+    await streamChat({
+      query: 'q',
+      conversationId: 'c',
+      onEvent: (ev) => events.push(ev as Record<string, unknown>),
+    })
+    expect(events.some((e) => e.type === 'answer_complete')).toBe(true)
+  })
+
+  it('活跃流按 chunk 重置 60 秒空闲看门狗', async () => {
+    vi.useFakeTimers()
+    const chunks = [
+      'data: {"type": "answer_chunk", "content": "一"}\n\n',
+      'data: {"type": "answer_chunk", "content": "二"}\n\n',
+      'data: {"type": "answer_complete", "content": "一二"}\n\n',
+      'data: [DONE]\n\n',
+    ]
+    let index = 0
+    const body = {
+      getReader: () => ({
+        read: () => new Promise<ReadableStreamReadResult<Uint8Array>>((resolve) => {
+          setTimeout(() => {
+            if (index >= chunks.length) {
+              resolve({ done: true, value: undefined })
+              return
+            }
+            resolve({ done: false, value: encoder.encode(chunks[index++]) })
+          }, 40000)
+        }),
+        cancel: vi.fn().mockResolvedValue(undefined),
+      }),
+    }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      body,
+    } as unknown as Response))
+
+    const stream = streamChat({ query: 'q', conversationId: 'c', onEvent: () => {} })
+    await vi.advanceTimersByTimeAsync(240000)
+    await expect(stream).resolves.toBeUndefined()
   })
 })

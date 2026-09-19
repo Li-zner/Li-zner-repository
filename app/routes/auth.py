@@ -3,12 +3,22 @@
 从 app/main.py 纯移动而来（2026-08-31 模块化，行为等价，零逻辑改动）。
 支持手机号作为账号登录（账号即手机号）；JWT 认证主体在 middleware/auth。
 """
+import ipaddress
+
 from pydantic import BaseModel, Field
 from fastapi import APIRouter, Request, Depends, HTTPException
+from fastapi.responses import JSONResponse
 
 from ..core.logging import setup_logging
 from ..core.db import get_pool
-from ..core.config import PASSWORD_MAX_BYTES
+from ..core.config import PASSWORD_MAX_BYTES, TRUST_PROXY_HEADERS
+from ..core.auth_cookies import (
+    ACCESS_COOKIE,
+    REFRESH_COOKIE,
+    clear_console_cookies,
+    is_console_cookie_request,
+    set_console_cookies,
+)
 from ..core.password import hash_password
 from ..middleware.auth import (
     get_current_user, authenticate_user, create_token_pair,
@@ -23,17 +33,69 @@ router = APIRouter()
 _LOGIN_FAIL_LIMIT = 5
 _LOGIN_LOCK_SECONDS = 900
 
+# 登录失败计数/锁定原子化（B-17）：INCR 首次即设 TTL；达上限写锁键并清计数
+_LOGIN_FAIL_LUA = """
+local c = redis.call('INCR', KEYS[1])
+if c == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+if tonumber(c) >= tonumber(ARGV[2]) then
+  redis.call('SETEX', KEYS[2], ARGV[1], '1')
+  redis.call('DEL', KEYS[1])
+end
+return c
+"""
+
+
+# 可信反代来源网段：回环 + RFC1918 + IPv6 回环/ULA/链路本地。
+# 不用 ipaddress.is_private——它还把 192.0.2.0/24、198.51.100.0/24、
+# 203.0.113.0/24 等文档段算作私有，等于把伪造头的信任面扩大到公网。
+_TRUSTED_PROXY_NETS: tuple = tuple(
+    ipaddress.ip_network(c) for c in (
+        "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+        "::1/128", "fd00::/8", "fe80::/10",
+    )
+)
+
+
+def _peer_is_trusted_proxy(host: str) -> bool:
+    """socket 对端是否本机可信反代：只有落在上面的网段才算。
+
+    生产链路（Cloudflare Tunnel -> nginx -> uvicorn）里 nginx 与网关同网络，
+    对端必然是私网地址；公网对端只可能是直连，其转发头一律不采信。
+    地址解析不了（Unix socket、空值）按不可信处理。
+    """
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(ip in net for net in _TRUSTED_PROXY_NETS)
+
 
 def _client_ip(request: Request) -> str:
-    """取可信客户端 IP（X-Forwarded-For 末跳 > 直连 IP），供失败计数键使用
+    """取可信客户端 IP。Cloudflare Tunnel 链路以 CF-Connecting-IP 为准。
 
-    2026-09-09 审查 P1 修复：nginx 用 $proxy_add_x_forwarded_for 追加真实 IP，
-    首跳是客户端可伪造的前缀——取首跳时防爆破锁既可被绕过（每次换伪造 IP）也可
-    反向陷害（伪造受害者 IP 连错 5 次锁 15 分钟）；末跳才是我方 nginx 追加的可信值。
-    CF-Connecting-IP 不在部署链路（nginx 直连），不采信。
+    生产链路是 Cloudflare Tunnel -> nginx；CF 头由隧道入口写入。没有该头时
+    回退 X-Forwarded-For 末跳（直连 nginx 场景），不采信首跳用户可控值。
+
+    RT-1（2026-09-19 审查）：转发头本身可被直连端口者伪造，伪造一次即绕
+    登录失败锁 / 短信 IP 日限额 / oauth 限频。故默认只信 socket 对端地址，
+    只有部署链路确为可信反代（TRUST_PROXY_HEADERS=1，与 observability 威胁
+    模型口径一致）时才读头。本函数为 phone/map/oauth 共用，修这一处全覆盖。
+
+    重扫修复（2026-09-19）：全局开关在实际部署里从未置位（容器 printenv 为
+    空、uvicorn 未带 --proxy-headers），于是所有请求都退化成 nginx 的地址——
+    登录锁、短信日限、oauth 限频、地图配额变成全站共享一个桶（任一人可锁
+    任意账号）。改为按**本次请求的对端**判定：对端是回环/私网即视为经过本机
+    反代、可信其头；公网对端仍只信 socket。开关保留为强制放行的逃生口。
     """
-    ip = (request.headers.get("x-forwarded-for")
-          or (request.client.host if request.client else ""))
+    peer = request.client.host if request.client else ""
+    if not (TRUST_PROXY_HEADERS or _peer_is_trusted_proxy(peer)):
+        return peer or "unknown"
+    cf_ip = request.headers.get("cf-connecting-ip", "").strip()
+    if cf_ip:
+        return cf_ip
+    ip = (request.headers.get("x-forwarded-for") or peer)
     if ip and "," in ip:
         ip = ip.split(",")[-1].strip()
     return ip or "unknown"
@@ -48,16 +110,18 @@ async def _check_login_lock(ip: str, username: str):
 
 
 async def _record_login_failure(ip: str, username: str):
-    """登录失败累计：达上限写入锁定键（TTL 即锁时长，自愈）"""
+    """登录失败累计：达上限写入锁定键（TTL 即锁时长，自愈）。
+
+    INCR/EXPIRE/锁写入收敛进单个 Lua 原子执行（2026-09-15 审查 B-17）：
+    原三步分开，进程在 INCR 与 EXPIRE 之间崩溃会残留无 TTL 键（永不过期）。
+    """
     from ..core.redis import get_redis
     r = await get_redis()
-    key = f"login_fail:{ip}:{username}"
-    count = await r.incr(key)
-    if count == 1:
-        await r.expire(key, _LOGIN_LOCK_SECONDS)
-    if count >= _LOGIN_FAIL_LIMIT:
-        await r.setex(f"login_lock:{ip}:{username}", _LOGIN_LOCK_SECONDS, "1")
-        await r.delete(key)
+    await r.eval(
+        _LOGIN_FAIL_LUA, 2,
+        f"login_fail:{ip}:{username}", f"login_lock:{ip}:{username}",
+        _LOGIN_LOCK_SECONDS, _LOGIN_FAIL_LIMIT,
+    )
 
 
 async def _clear_login_failures(ip: str, username: str):
@@ -69,14 +133,15 @@ async def _clear_login_failures(ip: str, username: str):
 
 class LoginRequest(BaseModel):
     """登录请求（P2 #17：Pydantic 校验 + 自动生成 OpenAPI 文档）"""
-    username: str = Field(..., min_length=1)
-    password: str = Field(..., min_length=1)
+    username: str = Field(..., min_length=1, max_length=128)
+    password: str = Field(..., min_length=1, max_length=256)
 
 
 class ChangePasswordRequest(BaseModel):
-    """修改密码请求"""
-    old_password: str = Field(..., min_length=1)
-    new_password: str = Field(..., min_length=6)
+    """修改密码请求（限长与登录请求对称：bcrypt 截断在 72 字节之外无增益，
+    超长串只膨胀日志与内存）"""
+    old_password: str = Field(..., min_length=1, max_length=256)
+    new_password: str = Field(..., min_length=6, max_length=256)
 
 
 async def resolve_login_username(username: str) -> str:
@@ -86,7 +151,7 @@ async def resolve_login_username(username: str) -> str:
     if username.startswith("phone_") or not re.match(r'^1\d{10}$', username):
         return username
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=5) as conn:
         row = await conn.fetchrow("SELECT username FROM users WHERE phone=$1", username)
         if row:
             return row["username"]
@@ -113,22 +178,35 @@ async def login(payload: LoginRequest, request: Request):
     # 审计：登录成功
     from ..core.audit import audit
     await audit(username, "login", {"method": "password"})
-    return {"access_token": pair["access_token"], "refresh_token": pair["refresh_token"], "token_type": "bearer"}
+    cookie_mode = is_console_cookie_request(request)
+    response = JSONResponse({
+        "access_token": "" if cookie_mode else pair["access_token"],
+        "refresh_token": "" if cookie_mode else pair["refresh_token"],
+        "token_type": "bearer",
+        "cookie_auth": cookie_mode,
+    })
+    return set_console_cookies(response, pair, request)
 
 
 @router.post("/api/refresh")
 async def refresh_token(request: Request):
     """独立 refresh token 换新 token 对（轮换：旧 refresh 进黑名单）"""
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
+    if auth.startswith("Bearer "):
+        token = auth[len("Bearer "):]
+    else:
+        token = request.cookies.get(REFRESH_COOKIE, "")
+    if not token:
         raise HTTPException(401, "Missing token")
-    token = auth[len("Bearer "):]
     result = await refresh_access_token(token)
-    return {
-        "access_token": result["access_token"],
-        "refresh_token": result["refresh_token"],
+    cookie_mode = is_console_cookie_request(request)
+    response = JSONResponse({
+        "access_token": "" if cookie_mode else result["access_token"],
+        "refresh_token": "" if cookie_mode else result["refresh_token"],
         "token_type": "bearer",
-    }
+        "cookie_auth": cookie_mode,
+    })
+    return set_console_cookies(response, result, request)
 
 
 @router.post("/api/logout")
@@ -136,10 +214,17 @@ async def logout(request: Request):
     """登出：撤销 refresh token（其 jti 进黑名单）
     显式校验格式（P0 #11：格式错误返回 401，杜绝"无效成功"）"""
     auth = request.headers.get("Authorization", "")
-    if not auth or not auth.startswith("Bearer "):
+    if auth.startswith("Bearer "):
+        token = auth[len("Bearer "):]
+    else:
+        token = request.cookies.get(REFRESH_COOKIE, "")
+    if not token:
         raise HTTPException(401, "Invalid token format")
-    await revoke_refresh_token(auth[len("Bearer "):])
-    return {"success": True}
+    revoked = await revoke_refresh_token(token)
+    # revoked=False 含"token 本就无效"（幂等成功）与"Redis 异常未落地"（服务端已
+    # warning），字段透出供前端在异常场景提示（2026-09-10 审查 P2 假登出修复）
+    response = JSONResponse({"success": True, "revoked": revoked})
+    return clear_console_cookies(response)
 
 
 @router.post("/api/user/change-password")
@@ -155,22 +240,26 @@ async def change_password(payload: ChangePasswordRequest, current_user: dict = D
     user = await authenticate_user(username, old_password)
     if not user:
         raise HTTPException(400, "旧密码不正确")
-    new_hashed = hash_password(new_password)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET hashed_password=$1 WHERE username=$2",
-            new_hashed, username
-        )
     # 改密吊销存量会话（2026-09-07 审查 P2）：记录改密时刻，refresh 流程发现
     # token 签发早于该时刻即拒绝——旧 refresh token 最长 30 天有效的窗口被关闭
     import time
     from ..core.redis import get_redis
     from ..core.config import REFRESH_TOKEN_EXPIRE_DAYS
     r = await get_redis()
-    await r.set(
-        f"auth:pwd_changed:{username}", str(int(time.time())),
-        ex=REFRESH_TOKEN_EXPIRE_DAYS * 86400,
-    )
+    try:
+        await r.set(
+            f"auth:pwd_changed:{username}", str(int(time.time())),
+            ex=REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+        )
+    except Exception as e:
+        logger.error(f"改密吊销标记写入失败，拒绝改密: {e}")
+        raise HTTPException(503, "认证状态暂不可用，请稍后重试")
+    new_hashed = hash_password(new_password)
+    pool = await get_pool()
+    async with pool.acquire(timeout=5) as conn:
+        await conn.execute(
+            "UPDATE users SET hashed_password=$1 WHERE username=$2",
+            new_hashed, username
+        )
     logger.info(f"密码已修改: username={username}")
     return {"message": "密码修改成功"}

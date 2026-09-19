@@ -32,16 +32,22 @@ async def audit_logs(user_id: str = Query("", description="按用户过滤"),
 async def list_tenants(_: dict = Depends(_require_admin)):
     """租户列表：用户数 / 对话数 / 消费额（按租户聚合）"""
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=5) as conn:
         rows = await conn.fetch("""
             SELECT t.id, t.name, t.created_at,
                    COUNT(DISTINCT u.username) AS user_count,
                    COUNT(DISTINCT cm.id)      AS msg_count,
-                   COALESCE(SUM(w.total_spent), 0) AS total_spent
+                   COALESCE(SUM(spent.per_user), 0) AS total_spent
             FROM tenants t
             LEFT JOIN users u ON u.tenant_id = t.id
             LEFT JOIN conversation_memories cm ON cm.user_id = u.username
-            LEFT JOIN user_wallets w ON w.user_id = u.username
+            LEFT JOIN LATERAL (
+                -- 2026-09-12 修复（外部复核 P1）：消息×钱包多对多 JOIN 会让
+                -- SUM(total_spent) 按消息行数重复累加。先按用户聚合消息数，
+                -- 钱包经 LATERAL 每用户只取一次，再对"每用户单值"求和
+                SELECT w.total_spent AS per_user
+                FROM user_wallets w WHERE w.user_id = u.username
+            ) spent ON TRUE
             GROUP BY t.id ORDER BY t.id
         """)
         return {"tenants": [
@@ -56,7 +62,7 @@ async def list_tenants(_: dict = Depends(_require_admin)):
 async def tenant_members(tenant_id: int, _: dict = Depends(_require_admin)):
     """租户成员列表"""
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=5) as conn:
         rows = await conn.fetch("""
             SELECT username, phone, display_name, role, created_at
             FROM users WHERE tenant_id = $1 ORDER BY created_at
@@ -72,7 +78,7 @@ async def tenant_members(tenant_id: int, _: dict = Depends(_require_admin)):
 async def tenant_stats(tenant_id: int, _: dict = Depends(_require_admin)):
     """租户聚合报表：对话量 / 消费 / 活跃度（按天）"""
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=5) as conn:
         info = await conn.fetchrow("SELECT name FROM tenants WHERE id = $1", tenant_id)
         if not info:
             raise HTTPException(404, "租户不存在")

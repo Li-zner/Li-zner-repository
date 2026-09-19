@@ -17,6 +17,15 @@ logger = setup_logging()
 USER_INFO_CACHE_PREFIX = "user:info:"
 
 
+class QuotaDependencyError(Exception):
+    """试用额度依赖（数据库）故障——与"额度耗尽"必须区分（2026-09-14 审计 P1）。
+
+    原实现 DB 异常与额度耗尽共用 False，调用方一律映射 402"免费额度已用完"，
+    数据库故障被误报成业务额度问题。调用方捕获本异常应返回 503（fail-closed
+    语义不变：仍然拒绝请求，只是状态码如实反映"服务故障"而非"额度用尽"）。
+    """
+
+
 async def invalidate_user_cache(username: str) -> None:
     """失效 auth.get_cached_user 的用户信息缓存（TTL 5 分钟）
 
@@ -30,16 +39,6 @@ async def invalidate_user_cache(username: str) -> None:
         logger.debug(f"用户缓存失效失败（TTL 自愈）: {e}")
 
 
-def is_quota_exhausted(user: dict) -> bool:
-    """受限用户累计提问次数 >= 上限（admin 与非受限用户恒 False）
-
-    admin 账号（账密直登）不设试用限制，无论 quota_limited 状态如何。
-    """
-    if user.get("role") == "admin":
-        return False
-    return bool(user.get("quota_limited")) and (user.get("used_requests") or 0) >= GITHUB_QUESTION_LIMIT
-
-
 def remaining_questions(user: dict) -> int:
     """受限用户剩余可提问次数；非受限用户返回 -1（表示无限制，前端已约定，C6 保留该语义）"""
     if user.get("role") == "admin" or not user.get("quota_limited"):
@@ -51,7 +50,7 @@ async def inc_used_questions(username: str) -> None:
     """受限用户提问次数 +1（带上限条件原子自增，防并发超限）；失败不影响主流程"""
     try:
         pool = await get_pool()
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=5) as conn:
             # 原子：仅当未达上限时才自增，DB 层保证并发下不会超限（P0 #62）
             result = await conn.execute(
                 "UPDATE users SET used_requests = used_requests + 1, updated_at = CURRENT_TIMESTAMP "
@@ -65,3 +64,56 @@ async def inc_used_questions(username: str) -> None:
                 await invalidate_user_cache(username)
     except Exception as e:
         logger.warning(f"GitHub 试用额度累计失败（不影响对话）: {e}")
+
+
+async def reserve_used_questions(user: dict) -> bool:
+    """在调用 LLM 前原子预留一次试用额度。
+
+    与旧的“完成后 inc”不同，数据库条件更新在准入时执行，剩余 1 次额度时
+    并发请求只能有一个成功，断连也不会漏计。admin/非受限用户直接放行。
+    返回：True=已预留；False=额度耗尽（402）；DB 异常抛 QuotaDependencyError
+    （调用方映射 503，2026-09-14 审计 P1 三态化）。
+    """
+    if user.get("role") == "admin" or not user.get("quota_limited"):
+        return True
+    username = user["username"]
+    try:
+        pool = await get_pool()
+        async with pool.acquire(timeout=5) as conn:
+            row = await conn.fetchval(
+                "UPDATE users SET used_requests = used_requests + 1, "
+                "updated_at = CURRENT_TIMESTAMP "
+                "WHERE username = $1 AND quota_limited = TRUE AND role != 'admin' "
+                "AND used_requests < $2 RETURNING used_requests",
+                username, GITHUB_QUESTION_LIMIT,
+            )
+        if row is not None:
+            await invalidate_user_cache(username)
+            return True
+        return False
+    except QuotaDependencyError:
+        raise
+    except Exception as e:
+        logger.warning(f"试用额度预留失败（DB 故障，与额度耗尽区分）: {e}")
+        raise QuotaDependencyError(f"quota dependency unavailable: {type(e).__name__}") from e
+
+
+async def rollback_used_questions(username: str) -> None:
+    """归还一次已预留的试用额度（2026-09-12：槽位满 429 等未产出场景回滚）。
+
+    条件与 reserve_used_questions 对称；失败仅告警（下次预留以 DB 当前值为准，
+    不会放大额度）。
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire(timeout=5) as conn:
+            await conn.execute(
+                "UPDATE users SET used_requests = GREATEST(used_requests - 1, 0), "
+                "updated_at = CURRENT_TIMESTAMP "
+                "WHERE username = $1 AND quota_limited = TRUE AND role != 'admin' "
+                "AND used_requests > 0",
+                username,
+            )
+        await invalidate_user_cache(username)
+    except Exception as e:
+        logger.warning(f"试用额度回滚失败: {e}")

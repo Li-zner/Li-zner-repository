@@ -60,7 +60,6 @@ async def init_redis():
 
 async def get_redis():
     """获取 Redis 客户端（首次调用时自动初始化，双检锁防并发双初始化）"""
-    global redis_client
     if redis_client is None:
         async with _init_lock:
             if redis_client is None:

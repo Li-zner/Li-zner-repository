@@ -1,10 +1,12 @@
 import asyncio
-import json
-import os
 import httpx
-from ..core.redis import get_redis
 from ..core.logging import setup_logging
-from ..core.config import DEEPSEEK_MODEL, HTTP_TIMEOUT_MEDIUM, llm_endpoint
+from ..core.config import (
+    DEEPSEEK_MODEL,
+    HTTP_TIMEOUT_MEDIUM,
+    apply_llm_request_options,
+    llm_endpoint,
+)
 
 logger = setup_logging()
 
@@ -74,36 +76,40 @@ async def generate_summary(messages: list, max_tokens: int = 300, username: str 
 ---
 摘要：
 """
-    api_key = os.getenv("DEEPSEEK_API_KEY")
+    from ..services.chat_support import get_deepseek_key
+    api_key = await get_deepseek_key()
     if not api_key:
         return ""
 
     # 主力模型可能是 qwen（百炼端点），按模型名路由端点与密钥
     base_url, api_key = llm_endpoint(DEEPSEEK_MODEL, api_key)
     # 指数退避重试（最多 3 次）：超时/抖动/空响应都不再让摘要功能静默失效（P1/P2）
+    from ..core.concurrency import llm_semaphore
     for attempt in range(3):
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
-                resp = await client.post(
-                    f"{base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                    json={
-                        "model": DEEPSEEK_MODEL,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.3,
-                        "max_tokens": max_tokens
-                    }
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                # 计入计费（2026-09-09 主人拍板）：记忆压缩属用户请求触发的 LLM 消耗
-                _usage = data.get("usage") or {}
-                if username and (_usage.get("prompt_tokens") or _usage.get("completion_tokens")):
-                    from ..services.llm_streaming import record_token_usage
-                    record_token_usage(_usage, username, "")
-                summary = data["choices"][0]["message"]["content"].strip()
-                if summary:
-                    return summary
+            # 纳入全局 LLM 并发闸（2026-09-10 审查 P2 对齐 orchestrator 同修法）
+            async with llm_semaphore:
+                async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
+                    resp = await client.post(
+                        f"{base_url}/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json=apply_llm_request_options({
+                            "model": DEEPSEEK_MODEL,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.3,
+                            "max_tokens": max_tokens
+                        }, DEEPSEEK_MODEL)
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    # 计入计费（2026-09-09 主人拍板）：记忆压缩属用户请求触发的 LLM 消耗
+                    _usage = data.get("usage") or {}
+                    if username and (_usage.get("prompt_tokens") or _usage.get("completion_tokens")):
+                        from ..services.llm_streaming import record_token_usage
+                        record_token_usage(_usage, username, "")
+                    summary = data["choices"][0]["message"]["content"].strip()
+                    if summary:
+                        return summary
                 _err = "空摘要"
         except Exception as e:
             _err = str(e)[:120]

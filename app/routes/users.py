@@ -16,11 +16,11 @@ router = APIRouter()
 
 
 class RateMessageRequest(BaseModel):
-    """消息评分请求"""
+    """消息评分请求（文本字段限长：入库字段，防超长串滥用存储）"""
     rating: int = Field(..., ge=1, le=5)
-    session_id: str = ""
-    user_message: str = ""
-    assistant_message: str = ""
+    session_id: str = Field(default="", max_length=128)
+    user_message: str = Field(default="", max_length=4096)
+    assistant_message: str = Field(default="", max_length=4096)
 
 
 class SwitchPersonaRequest(BaseModel):
@@ -33,7 +33,7 @@ async def get_user_profile(current_user: dict = Depends(get_current_user)):
     """获取当前用户详细信息"""
     username = current_user["username"]
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=5) as conn:
         row = await conn.fetchrow(
             "SELECT username, phone, role, display_name, email, avatar_url, extra, "
             "quota_limited, used_requests, created_at "
@@ -72,7 +72,7 @@ async def rate_message(payload: RateMessageRequest, current_user: dict = Depends
     assistant_message = payload.assistant_message
     username = current_user["username"]
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=5) as conn:
         # 同一回复（同用户+会话+问题+回答）已评过分 → 拒绝重复评分
         # Bug #10 修复：预查只是快路径（友好提示）；真正防重靠唯一索引
         # uq_message_ratings_dedup 兜底，并发后到者命中唯一冲突，捕获后返回已有评分。
@@ -140,8 +140,12 @@ async def switch_persona(payload: SwitchPersonaRequest, current_user: dict = Dep
 
 @router.get("/api/stats")
 async def get_stats(current_user: dict = Depends(get_current_user)):
+    # 收敛 admin（2026-09-10 审查 P2）：全站统计（总请求量/成功率/模型分布/最近样本）
+    # 属运营信息面，多租户下不对普通用户开放（与 admin_errors 同口径）
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可访问")
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=5) as conn:
         # 聚合下推 PG（P2 #5：避免 Python 层拉全量算平均，浪费内存与 CPU）
         agg = await conn.fetchrow(
             "SELECT COUNT(*) as total, "

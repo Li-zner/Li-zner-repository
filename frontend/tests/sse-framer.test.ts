@@ -1,6 +1,6 @@
-/** SSE 分帧器单测：跨 chunk 半行攒帧 / [DONE] 忽略 / 非 data 行忽略 */
+/** SSE 分帧器单测：跨 chunk 半行攒帧 / [DONE] 哨兵 / 非 data 行与坏 JSON 忽略 */
 import { describe, expect, it, vi } from 'vitest'
-import { SseLineFramer, parseSseLine } from '../src/api/sse'
+import { SseLineFramer, SSE_DONE, parseSseLine } from '../src/api/sse'
 
 describe('parseSseLine', () => {
   it('解析 data: JSON 行', () => {
@@ -9,8 +9,8 @@ describe('parseSseLine', () => {
       content: '你好',
     })
   })
-  it('[DONE] 与空行返回 null', () => {
-    expect(parseSseLine('data: [DONE]')).toBeNull()
+  it('[DONE] 返回哨兵单例，与坏 JSON 的 null 可区分（截断检测依赖此语义）', () => {
+    expect(parseSseLine('data: [DONE]')).toBe(SSE_DONE)
     expect(parseSseLine('')).toBeNull()
   })
   it('非 data 行返回 null', () => {

@@ -8,7 +8,7 @@ export function changePassword(oldPassword: string, newPassword: string): Promis
 export interface RateResult {
   message: string
   rating: number
-  already_rated: boolean
+  already_rated?: boolean
 }
 
 export function rateMessage(payload: {

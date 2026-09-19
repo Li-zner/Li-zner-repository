@@ -7,35 +7,68 @@
 """
 import asyncio
 import json
-import re
+import time
 from datetime import datetime
 from typing import AsyncIterator, Dict, List, Tuple
 
 from ..core.config import TOOL_TIMEOUT
 from ..core.logging import setup_logging
 from ..core.constants import today_cn
-from ..core.persona_manager import get_persona_manager
+from ..core.persona_manager import get_persona_manager, is_civil_persona
 from ..core.place_extract import auto_tool_args
-from ..core.safety_filter import get_filter, sanitize_error_text
+from ..core.safety_filter import (
+    ContentStreamGuard, format_untrusted_tool_context, get_filter, sanitize_error_text,
+)
 from ..core.stream_utils import dispatch_tool, build_file_context, sse
 from .chat_stream_ctx import ChatStreamCtx, finalize_answer
-from .chat_support import lang_instruction, safe_format_prompt
+from .chat_support import (
+    display_safe_tool_result, hide_reasoning, lang_instruction, safe_format_prompt,
+)
+from .civil_grounding import (
+    civil_tool_result,
+    find_ungrounded_citations as _find_ungrounded_citations,
+    grounding_reply,
+    validate_civil_answer,
+)
 from .llm_streaming import answer_via_models, ensure_answer, apply_safety_filter
+from .rag_request_trace import mark_route, record_span
 
 logger = setup_logging()
 
 # 推荐通道仅旅游四工具参与（与原行为一致）
 RECOMMEND_TOUR_TOOLS = ("query_weather", "query_hotel", "query_route", "query_food")
 
-# 法条号形状（含"零"：第一千零七十七条；与 routing_table 的法条正则同一字符集）
-_ARTICLE_RE = re.compile(r"第[一二三四五六七八九十百千零0-9]+条")
+# 失败工具 → 用户可感知的板块名：注入话术点名缺失板块而非报数字（2026-09-10 实测：
+# "有4项未能获取"会被思考模型原样复述并困惑"不知道哪些未能获取"；板块名是用户
+# 可感知词，复述无害，也给了模型可行动信息）
+_MISSING_SECTION_ZH = {
+    "query_weather": "天气", "query_hotel": "住宿",
+    "query_route": "交通", "query_food": "美食",
+}
 
 
 def find_ungrounded_citations(answer: str, contexts: List[str]) -> List[str]:
-    """引用溯源校验：返回回答中出现、但在全部检索依据文本（heading+content）中
-    都找不到的条文号——幻觉引用候选。log-only 不阻断回答，供幻觉引用率统计。"""
-    corpus = "\n".join(contexts)
-    return sorted({a for a in _ARTICLE_RE.findall(answer) if a not in corpus})
+    """兼容旧调用点：引用溯源校验已下沉到 civil_grounding 共用实现。"""
+    return _find_ungrounded_citations(answer, contexts)
+
+
+def _record_ungrounded_citations(result_text: str, tool_result) -> None:
+    """记录检索回答中的无依据条文号；监测失败不影响回答主流程。"""
+    if not (isinstance(tool_result, dict) and tool_result.get("results")):
+        return
+    contexts = [
+        f"{item.get('heading', '')}\n{item.get('content', '')}"
+        for item in tool_result["results"]
+    ]
+    ungrounded = find_ungrounded_citations(result_text, contexts)
+    if ungrounded:
+        logger.warning(f"引用校验: 回答引用了检索依据之外的条文号: {ungrounded}")
+    try:
+        from .answer_trace import set_ungrounded_citations
+        set_ungrounded_citations(ungrounded)
+    except Exception:  # noqa: silent-except — 监测失败不影响回答
+        pass
+
 
 # 输出纪律（防泄漏，两通道共用）：错误/矛盾的工具数据曾诱发模型整段元推理并漏进正文
 # （线上案例：注入出发地天气+error 后，模型在正文里纠结"为什么查的是广州"）
@@ -59,9 +92,6 @@ def build_simple_tool_args(agent_name: str, ctx: ChatStreamCtx) -> Tuple[Dict, s
         q = ctx.civ_civil_mapped_query or ctx.user_query
         logger.info(f"search_knowledge 查询: {q[:80]}... (原: {ctx.user_query[:30]}...)")
         return {"query": q}, "正在查询知识库..."
-    if agent_name == "search_project_knowledge":
-        logger.info(f"search_project_knowledge 查询: {ctx.user_query[:80]}...")
-        return {"query": ctx.user_query}, "正在查询项目知识库..."
     args = auto_tool_args(agent_name, ctx.user_query)
     if agent_name == "query_weather":
         return args, f"正在查询 {args.get('city', '')} 天气..."
@@ -85,7 +115,7 @@ def _fast_system_base(ctx: ChatStreamCtx) -> str:
         if _persona else f"你是AI助手。今天是{_today_str}。"
     )
     _system += ctx.lang_instr
-    if ctx.persona_id == "civil_code":
+    if is_civil_persona(ctx.persona_id):
         _system += (
             f"\n\n### 路由裁决：此问题已被确认为民法典问题\n"
             f"即使该问题也涉及其他法律领域，你**必须**先回答《民法典》中的相关规定（引用具体法条），\n"
@@ -93,6 +123,15 @@ def _fast_system_base(ctx: ChatStreamCtx) -> str:
             f"这是最高优先级指令。"
         )
     return _system
+
+
+def _messages_for_fast_path(ctx: ChatStreamCtx, system_content: str) -> list:
+    """复用共享历史：替换 system，保留文件上下文/历史，再追加当前问题。"""
+    messages = [{"role": "system", "content": system_content}]
+    if ctx.messages:
+        messages.extend(ctx.messages[1:])
+    messages.append({"role": "user", "content": ctx.user_query})
+    return messages
 
 
 async def _build_fast_system(ctx: ChatStreamCtx, agent_name: str, tool_result) -> str:
@@ -114,17 +153,20 @@ async def _build_fast_system(ctx: ChatStreamCtx, agent_name: str, tool_result) -
                 f"1. **禁止编造**：只能基于工具返回的数据回答，不能编造任何具体数据\n"
                 f"2. **先推荐再追问**：如果用户是求推荐，第一句就直接给推荐方案\n"
             )
-            if ctx.persona_id == "civil_code":
-                # 法条类规则仅对民法典人格有意义，注入旅游/求职答案只会造成干扰
+            if is_civil_persona(ctx.persona_id):
+                # 法条类规则仅对民法典人格有意义，注入旅游答案只会造成干扰
                 _system += (
-                    f"3. **交叉领域**（如果问题同时涉及民法典和其他法律）：先回答民法典部分，再简要提及其他法律\n"
-                    f"4. **禁止「让我先查询」**：第一句话必须是法条引用或直接答案\n"
+                    f"3. **只答最相关依据**：从检索结果中选择与用户问题最直接相关的一条或少数法条，"
+                    f"不得为了面面俱到而堆砌全部相关法条或章节\n"
+                    f"4. **仅限民法典依据**：不得使用模型自身知识、常识、联网信息或其他法律条文补全回答；"
+                    f"检索结果不足时明确说明无法依据知识库回答\n"
+                    f"5. **禁止「让我先查询」**：第一句话必须是法条引用或直接答案\n"
                 )
             _system += (
                 f"3. **输出纪律**：直接输出给用户看的正式回答；禁止内心独白、自我质疑、"
                 f"对数据的元评论，禁止出现工具名、JSON 键名等内部细节；"
                 f"数据与用户问的目的地不符时忽略该数据\n"
-                f"\n工具返回的数据：\n{json.dumps(tool_result, ensure_ascii=False, indent=2)}"
+                f"\n工具返回的数据：\n{format_untrusted_tool_context(tool_result)}"
             )
             if agent_name == "search_knowledge":
                 # 引用溯源：条文号绑定检索结果，末尾输出依据清单（配合 find_ungrounded_citations 校验）
@@ -132,21 +174,20 @@ async def _build_fast_system(ctx: ChatStreamCtx, agent_name: str, tool_result) -
                     "\n### 引用溯源要求\n"
                     "1. 引用法条时，条文号必须取自上面检索结果中的条文号\n"
                     "2. 回答末尾另起一行，以「依据:」开头，列出本次回答实际引用的条文号\n"
-                    "3. 禁止引用检索结果中不存在的条文号；检索结果未覆盖的部分注明「基于一般法律知识」"
+                    "3. 禁止引用检索结果中不存在的条文号\n"
+                    "4. 只回答与问题最直接相关的法条，不要求覆盖所有关联法条"
                 )
         else:
-            if ctx.persona_id == "civil_code":
-                # 民法典人格的无数据分支保留法条引导（原全 agent 共用，对旅游/求职是干扰）
+            if is_civil_persona(ctx.persona_id):
+                # 民法典人格零召回分支：只允许确定性拒答，不得靠模型知识补全。
                 _system += (
                     f"\n\n工具 [{agent_name}] 未找到相关知识库中的对应内容。\n"
                     f"## 规则（最高优先级）\n"
-                    f"1. **直接回答用户的问题**，基于你自己的法律知识\n"
-                    f"2. **第一句话就必须是法条引用或直接答案**，禁止任何铺垫\n"
-                    f"3. **绝对禁止**说「让我先查询」「我来查一下」「请稍等」「正在查询」等任何等待语\n"
-                    f"4. 引用法条时注明具体条、款、项，并说明这是基于你的法律知识\n"
-                    f"5. 如果不确定某一具体法条编号，可以说明「根据民法典相关规定」\n"
-                    f"6. 提示用户：回答仅供参考，不构成正式法律意见\n"
-                    f"7. **如果问题涉及多个法律领域**（如同时涉及民法典和治安管理处罚法），先回答民法典部分，再简要提及其他法律"
+                    f"1. **第一句话明确告知**：知识库中未检索到与该问题直接对应的条文\n"
+                    f"2. **不得提供法律结论**：不得使用自身知识、一般法律常识、联网信息或其他法律条文补全\n"
+                    f"3. **禁止引用任何条文号**（如「第X条」）\n"
+                    f"4. **绝对禁止**说「让我先查询」「我来查一下」「请稍等」「正在查询」等任何等待语\n"
+                    f"5. 只提示用户补充事实或换一种问法后重试"
                 )
             else:
                 _system += (
@@ -160,10 +201,84 @@ async def _build_fast_system(ctx: ChatStreamCtx, agent_name: str, tool_result) -
     return _system
 
 
+async def _finish_simple_terminal(ctx: ChatStreamCtx, text: str,
+                                  write_cache: bool = False) -> AsyncIterator[str]:
+    """输出并收尾快速通道结果，供民法典确定性兜底复用。"""
+    yield sse("answer_chunk", text)
+    yield sse("answer_complete", text) + "data: [DONE]\n\n"
+    await finalize_answer(ctx, text, write_cache=write_cache)
+    ctx.saved_normally = True
+    ctx.finished = True
+
+
+def _civil_stop_message(ctx: ChatStreamCtx, agent_name: str, tool_result) -> str | None:
+    """民法典快速通道的零召回/跨法域收口文案；非民法典返回 None。"""
+    if not is_civil_persona(ctx.persona_id) or agent_name != "search_knowledge":
+        return None
+    if isinstance(tool_result, dict) and tool_result.get("mapping_hit"):
+        return tool_result.get("message") or grounding_reply("no_evidence", ctx.req.lang)
+    if civil_tool_result(tool_result) is None:
+        return grounding_reply("no_evidence", ctx.req.lang)
+    return None
+
+
+async def _stream_fast_model(ctx: ChatStreamCtx, messages: list,
+                             civil_buffer: bool, state: dict) -> AsyncIterator[str]:
+    """消费快速通道模型流；民法典缓冲到校验后再外发，其他人格保持实时流。"""
+    sf = get_filter()
+    guard = ContentStreamGuard(sf)
+    state.update({"text": "", "generated": False, "interrupted": False})
+    started = time.perf_counter()
+    reasoning_chars = 0
+    async for kind, text in answer_via_models(ctx, messages, "简单任务"):
+        if kind == "reasoning":
+            reasoning_chars += len(text or "")
+            # 思考外发门禁与 ReAct 路径同口径（2026-09-19 审查 chat P2-2）：
+            # 指标照常计数，只拦外发
+            if not hide_reasoning(ctx.persona_id, ctx.persona) and text:
+                yield sse("reasoning_chunk", text)
+        elif kind == "answer":
+            piece, blocked = guard.feed(text)
+            if blocked:
+                state["text"] += sf.safe_message
+                state["interrupted"] = True
+                yield sse("answer_chunk", sf.safe_message)
+                break
+            if piece:
+                state["generated"] = True
+                state["text"] += piece
+                if not civil_buffer:
+                    yield sse("answer_chunk", piece)
+    if not state["interrupted"]:
+        tail, tail_blocked = guard.flush()
+        if tail_blocked:
+            state["text"] = sf.safe_message
+            state["interrupted"] = True
+            yield sse("answer_chunk", sf.safe_message)
+        elif tail:
+            state["generated"] = True
+            state["text"] += tail
+            if not civil_buffer:
+                yield sse("answer_chunk", tail)
+    state["sf"] = sf
+    record_span(
+        "generation",
+        latency_ms=round((time.perf_counter() - started) * 1000),
+        attributes={
+            # 与下方 getattr(ctx, "username", "") 同口径：ctx 由调用方构造，
+            # 缺字段只影响埋点标签，不该打断快速通道（2026-09-16）。
+            "model": getattr(ctx, "selected_model", ""),
+            "reasoning_chars": reasoning_chars,
+            "answer_chars": len(state["text"]),
+        },
+    )
+
+
 async def simple_fast_path(ctx: ChatStreamCtx) -> AsyncIterator[str]:
     """单 Agent 或纯 LLM：直接执行工具(如有) + 单次 LLM 格式化"""
     is_pure_chat = len(ctx.matched_agents) == 0
     agent_name = ctx.matched_agents[0] if not is_pure_chat else "chat"
+    mark_route("simple_fast_path")
     logger.info(f"简单任务快速通道: agent={agent_name}")
     yield sse("thought", '正在查询相关信息...' if not is_pure_chat else '正在思考...')
     try:
@@ -172,48 +287,62 @@ async def simple_fast_path(ctx: ChatStreamCtx) -> AsyncIterator[str]:
         if not is_pure_chat:
             args, _status = build_simple_tool_args(agent_name, ctx)
             yield sse("reasoning_chunk", _status)
-            tool_result = await dispatch_tool(agent_name, args, ctx.user_query, ctx.user_perms, getattr(ctx, "username", ""))
+            tool_result = await dispatch_tool(
+                agent_name, args, ctx.user_query, ctx.user_perms,
+                getattr(ctx, "username", ""), persona_id=ctx.persona_id,
+            )
             if agent_name == "search_knowledge":
                 from ..core.audit import audit
                 await audit(ctx.username, "kb_search", {"query": ctx.user_query[:200]})
             yield f"data: {json.dumps({'type': 'reasoning_done'})}\n\n"
             yield f"data: {json.dumps({'type': 'tool_call', 'name': agent_name, 'args': args})}\n\n"
-            yield f"data: {json.dumps({'type': 'tool_result', 'index': 0, 'result': tool_result})}\n\n"
+            yield f"data: {json.dumps({'type': 'tool_result', 'index': 0, 'result': display_safe_tool_result(tool_result)})}\n\n"
 
-        _system_fast = await _build_fast_system(ctx, agent_name, tool_result)
-        result_text = ""
-        _sf = get_filter()
-        async for kind, text in answer_via_models(ctx, [{"role": "system", "content": _system_fast},
-                                                         {"role": "user", "content": ctx.user_query}], "简单任务"):
-            if kind == "reasoning":
-                yield sse("reasoning_chunk", text)
-            elif kind == "answer":
-                # 逐块 DFA 过滤：answer_chunk 已实时发出，事后过滤拦不回（与 ReAct 路径同标准）
-                _chk = _sf.check_stream(text)
-                if not _chk["safe"]:
-                    result_text += _sf.safe_message
-                    yield sse("answer_chunk", _sf.safe_message)
-                    break
-                result_text += text
-                yield sse("answer_chunk", text)
+        civil_buffer = is_civil_persona(ctx.persona_id) and agent_name == "search_knowledge"
+        stop_message = _civil_stop_message(ctx, agent_name, tool_result)
+        if stop_message:
+            async for event in _finish_simple_terminal(ctx, stop_message):
+                yield event
+            return
 
-        result_text = await ensure_answer(ctx, result_text,
-            f"简单任务快速通道未返回有效回复: agent={agent_name}, models={ctx.model_try_list}")
+        system_fast = await _build_fast_system(ctx, agent_name, tool_result)
+        state = {}
+        messages = _messages_for_fast_path(ctx, system_fast)
+        async for event in _stream_fast_model(ctx, messages, civil_buffer, state):
+            yield event
+        result_text = state["text"]
+        civil_grounded = True
+        if civil_buffer and not state["interrupted"]:
+            if not result_text:
+                result_text = grounding_reply("service_error", ctx.req.lang)
+                civil_grounded = False
+            else:
+                civil_grounded, _ = validate_civil_answer(result_text, tool_result)
+                if not civil_grounded:
+                    result_text = grounding_reply("ungrounded", ctx.req.lang)
+            yield sse("answer_chunk", result_text)
+        else:
+            result_text = await ensure_answer(ctx, result_text,
+                f"简单任务快速通道未返回有效回复: agent={agent_name}, models={ctx.model_try_list}")
+
+        cache_allowed = state["generated"] and not state["interrupted"] and civil_grounded
+        if state["sf"].contains_sensitive(result_text):
+            cache_allowed = False
         result_text = apply_safety_filter(result_text)
-        if agent_name == "search_knowledge" and isinstance(tool_result, dict) and tool_result.get("results"):
-            # 幻觉引用校验（log-only）：不阻断回答，warning 进日志供幻觉引用率统计
-            _contexts = [f"{r.get('heading', '')}\n{r.get('content', '')}" for r in tool_result["results"]]
-            _ungrounded = find_ungrounded_citations(result_text, _contexts)
-            if _ungrounded:
-                logger.warning(f"引用校验: 回答引用了检索依据之外的条文号: {_ungrounded}")
+        if agent_name == "search_knowledge":
+            _record_ungrounded_citations(result_text, tool_result)
         yield sse("answer_complete", result_text) + "data: [DONE]\n\n"
-
-        await finalize_answer(ctx, result_text)
+        await finalize_answer(ctx, result_text, write_cache=cache_allowed)
         ctx.saved_normally = True
         ctx.finished = True
         logger.info(f"简单任务快速通道完成: agent={agent_name}")
-        return
     except Exception as fast_err:
+        if is_civil_persona(ctx.persona_id):
+            logger.warning(f"民法典快速通道失败，禁止通用知识降级: {fast_err}")
+            async for event in _finish_simple_terminal(
+                    ctx, grounding_reply("service_error", ctx.req.lang)):
+                yield event
+            return
         logger.warning(f"简单任务快速通道失败，降级到流式模式: {fast_err}")
         # 降级：继续走流式 ReAct 循环（不置 finished，主编排接续）
 
@@ -223,19 +352,23 @@ async def _run_recommend_tools(ctx: ChatStreamCtx, tool_results: List[Tuple[str,
     async def _run_one(agent: str) -> tuple:
         """执行单个工具；异常归一为 {error} 并带回 agent 名（供结果归位）"""
         try:
-            res = await dispatch_tool(agent, {}, ctx.user_query, None, getattr(ctx, "username", ""))
+            res = await dispatch_tool(
+                agent, {}, ctx.user_query, None, getattr(ctx, "username", ""))
         except Exception as te:
             res = {"error": sanitize_error_text(str(te))}
         return agent, res
 
     touring = [a for a in ctx.matched_agents if a in RECOMMEND_TOUR_TOOLS]
-    tasks = [asyncio.create_task(_run_one(agent)) for agent in touring]
+    # spawn 持强引用（2026-09-14 逐行审查补）：裸 create_task 在生成器被早闭
+    # （客户端断连触发 GeneratorExit）时局部 tasks 引用随帧销毁，在途任务成孤儿
+    from ..core.concurrency import spawn
+    tasks = [spawn(_run_one(agent), name=f"recommend:{agent}") for agent in touring]
     try:
         for done in asyncio.as_completed(tasks, timeout=TOOL_TIMEOUT):
             name, res = await done
             tool_results.append((name, res))
             yield f"data: {json.dumps({'type': 'tool_call', 'name': name, 'args': {}})}\n\n"
-            yield f"data: {json.dumps({'type': 'tool_result', 'index': 0, 'result': res})}\n\n"
+            yield f"data: {json.dumps({'type': 'tool_result', 'index': 0, 'result': display_safe_tool_result(res)})}\n\n"
     except TimeoutError:
         for t in tasks:
             if not t.done():
@@ -249,6 +382,7 @@ async def _run_recommend_tools(ctx: ChatStreamCtx, tool_results: List[Tuple[str,
 
 async def recommend_fast_path(ctx: ChatStreamCtx) -> AsyncIterator[str]:
     """推荐/多 Agent：已知意图 → 直接并行执行所有工具 → 单次 LLM 格式化"""
+    mark_route("recommend_fast_path")
     logger.info(f"推荐/多Agent快速通道: agents={ctx.matched_agents}")
     yield sse("thought", '正在查询多个信息，请稍候...')
     try:
@@ -261,40 +395,64 @@ async def recommend_fast_path(ctx: ChatStreamCtx) -> AsyncIterator[str]:
         if _fc:
             _sys += "\n\n" + _fc
         # 错误结果不进 prompt：模型无法利用错误数据，反而会对着它元推理（把
-        # "为什么是错误数据"的纠结漏进正文）；只统计失败数量做一句兜底说明
+        # "为什么是错误数据"的纠结漏进正文）；只点名缺失板块做一句中性说明
         ok_results = [(n, r) for n, r in tool_results if not (isinstance(r, dict) and r.get("error"))]
-        failed_cnt = len(tool_results) - len(ok_results)
         _sys += "\n\n以下是已查询到的实时数据，请整合成一份完整、自然、连贯的回答给用户。不要提及「专家」「查询工具」等词。\n\n"
         for name, res in ok_results:
-            _sys += f"--- {name} ---\n{json.dumps(res, ensure_ascii=False, indent=2)}\n\n"
-        if failed_cnt:
+            _sys += f"--- {name} ---\n{format_untrusted_tool_context(res)}\n\n"
+        missing = [n for n, r in tool_results if isinstance(r, dict) and r.get("error")]
+        if missing:
+            _missing_zh = "、".join(_MISSING_SECTION_ZH.get(n, n) for n in missing)
             _sys += (
-                f"注意：有{failed_cnt}项实时数据本次未能获取，相关部分请基于你的知识给出建议，"
-                f"禁止编造具体实时数字，也不要向用户提到查询失败或技术故障。\n\n"
+                f"以下部分本次没有查询到数据：{_missing_zh}。"
+                f"相关部分请基于你自己的知识给出建议，不要编造具体实时数字。\n\n"
             )
         _sys += _ANSWER_DISCIPLINE
 
         result_text = ""
         _sf = get_filter()
-        async for kind, text in answer_via_models(ctx, [{"role": "system", "content": _sys},
-                                                         {"role": "user", "content": ctx.user_query}], "多Agent"):
+        _content_guard = ContentStreamGuard(_sf)
+        _stream_interrupted = False
+        _stream_generated = False
+        _messages = _messages_for_fast_path(ctx, _sys)
+        async for kind, text in answer_via_models(ctx, _messages, "多Agent"):
             if kind == "reasoning":
-                yield sse("reasoning_chunk", text)
+                # 与 ReAct 路径同口径的思考外发门禁（2026-09-19 审查 chat P2-2）
+                if not hide_reasoning(ctx.persona_id, ctx.persona) and text:
+                    yield sse("reasoning_chunk", text)
             elif kind == "answer":
-                _chk = _sf.check_stream(text)
-                if not _chk["safe"]:
+                # 跨块缓冲（2026-09-10 审查 P2）：拦被块边界切开的敏感词
+                _piece, _blocked = _content_guard.feed(text)
+                if _blocked:
                     result_text += _sf.safe_message
                     yield sse("answer_chunk", _sf.safe_message)
+                    _stream_interrupted = True
                     break
-                result_text += text
-                yield sse("answer_chunk", text)
+                if _piece:
+                    _stream_generated = True
+                    result_text += _piece
+                    yield sse("answer_chunk", _piece)
+        if not _stream_interrupted:
+            _tail, _tail_blocked = _content_guard.flush()
+            if _tail_blocked:
+                _stream_interrupted = True
+                result_text = _sf.safe_message
+                yield sse("answer_chunk", _sf.safe_message)
+            elif _tail:
+                _stream_generated = True
+                result_text += _tail
+                yield sse("answer_chunk", _tail)
 
         result_text = await ensure_answer(ctx, result_text,
             f"多Agent快速通道未返回有效回复: agents={ctx.matched_agents}, models={ctx.model_try_list}")
+        _cache_allowed = _stream_generated and not _stream_interrupted
+        if _sf.contains_sensitive(result_text):
+            _cache_allowed = False
         result_text = apply_safety_filter(result_text)
         yield sse("answer_complete", result_text) + "data: [DONE]\n\n"
 
-        await finalize_answer(ctx, result_text)
+        # 同上：DFA 拦截过的产物不入语义缓存（2026-09-11 规则审查 P1）
+        await finalize_answer(ctx, result_text, write_cache=_cache_allowed)
         ctx.saved_normally = True
         ctx.finished = True
         logger.info(f"多Agent快速通道完成: {len(tool_results)}个工具")

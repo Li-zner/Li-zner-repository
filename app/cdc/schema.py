@@ -42,3 +42,32 @@ async def ensure_schema(conn: asyncpg.Connection):
         )
         if not trig:
             raise RuntimeError(f"CDC 触发器 trg_cdc_{table} 不存在！请先执行数据库迁移：alembic upgrade head")
+
+    # 2026-09-14 修复（cdc 日志 09-11 P1）：消费顺序是 (txid,id)，旧 schema 缺
+    # txid 列 / 分区结构不对 / 触发器函数未带 txid 采集时，消费会静默漏事件——
+    # 启动校验必须覆盖这三处，旧 schema fail loudly 指向迁移。
+    txid_col = await conn.fetchval(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = 'cdc_events' AND column_name = 'txid'"
+    )
+    if not txid_col:
+        raise RuntimeError(
+            "cdc_events.txid 列不存在（旧 schema）！消费游标是 (txid,id)，"
+            "缺列会漏事件。请执行：alembic upgrade head")
+    partstrat = await conn.fetchval(
+        "SELECT partstrat FROM pg_partitioned_table WHERE partrelid = 'cdc_events'::regclass"
+    )
+    # asyncpg 将 PostgreSQL 内部 "char" 类型返回为 bytes，先归一化再比较。
+    if isinstance(partstrat, bytes):
+        partstrat = partstrat.decode()
+    if partstrat != "r":  # 'r' = RANGE（b1c2d3e4f5a6 按月 RANGE 分区）
+        raise RuntimeError(
+            "cdc_events 不是 RANGE 分区表（旧 schema）！过期分区清理依赖分区结构，"
+            "请执行：alembic upgrade head")
+    func_src = await conn.fetchval(
+        "SELECT pg_get_functiondef('cdc_capture()'::regprocedure)"
+    )
+    if func_src is None or "txid_current" not in func_src:
+        raise RuntimeError(
+            "cdc_capture 函数版本过旧（未采集 txid）！消费游标是 (txid,id)，"
+            "旧函数产出的事件无法入游标序。请执行：alembic upgrade head")

@@ -26,7 +26,7 @@ async def check_once(threshold_ms: int = _DEFAULT_THRESHOLD_MS):
         return
     pool = await get_pool()
     try:
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=5) as conn:
             row = await conn.fetchrow(
                 """
                 SELECT count(*) FILTER (WHERE mean_exec_time > $1) AS cnt,

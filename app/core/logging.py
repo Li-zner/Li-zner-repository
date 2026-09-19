@@ -33,6 +33,11 @@ def _get_trace_id():
     return None
 
 
+def get_trace_id() -> str:
+    """返回当前日志上下文中的 trace_id，供监测模块关联 Tempo。"""
+    return _get_trace_id() or ""
+
+
 class JsonFormatter(logging.Formatter):
     def format(self, record):
         log_entry = {
@@ -56,6 +61,10 @@ _configured = False
 def setup_logging():
     global _configured
     logger = logging.getLogger()
+    # 第三方 HTTP 客户端在 INFO 级会打印完整 URL；高德等接口把 Key 放在 query，
+    # 必须压到 WARNING，防止密钥随日志持久化。
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     # 幂等守卫（P3 修复）：原先每次调用清空重加 root handlers，30 个模块 import 时
     # 反复重置，且会误伤其他模块自定义的 handler
     if _configured and logger.handlers:

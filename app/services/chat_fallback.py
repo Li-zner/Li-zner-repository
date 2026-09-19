@@ -16,8 +16,11 @@ from ..core.config import (
 from ..core.concurrency import llm_semaphore
 from ..core.jfast import loads as jloads
 from ..core.logging import setup_logging
+from ..core.persona_manager import is_civil_persona
+from ..core.safety_filter import ContentStreamGuard, get_filter
 from ..core.semantic_cache import SemanticCache
 from ..core.stream_utils import sse
+from .civil_grounding import grounding_reply
 from .chat_support import get_deepseek_key, lang_instruction, mark_key_result
 
 logger = setup_logging()
@@ -25,6 +28,8 @@ logger = setup_logging()
 
 async def fallback_flash(req: ChatRequest, username: str) -> AsyncIterator[str]:
     """第一级降级：使用 DeepSeek Flash（无工具调用，纯聊天）"""
+    if is_civil_persona(getattr(req, "persona_id", "")):
+        return
     from ..core.metrics import gateway_errors_total
     gateway_errors_total.labels(status='fallback_flash').inc()
     logger.info(f"触发 Flash 降级: username={username}")
@@ -47,8 +52,50 @@ async def fallback_flash(req: ChatRequest, username: str) -> AsyncIterator[str]:
         # 未产出任何内容：静默返回，交 fallback_chain 空流兜底（answer_complete+[DONE]）
 
 
+def _flash_payload(req: ChatRequest, username: str) -> dict:
+    """构造 Flash 降级请求体（2026-09-11 拆出自 _flash_sse，满足 80 行函数门禁）"""
+    return {
+        "model": DEEPSEEK_FLASH_MODEL,
+        "messages": [
+            {"role": "system", "content": "你是AI助手，请直接回答用户的问题。如果涉及法律问题，回答相关法律规定；如果无法查询知识库，请如实说明暂无法核实依据，不要编造具体条文号。" + lang_instruction(req)},
+            {"role": "user", "content": req.query}
+        ],
+        "user": username,
+        "stream": True,
+        "stream_options": {"include_usage": True},  # 2026-09-09 审查 P1：降级链补计量
+        "temperature": 0.3,
+        "max_tokens": 2048,
+    }
+
+
+async def _bill_intercepted(_usage, username: str, full_text: str,
+                            record_token_usage, _estimate_tokens) -> None:
+    """DFA 拦截 return 前计费（2026-09-11 P1）：token 已真实消耗。
+    usage 尾块未到时按已产出文本估算（与断连口径一致）。拆出以满足 80 行门禁。"""
+    if _usage:
+        record_token_usage(_usage, username, "")
+    elif username and full_text:
+        est = _estimate_tokens(full_text)
+        record_token_usage(
+            {"prompt_tokens": 0, "completion_tokens": est},
+            username, "",
+            remark=f"DFA拦截估算计费（Flash降级 {est} tokens）")
+
+
+def _parse_flash_chunk(data_str: str, guard: ContentStreamGuard) -> tuple:
+    """解析一条 Flash SSE 数据，返回用量、原始块、安全块和拦截状态。"""
+    data = jloads(data_str)
+    usage = data.get("usage")
+    choices = data.get("choices") or [{}]
+    chunk = choices[0].get("delta", {}).get("content", "")
+    if not chunk:
+        return usage, "", "", False
+    piece, blocked = guard.feed(chunk)
+    return usage, chunk, piece, blocked
+
+
 async def _flash_sse(req: ChatRequest, username: str, deepseek_api_key: str) -> AsyncIterator[str]:
-    """Flash SSE 消费主体：逐块 DFA 过滤 + 流尾终检 + include_usage 计量（异常向上传播）"""
+    """Flash SSE 消费主体：跨块 DFA 守卫 + include_usage 计量（异常向上传播）。"""
     from .llm_streaming import _estimate_tokens, record_token_usage
     async with llm_semaphore:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
@@ -56,24 +103,14 @@ async def _flash_sse(req: ChatRequest, username: str, deepseek_api_key: str) -> 
                 "POST",
                 f"{DEEPSEEK_API_BASE}/chat/completions",
                 headers={"Authorization": f"Bearer {deepseek_api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": DEEPSEEK_FLASH_MODEL,
-                    "messages": [
-                        {"role": "system", "content": "你是AI助手，请直接回答用户的问题。如果涉及法律问题，回答相关法律规定。如果无法查询知识库，请用已有知识回答。" + lang_instruction(req)},
-                        {"role": "user", "content": req.query}
-                    ],
-                    "user": username,
-                    "stream": True,
-                    "stream_options": {"include_usage": True},  # 2026-09-09 审查 P1：降级链补计量
-                    "temperature": 0.3,
-                    "max_tokens": 2048,
-                }
+                json=_flash_payload(req, username),
             ) as resp:
                 resp.raise_for_status()
                 await mark_key_result(deepseek_api_key, True)
-                from ..core.safety_filter import get_filter
                 sf = get_filter()
-                _full_text = ""  # 全文累积，流尾终检跨块拼接（2026-09-07 审查 P2）
+                _guard = ContentStreamGuard(sf)
+                _full_text = ""  # 原始全文，供拦截计费估算
+                _safe_text = ""  # 实际外发全文，供 answer_complete 收口
                 _usage = None    # include_usage 尾块携带的 token 用量（计量扣费用）
                 try:
                     async for line in resp.aiter_lines():
@@ -82,24 +119,25 @@ async def _flash_sse(req: ChatRequest, username: str, deepseek_api_key: str) -> 
                             if data_str == "[DONE]":
                                 break
                             try:
-                                data = jloads(data_str)
-                                # include_usage 尾块：usage 挂在 choices 为空的事件上，
-                                # choices 取值须容忍空数组（原写法 [{}][0] 会 IndexError）
-                                if data.get("usage"):
-                                    _usage = data["usage"]
-                                choices = data.get("choices") or [{}]
-                                chunk = choices[0].get("delta", {}).get("content", "")
+                                # include_usage 尾块 choices 为空，解析器已容忍空数组
+                                _new_usage, chunk, _piece, _blocked = _parse_flash_chunk(
+                                    data_str, _guard)
+                                if _new_usage:
+                                    _usage = _new_usage
                                 if chunk:
-                                    # ===== DFA 敏感词过滤（逐块）=====
                                     _full_text += chunk
-                                    result = sf.check_stream(chunk)
-                                    if not result['safe']:
-                                        logger.warning(f"DFA 拦截Flash降级: 敏感词='{result['triggered_word']}'")
+                                    if _blocked:
+                                        logger.warning("DFA 拦截Flash降级: 跨块或单块命中")
+                                        _safe_text += sf.safe_message
                                         yield sse("answer_chunk", sf.safe_message)
-                                        yield sse("answer_complete", sf.safe_message) + "data: [DONE]\n\n"
+                                        await _bill_intercepted(
+                                            _usage, username, _full_text,
+                                            record_token_usage, _estimate_tokens)
+                                        yield sse("answer_complete", _safe_text) + "data: [DONE]\n\n"
                                         return
-                                    # ============================
-                                    yield sse("answer_chunk", chunk)
+                                    if _piece:
+                                        _safe_text += _piece
+                                        yield sse("answer_chunk", _piece)
                             except (json.JSONDecodeError, ValueError) as e:
                                 logger.debug(f"SSE 行解析失败跳过: {e}")
                 except (GeneratorExit, asyncio.CancelledError):
@@ -112,18 +150,52 @@ async def _flash_sse(req: ChatRequest, username: str, deepseek_api_key: str) -> 
                             username, "",
                             remark=f"断连估算补计费（Flash降级 {_estimate_tokens(_full_text)} tokens）")
                     raise
-                # 流尾全文终检（对齐主路径 runner/ReAct）：逐块 DFA 拦不住跨块
-                # 拼接出的敏感词，命中以安全文案收口
-                if _full_text and sf.contains_sensitive(_full_text):
-                    logger.warning("DFA 流尾终检拦截Flash降级（跨块拼接命中）")
-                    yield sse("answer_complete", sf.safe_message) + "data: [DONE]\n\n"
+                _tail, _tail_blocked = _guard.flush()
+                if _tail_blocked:
+                    logger.warning("DFA 流尾拦截Flash降级")
+                    _safe_text += sf.safe_message
+                    yield sse("answer_chunk", sf.safe_message)
+                    await _bill_intercepted(
+                        _usage, username, _full_text,
+                        record_token_usage, _estimate_tokens)
+                    yield sse("answer_complete", _safe_text) + "data: [DONE]\n\n"
                     return
-                    # 计量扣费（2026-09-09 审查 P1）：降级链原先零计量——主模型失败后
-                    # 用户拿到的完整 Flash 回答全部免费；量小但计量口径必须一致
-                    if _usage:
-                        record_token_usage(_usage, username, "")
-                # 流正常结束（含未收到 [DONE] 的兜底）
+                if _tail:
+                    _safe_text += _tail
+                    yield sse("answer_chunk", _tail)
+                # 计量扣费（2026-09-09 审查 P1）：正常路径按真实 usage 计费；
+                # 拦截路径已由 _bill_intercepted 提前完成，避免 usage 双计。
+                if _usage:
+                    record_token_usage(_usage, username, "", model=DEEPSEEK_FLASH_MODEL)
+                # answer_complete 承载终检后的完整内容；空全文不发成功事件，
+                # 由 fallback_chain 据 yielded 判断是否补兜底文案。
+                if _safe_text:
+                    yield sse("answer_complete", _safe_text) + "data: [DONE]\n\n"
+                    return
                 yield "data: [DONE]\n\n"
+
+
+def accumulate_sse_text(acc: str, raw_event: str) -> str:
+    """从 fallback_chain 产出的 SSE 事件行聚合回答文本（供上层降级路径统一 finalize）。
+
+    answer_complete 承载终检后的完整文本，直接覆盖累积值；answer_chunk 追加；
+    [DONE]/解析失败行不影响累积。2026-09-14 审计 P1 配套：降级输出此前只转发
+    不收尾，上层无法拿到最终文本做 finalize_answer。
+    """
+    payload = raw_event[5:].strip() if raw_event.startswith("data: ") else ""
+    if not payload or payload == "[DONE]":
+        return acc
+    try:
+        ev = jloads(payload)
+    except Exception:
+        return acc
+    if not isinstance(ev, dict):
+        return acc
+    if ev.get("type") == "answer_complete" and ev.get("content"):
+        return str(ev["content"])
+    if ev.get("type") == "answer_chunk":
+        return acc + str(ev.get("content") or "")
+    return acc
 
 
 async def fallback_chain(req: ChatRequest, username: str, cache_ctx: str = "") -> AsyncIterator[str]:
@@ -132,6 +204,12 @@ async def fallback_chain(req: ChatRequest, username: str, cache_ctx: str = "") -
     兜底失败时写入短 TTL 空值占位防穿透风暴（await 而非 create_task，
     确保写入完成，P0 #11 防击穿占位不悬空）。
     """
+    if is_civil_persona(getattr(req, "persona_id", "")):
+        yield sse(
+            "answer_complete",
+            grounding_reply("service_error", getattr(req, "lang", "zh")),
+        ) + "data: [DONE]\n\n"
+        return
     yielded = False
     try:
         async for chunk in fallback_flash(req, username):

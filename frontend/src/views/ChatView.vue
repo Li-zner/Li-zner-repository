@@ -1,8 +1,9 @@
 <script setup lang="ts">
-/** 聊天主界面：旧版 .app 骨架。默认旅游人格；顶部求职/民法典按钮切换人格 */
+/** 聊天主界面：旧版 .app 骨架。默认旅游人格；顶部民法典按钮切换人格 */
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
+import { ApiError } from '../api/http'
 import { useAuthStore } from '../stores/auth'
 import { useChatStore } from '../stores/chat'
 import { useUiStore } from '../stores/ui'
@@ -15,13 +16,13 @@ import SettingsModal from '../components/SettingsModal.vue'
 import WalletModal from '../components/WalletModal.vue'
 import TxModal from '../components/TxModal.vue'
 import BindPhoneModal from '../components/BindPhoneModal.vue'
-
+import RatingModal from '../components/RatingModal.vue'
+import WelcomePanel from '../components/WelcomePanel.vue'
 const { t } = useI18n()
 const router = useRouter()
 const auth = useAuthStore()
 const chat = useChatStore()
 const ui = useUiStore()
-
 const input = ref('')
 const uploads = ref<UploadedFile[]>([])
 const uploadError = ref('')
@@ -33,30 +34,36 @@ const drawerOpen = ref(false)
 const headerCollapsed = ref(false)
 /** 手机端人格下拉 */
 const ddOpen = ref(false)
-const personaOptions = [
-  { value: 'unified', label: t('travel_mode') },
-  { value: 'me', label: t('me_mode') },
+// 本地兜底选项只列真实人格（2026-09-12 主人定夺：去掉 unified 幻影「旅行」——
+// unified 是后端降级 id，此前被误标为「旅行」与 travel 重复出现在下拉里）
+const personaOptions = computed(() => [
   { value: 'civil_code', label: t('civil_mode') },
-]
-const personaLabel = computed(() =>
-  personaOptions.find((o) => o.value === chat.currentPersonaId)?.label ?? t('travel_mode'))
-
+])
+// 后端人格列表优先（人格可动态增减），本地兜底选项去重后追加
+const allPersonaOptions = computed(() => {
+  const merged = chat.personas.map((p) => ({ value: p.id, label: p.name }))
+  for (const o of personaOptions.value) {
+    if (!merged.some((x) => x.value === o.value)) merged.push(o)
+  }
+  return merged
+})
+// 旧会话可能残留 unified（行为等同默认 travel）：标签回落到首选项而非幻影「旅行」
+const personaLabel = computed(
+  () => allPersonaOptions.value.find((o) => o.value === chat.currentPersonaId)?.label
+    ?? allPersonaOptions.value[0]?.label ?? t('travel_mode'))
 function pickPersona(value: string) {
   ddOpen.value = false
   if (value !== chat.currentPersonaId) switchPersona(value)
 }
-
 /** 点外部关闭下拉 */
 function onDocClick() {
   ddOpen.value = false
 }
-
 // ---------- 滚动跟随：流式时贴底自动滚，用户上翻则停手 + 悬浮"回到底部" ----------
 const messagesEl = ref<HTMLElement | null>(null)
 const inputEl = ref<HTMLTextAreaElement | null>(null)
 const showScrollBottom = ref(false)
 const nearBottom = ref(true)
-
 function onMessagesScroll() {
   const el = messagesEl.value
   if (!el) return
@@ -64,12 +71,10 @@ function onMessagesScroll() {
   nearBottom.value = dist < 120
   showScrollBottom.value = dist > 300
 }
-
 function scrollToBottom() {
   const el = messagesEl.value
   if (el) el.scrollTop = el.scrollHeight
 }
-
 // 流式增量（正文/思考/工具行）或消息条数变化时，贴底状态才自动跟随
 watch(
   () => {
@@ -83,13 +88,11 @@ watch(
     scrollToBottom()
   },
 )
-
 // 会话切换/首屏渲染后贴底
 watch(() => chat.currentSessionId, async () => {
   await nextTick()
   scrollToBottom()
 })
-
 // ---------- 多行输入：Enter 发送 / Shift+Enter 换行 / 自动增高 ----------
 function autoGrow() {
   const el = inputEl.value
@@ -97,13 +100,21 @@ function autoGrow() {
   el.style.height = 'auto'
   el.style.height = Math.min(el.scrollHeight, 132) + 'px'
 }
-
 onMounted(() => {
   document.addEventListener('click', onDocClick)
 })
 onUnmounted(() => document.removeEventListener('click', onDocClick))
 onMounted(async () => {
-  if (!auth.profileLoaded) auth.loadProfile().catch(() => router.push('/login'))
+  ui.initTheme()
+  try {
+    await auth.ensureProfile()
+  } catch (e) {
+    // 2026-09-12 清欠（D-F14）：仅凭证失效才踢登录，瞬时 5xx/网络抖动不打扰用户
+    if (e instanceof ApiError && e.status === 401) router.push('/login')
+    return
+  }
+  // profile 成功后立即按新 owner 重建会话，后续人格接口失败也不会残留旧账号数据。
+  chat.initSessions()
   // 会话列表必须先加载完成，autoPrompt 才有 currentSession 可发（否则 send 静默返回 → 无输出）
   await chat.loadPersonas().catch(() => {})
   refreshBalance()
@@ -113,27 +124,45 @@ onMounted(async () => {
     await chat.send(prompt)
   }
 })
-
 // 人格切换时清空输入与附件（会话数据由 store 响应式切换，无需销毁组件）
 watch(() => chat.currentPersonaId, () => {
   input.value = ''
   uploads.value = []
 })
-
 async function refreshBalance() {
   try { balance.value = (await getWallet()).balance } catch { /* 静默 */ }
 }
-
+/** 与后端 file_upload.ALLOWED_EXTENSIONS / MAX_FILE_SIZE 对齐的前端预检
+ *  （2026-09-10 审查 P2：原先无任何前端预检，大文件要先传完才被后端拒绝） */
+const MAX_UPLOAD_MB = 20
+const ALLOWED_EXTS = ['.txt', '.md', '.csv', '.json', '.xml', '.yaml', '.yml',
+  '.rst', '.rtf', '.pdf', '.jpg', '.jpeg', '.png', '.bmp', '.webp', '.docx']
 async function onFilePicked(e: Event) {
   const target = e.target as HTMLInputElement
   const file = target.files?.[0]
   if (!file) return
   uploadError.value = ''
-  try { uploads.value.push(await uploadFile(file)) }
+  const ext = file.name.slice(file.name.lastIndexOf('.')).toLowerCase()
+  if (!ALLOWED_EXTS.includes(ext)) {
+    uploadError.value = t('unsupported_file_type')
+    target.value = ''
+    return
+  }
+  if (file.size > MAX_UPLOAD_MB * 1024 * 1024) {
+    uploadError.value = t('file_too_large')
+    target.value = ''
+    return
+  }
+  // 2026-09-12 修复（外部复核 P1）：上传是异步的，期间切换人格会把旧人格的
+  // 附件塞进新人格的输入区——发起时快照人格，完成时已切换则丢弃
+  const personaAtStart = chat.currentPersonaId
+  try {
+    const uploaded = await uploadFile(file)
+    if (chat.currentPersonaId === personaAtStart) uploads.value.push(uploaded)
+  }
   catch (err) { uploadError.value = err instanceof Error ? err.message : t('upload_failed') }
   finally { target.value = '' }
 }
-
 function clearUploads() { uploads.value = [] }
 
 /** textarea Enter 发送 / Shift+Enter 换行；IME 组词确认的回车走默认确认行为 */
@@ -160,7 +189,11 @@ async function doSend() {
   void refreshBalance()
 }
 
-async function doLogout() { await auth.logout(); router.push('/login') }
+async function doLogout() {
+  await chat.cancelAndWait()
+  await auth.logout()
+  router.push('/login')
+}
 
 function newConversation() {
   chat.newConversation()
@@ -173,8 +206,7 @@ function onDelete(index: number) {
 }
 
 // ---------- 评分 ----------
-const rateStars = ref(0)
-function openRate(index: number) { rateIndex.value = index; rateStars.value = 0 }
+function openRate(index: number) { rateIndex.value = index }
 
 async function submitRate(star: number) {
   if (rateIndex.value === null || !star) return
@@ -195,24 +227,11 @@ async function submitRate(star: number) {
   rateIndex.value = null
 }
 
-// ---------- 人格切换（顶部按钮：求职 / 民法典） ----------
-const isMePersona = computed(() => chat.currentPersonaId === 'me')
-const isCivilPersona = computed(() => chat.currentPersonaId === 'civil_code')
-
+// ---------- 人格切换（顶部按钮：民法典） ----------
 function switchPersona(id: string) {
   if (chat.streaming) return
   chat.switchPersona(id)
 }
-
-/** 追问建议直发（不经 input 框） */
-async function sendDirect(s: string) {
-  await chat.send(s)
-}
-
-const mePresets = computed(() => [
-  t('me_preset_1'), t('me_preset_2'), t('me_preset_3'),
-  t('me_preset_4'), t('me_preset_5'), t('me_preset_6'), t('me_preset_7'),
-])
 
 const themes = [
   { key: 'classic', label: 'theme_classic' },
@@ -269,7 +288,7 @@ async function send(q: string) {
 
       <div class="sidebar-footer">
         <div>{{ t('sessions_saved_local') }}</div>
-        <button @click="ui.openSettings()">⚙ {{ t('settings') }}</button>
+        <button @click="ui.openSettings()">{{ t('settings') }}</button>
         <!-- 退出入口：移动端 header 无退出按钮，收在此处 -->
         <button @click="doLogout">{{ t('nav_logout') }}</button>
       </div>
@@ -287,7 +306,7 @@ async function send(q: string) {
             <span class="balance-text">{{ balance !== null ? `¥${balance.toFixed(2)}` : '—' }}</span>
           </button>
           <span
-            v-if="auth.user?.quota_limited && (auth.user?.remaining_questions ?? 0) >= 0"
+            v-if="auth.user?.quota_limited && (auth.user?.remaining_questions ?? 0) > 0"
             class="quota-badge"
             @click="chat.bindPhoneTip = t('bind_phone_trial_tip')"
           >{{ t('quota_badge', { n: auth.user?.remaining_questions }) }}</span>
@@ -306,7 +325,7 @@ async function send(q: string) {
         <transition name="fadeup">
           <div v-if="ddOpen" class="dd-menu">
             <button
-              v-for="opt in personaOptions"
+              v-for="opt in allPersonaOptions"
               :key="opt.value"
               class="dd-item"
               :class="{ current: opt.value === chat.currentPersonaId }"
@@ -328,39 +347,11 @@ async function send(q: string) {
         class="chat-messages"
         @scroll.passive="onMessagesScroll"
       >
-        <template v-if="chat.messages.length === 0">
-          <!-- 求职人格欢迎卡 -->
-          <div v-if="isMePersona" class="welcome-card">
-            <h1>{{ t('me_welcome_title') }}</h1>
-            <div class="subtitle">{{ t('me_welcome_subtitle') }}</div>
-            <div class="info-grid">
-              <div><span class="label">{{ t('me_label_intent') }}</span><br><span class="value">{{ t('me_value_intent') }}</span></div>
-              <div><span class="label">{{ t('me_label_edu') }}</span><br><span class="value">{{ t('me_value_edu') }}</span></div>
-              <div><span class="label">{{ t('me_label_project') }}</span><br><span class="value">{{ t('me_value_project') }}</span></div>
-              <div><span class="label">{{ t('me_label_speed') }}</span><br><span class="value">{{ t('me_value_speed') }}</span></div>
-            </div>
-            <div class="tag-list">
-              <span v-for="tag in ['Python', 'FastAPI', 'Multi-Agent', 'RAG', 'Docker', 'DeepSeek', 'PostgreSQL', 'Redis']" :key="tag" class="tag">{{ tag }}</span>
-            </div>
-            <div class="hint">{{ t('me_contact') }}</div>
-            <div class="hint">{{ t('me_hint') }}</div>
-            <div class="presets">
-              <button v-for="q in mePresets" :key="q" @click="send(q)">{{ q }}</button>
-            </div>
-          </div>
-          <!-- 民法典人格欢迎卡（问题八） -->
-          <div v-else-if="isCivilPersona" class="welcome-card">
-            <h1>{{ t('civil_welcome_title') }}</h1>
-            <div class="subtitle">{{ t('civil_welcome_subtitle') }}</div>
-            <div class="hint">{{ t('civil_hint') }}</div>
-            <div class="presets">
-              <button @click="send('离婚冷静期是多久')">{{ t('civil_preset_1') }}</button>
-              <button @click="send('借钱不还怎么办')">{{ t('civil_preset_2') }}</button>
-              <button @click="send('高空抛物由谁负责')">{{ t('civil_preset_3') }}</button>
-            </div>
-          </div>
-          <div v-else class="empty-state">{{ t('welcome') }}</div>
-        </template>
+        <WelcomePanel
+          v-if="chat.messages.length === 0"
+          :persona-id="chat.currentPersonaId"
+          @send="send"
+        />
         <MessageBubble
           v-for="(m, i) in chat.messages"
           :key="m.id ?? i"
@@ -369,7 +360,6 @@ async function send(q: string) {
           :is-last="i === chat.messages.length - 1"
           @delete="onDelete"
           @rate="openRate"
-          @suggest="sendDirect"
         />
       </div>
 
@@ -390,15 +380,25 @@ async function send(q: string) {
             <circle class="track" cx="12" cy="12" r="10"/>
             <circle class="fill-arc" cx="12" cy="12" r="10" stroke-dasharray="62.83" stroke-dashoffset="0"/>
           </svg>
-          <span class="icon-overlay">📎</span>
+          <svg
+            class="icon-overlay"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+          </svg>
         </div>
-        <span class="file-label">{{ uploads[0].filename }}（{{ uploads[0].text_length }} {{ t('chars') }}）</span>
+        <span class="file-label">{{ uploads.map((u) => u.filename).join('、') }}（{{ uploads.reduce((n, u) => n + u.text_length, 0) }} {{ t('chars') }}）</span>
         <button class="file-close" @click="clearUploads">✕</button>
       </div>
 
       <div class="chat-input-area">
         <label class="upload-btn" :title="t('upload_title')">
-          <input type="file" @change="onFilePicked">
+          <input type="file" accept=".txt,.md,.csv,.json,.xml,.yaml,.yml,.rst,.rtf,.pdf,.jpg,.jpeg,.png,.bmp,.webp,.docx" @change="onFilePicked">
           <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
         </label>
         <div class="input-wrapper">
@@ -406,7 +406,7 @@ async function send(q: string) {
             ref="inputEl"
             v-model="input"
             rows="1"
-            :placeholder="isMePersona ? t('input_ph_me') : t('input_ph')"
+            :placeholder="t('input_ph')"
             @keydown.enter="onEnter"
             @input="autoGrow"
           ></textarea>
@@ -429,26 +429,11 @@ async function send(q: string) {
         @close="chat.bindPhoneTip = ''"
         @bound="refreshBalance"
       />
-      <div v-if="rateIndex !== null" class="payment-overlay show">
-        <div class="payment-modal" style="max-width:380px;text-align:center;">
-          <div class="modal-header">
-            <h3>{{ t('rate_answer') }}</h3>
-            <button class="close-btn" @click="rateIndex = null">✕</button>
-          </div>
-          <div class="modal-body" style="padding:24px 20px;">
-            <div style="font-size:14px;color:var(--text-secondary);margin-bottom:16px;">{{ t('rate_choose') }}</div>
-            <div style="display:flex;justify-content:center;gap:8px;font-size:34px;cursor:pointer;">
-              <span
-                v-for="star in 5"
-                :key="star"
-                style="transition:all 0.15s;"
-                :style="{ color: star <= rateStars ? '#f5a623' : '#ddd' }"
-                @click="() => { rateStars = star; submitRate(star) }"
-              >★</span>
-            </div>
-          </div>
-        </div>
-      </div>
+      <RatingModal
+        v-if="rateIndex !== null"
+        @close="rateIndex = null"
+        @submit="submitRate"
+      />
     </div>
   </div>
 </template>
@@ -524,8 +509,6 @@ async function send(q: string) {
   color: var(--text-muted);
   margin-top: 40vh;
 }
-</style>
-<style scoped>
 /* ---------- 顶部栏收起/展开（小三角骑缝在矩形下缘中部） ---------- */
 .header-collapse-zone {
   position: relative;

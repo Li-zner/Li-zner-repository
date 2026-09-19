@@ -96,9 +96,3 @@ if __name__ == "__main__":
 - [ ] test_client.py 四步流程 + 三条路径齐全
 - [ ] `--self-check`（纯逻辑部分）可无外部服务运行
 - [ ] README：作用 / 能力表 / 为什么这样设计 / 配置 / 运行验证 / 踩坑
-
-## 库内关联
-
-- 落地样例：[[MCP sever/README|MCP sever]]（5 个 Server 均按本五步法产出，README 结构同构）
-- 官方对照：[[AI应用资产/skills/mcp-builder/SKILL|mcp-builder 官方技能]]与[[AI应用资产/skills/mcp-builder/reference/evaluation|evaluation 评测框架]]
-- 图谱：[[图谱/MOC-MCP生态|MOC-MCP 生态]]

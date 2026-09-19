@@ -95,8 +95,16 @@ def _chinese_to_arabic(text: str) -> int:
     return total
 
 
-# 正则：匹配"第X条"、"第X条之一"等格式
-_ARTICLE_PATTERN = re.compile(r'第([一二三四五六七八九十百千0-9]+)条(?:之一|之二|之三|之四)?')
+# 正则：匹配"第X条"、"第X条之一"等格式；左分支是范围写法"第X-Y条"（含 -~至到），
+# 右分支是单条。2026-09-18 新增范围分支：此前正则整体不认"第394-404条"，
+# 归一化对范围查询完全旁路，trgm 词面路与 _promote_pinned 条号腿都看不见中文条号。
+_ARTICLE_PATTERN = re.compile(
+    r'第(?P<from>\d{1,4})\s*[-~～–—至到]\s*(?P<to>\d{1,4})条'
+    r'|第(?P<num>[一二三四五六七八九十百千0-9]+)条(?:之一|之二|之三|之四)?')
+
+# 范围展开上限：超过则不改写。逐条展开会等比拉长检索文本（trgm 查询与向量
+# embedding 输入共用），几十上百条时词面稀释已超过点名收益。
+_RANGE_MAX = 30
 
 # 其它法律名称：紧跟"第X条"时说明引用的不是民法典条文，不做归一化
 _OTHER_LAW_NAMES = (
@@ -121,44 +129,60 @@ def normalize_article_ref(query: str) -> str:
     Returns:
         归一化后的文本（未匹配则返回原文）
     """
+    def _other_law_ahead(start: int) -> bool:
+        """引用前紧挨着其它法律名 → 那是那部法律的条文，整体不改写（否则会拼出"消保法民法典第X条"）"""
+        return any(start >= len(p) and query[start - len(p):start] == p
+                   for p in _OTHER_LAW_NAMES)
+
+    def _head(start: int) -> str:
+        """该引用是否需注入「民法典」前缀（原文已带民法/民法典前缀则不注入）"""
+        if start >= 3 and query[start - 3:start] == "民法典":
+            return ""
+        if start >= 2 and query[start - 2:start] == "民法":
+            return ""
+        return "民法典"
+
     def _replace(match):
-        num_str = match.group(1)
+        if _other_law_ahead(match.start()):
+            return match.group(0)
+        head = _head(match.start())
+        if match.group("from"):
+            # 范围写法：逐条展开为中文数字条号列表，让 trgm 词面与 pin 提升可见。
+            # re.sub 不回扫替换文本，展开产物不会被单条分支二次注入前缀。
+            start_num, end_num = int(match.group("from")), int(match.group("to"))
+            if (not 1 <= start_num <= end_num <= 1260
+                    or end_num - start_num + 1 > _RANGE_MAX):
+                return match.group(0)
+            arts = "、".join(f"第{_arabic_to_chinese(n)}条"
+                             for n in range(start_num, end_num + 1))
+            return head + arts
+        num_str = match.group("num")
         if num_str.isdigit():
             num = int(num_str)
         else:
             num = _chinese_to_arabic(num_str)
-        
+
         if num <= 0:
             return match.group(0)
-        
-        # 判断原文是否已包含"民法典"前缀
-        start = match.start()
-        has_prefix = start >= 3 and query[start-3:start] == "民法典"
-        has_law_prefix = start >= 2 and query[start-2:start] == "民法"
-        # 前面紧挨着其它法律名 → 引用的是那部法律的条文，不改写（否则会拼出"消保法民法典第X条"）
-        if any(start >= len(p) and query[start - len(p):start] == p for p in _OTHER_LAW_NAMES):
-            return match.group(0)
-        
+
         # 民法典法条范围（1-1260条）；本应用是民法典助手，范围内的编号一律归入民法典。
         # 超出范围（其它法律的条文编号，如消保法共63条也在范围内被民法典优先覆盖）不归一化。
         # 注意：消保法条文号与民法典完全重叠，无上下文无法区分，按民法典处理是有意为之
         if 1 <= num <= 1260:
-            cn_num = _arabic_to_chinese(num)
-            result = f"第{cn_num}条"
-            if not has_prefix and not has_law_prefix:
-                result = "民法典" + result
-            return result
+            return head + f"第{_arabic_to_chinese(num)}条"
         return match.group(0)
     
     return _ARTICLE_PATTERN.sub(_replace, query)
 
 
 def get_article_number(query: str) -> int | None:
-    """从查询中提取法条编号"""
+    """从查询中提取法条编号（范围写法取首条号）"""
     match = _ARTICLE_PATTERN.search(query)
     if not match:
         return None
-    num_str = match.group(1)
+    if match.group("from"):
+        return int(match.group("from"))
+    num_str = match.group("num")
     if num_str.isdigit():
         return int(num_str)
     return _chinese_to_arabic(num_str)

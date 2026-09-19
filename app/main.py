@@ -15,10 +15,11 @@ from .core.otel import OTEL_AVAILABLE
 from .core.logging import setup_logging
 from .core.config import (
     SESSION_SECRET_KEY, ADMIN_PHONE, ADMIN_USERNAME, ADMIN_PASSWORD,
-    USER_FENGFENG_PASSWORD, CORS_ORIGINS,
+    CORS_ORIGINS,
 )
 from .core.db import init_pool, close_pool, get_pool
 from .core.metrics import gateway_requests_total, gateway_request_duration_seconds
+from .core.security_headers import install_security_headers, GATEWAY_SECURITY_HEADERS
 from .core.password import hash_password
 from .core.concurrency import spawn
 from .routes.v2 import router as v2_router
@@ -42,38 +43,22 @@ if not OTEL_AVAILABLE:
 # ---------- 数据库初始化 ----------
 
 async def _ensure_admin_users(conn):
-    """创建/升级管理员账号（凭据通过环境变量传入）"""
+    """创建或升级唯一管理员账号，供多实例并发启动使用。"""
     if ADMIN_PASSWORD:
-        row = await conn.fetchrow("SELECT username FROM users WHERE username='admin'")
-        if not row:
-            hashed = hash_password(ADMIN_PASSWORD)
-            await conn.execute(
-                "INSERT INTO users (username, hashed_password, phone, role, display_name) "
-                "VALUES ($1, $2, $3, 'admin', $4)",
-                ADMIN_USERNAME, hashed, ADMIN_PHONE or '', "系统管理员"
-            )
-            logger.info(f"管理员账号已创建: username={ADMIN_USERNAME}")
-        else:
-            if ADMIN_PHONE:
-                await conn.execute(
-                    "UPDATE users SET phone=$1, role='admin' WHERE username=$2",
-                    ADMIN_PHONE, ADMIN_USERNAME
-                )
+        # 只补角色和缺失资料，不覆盖已有密码，保持 bootstrap-only 语义。
+        await conn.execute(
+            "INSERT INTO users (username, hashed_password, phone, role, display_name) "
+            "VALUES ($1, $2, NULLIF($3, ''), 'admin', $4) "
+            "ON CONFLICT (username) DO UPDATE SET "
+            "role='admin', "
+            "phone=COALESCE(EXCLUDED.phone, users.phone), "
+            "display_name=COALESCE(users.display_name, EXCLUDED.display_name)",
+            ADMIN_USERNAME, hash_password(ADMIN_PASSWORD),
+            ADMIN_PHONE or '', "系统管理员",
+        )
+        logger.info(f"管理员账号已就绪: username={ADMIN_USERNAME}")
     else:
         logger.warning("ADMIN_PASSWORD 未设置，跳过管理员创建")
-
-    # 管理员 Fengfeng
-    fengfeng_pwd = USER_FENGFENG_PASSWORD or ADMIN_PASSWORD
-    if fengfeng_pwd:
-        row = await conn.fetchrow("SELECT username FROM users WHERE username='Fengfeng'")
-        if not row:
-            hashed = hash_password(fengfeng_pwd)
-            await conn.execute(
-                "INSERT INTO users (username, hashed_password, role) VALUES ($1, $2, 'admin')",
-                "Fengfeng", hashed
-            )
-        else:
-            await conn.execute("UPDATE users SET role='admin' WHERE username='Fengfeng'")
 
 
 async def init_db(conn=None):
@@ -86,13 +71,20 @@ async def init_db(conn=None):
     close_conn = False
     if conn is None:
         pool = await get_pool()
-        conn = await pool.acquire()
+        conn = await pool.acquire(timeout=5)
         close_conn = True
     try:
         await conn.execute("SELECT 1")  # 连接探活
         # 关键表存在性校验（迁移未执行时 fail loudly）
+        # 2026-09-13 补监测三表：否则重建镜像忘跑 alembic 时服务照常启动，
+        # 采集/监测循环静默 warning 空转——正是监测系统要消灭的静默失效
         for _t in ("users", "requests", "conversation_memories", "user_profiles",
-                   "semantic_cache", "knowledge_chunks", "payment_orders", "cdc_events"):
+                   "semantic_cache", "knowledge_chunks", "payment_orders",
+                   "payment_attempts", "cdc_events",
+                   "retrieval_traces", "answer_traces", "rag_verdicts",
+                   "rag_daily_reports", "rag_request_traces", "rag_stage_spans",
+                   "rag_incidents", "rag_remediation_actions",
+                   "rag_monitor_processing", "rag_incident_requests"):
             _exists = await conn.fetchval(
                 "SELECT 1 FROM information_schema.tables "
                 "WHERE table_schema = 'public' AND table_name = $1", _t)
@@ -102,14 +94,15 @@ async def init_db(conn=None):
         await _ensure_admin_users(conn)
     finally:
         if close_conn:
-            await conn.close()
+            # 归还给 asyncpg 连接池，避免启动探活连接脱离池管理。
+            await pool.release(conn)
 
 async def _start_background_tasks():
     """启动后台任务：维护循环 / 慢查询观测 / CDC worker。返回任务句柄供关闭时使用"""
     maintenance_task = None
     try:
         from .core.db_maintenance import maintenance_loop
-        maintenance_task = asyncio.create_task(maintenance_loop(24))
+        maintenance_task = spawn(maintenance_loop(24), name="db-maintenance")
         logger.info("数据库定时维护任务已启动（每24小时）")
     except Exception as e:
         logger.warning(f"维护任务启动跳过: {e}")
@@ -117,10 +110,20 @@ async def _start_background_tasks():
     slowq_task = None
     try:
         from .core.slow_query_watch import slow_query_watch_loop
-        slowq_task = asyncio.create_task(slow_query_watch_loop())
+        slowq_task = spawn(slow_query_watch_loop(), name="slow-query-watch")
         logger.info("慢查询观测已启动（每5分钟，pg_stat_statements）")
     except Exception as e:
         logger.warning(f"慢查询观测启动跳过: {e}")
+
+    # 待结算扣费补偿短周期循环（2026-09-10 审查 P2）：原随 24h 维护结算，
+    # 占位扣费单最长滞后 24h 才入流水，拆 5 分钟独立循环
+    deferred_task = None
+    try:
+        from .payment.deferred import settlement_loop
+        deferred_task = spawn(settlement_loop(300), name="payment-recovery")
+        logger.info("待结算扣费补偿已启动（每5分钟）")
+    except Exception as e:
+        logger.warning(f"待结算补偿启动跳过: {e}")
 
     cdc_task = None
     cdc_worker = None
@@ -128,12 +131,13 @@ async def _start_background_tasks():
         if os.getenv("CDC_ENABLED", "1") == "1":
             from .cdc.worker import CdcWorker
             cdc_worker = CdcWorker()
-            cdc_task = asyncio.create_task(cdc_worker.run())
+            cdc_task = spawn(cdc_worker.run(), name="cdc-worker")
             logger.info("CDC worker 已启动（变更数据捕获落盘）")
     except Exception as e:
         logger.warning(f"CDC worker 启动跳过: {e}")
 
-    return maintenance_task, slowq_task, cdc_task, cdc_worker
+    return (maintenance_task, slowq_task, deferred_task,
+            cdc_task, cdc_worker)
 
 
 async def _warmup_components():
@@ -159,7 +163,8 @@ async def _warmup_components():
         logger.warning(f"人格预热跳过: {e}")
 
 
-async def _stop_background_tasks(maintenance_task, slowq_task, cdc_task, cdc_worker):
+async def _stop_background_tasks(maintenance_task, slowq_task, deferred_task,
+                                 cdc_task, cdc_worker):
     """关闭后台任务（先取消协程，再落 CDC checkpoint）"""
     if slowq_task:
         slowq_task.cancel()
@@ -167,6 +172,13 @@ async def _stop_background_tasks(maintenance_task, slowq_task, cdc_task, cdc_wor
             await slowq_task
         except asyncio.CancelledError:  # noqa: silent-except 豁免：优雅关停惯例（吞 CancelledError）
             pass
+    if deferred_task:
+        deferred_task.cancel()
+        try:
+            await deferred_task
+        except asyncio.CancelledError:  # noqa: silent-except 豁免：优雅关停惯例（吞 CancelledError）
+            pass
+        logger.info("待结算补偿任务已停止")
     if maintenance_task:
         maintenance_task.cancel()
         try:
@@ -187,21 +199,31 @@ async def _stop_background_tasks(maintenance_task, slowq_task, cdc_task, cdc_wor
         logger.info("CDC worker 已停止")
 
 
-async def lifespan(app: FastAPI):
+async def _initialize_runtime() -> tuple:
+    """初始化必需依赖、后台任务与预热，返回后台任务句柄。"""
+    app_env = os.getenv("APP_ENV", "production").lower()
+
+    def _required_startup_failure(label: str, exc: Exception):
+        """生产环境依赖不可用时拒绝启动；测试/本地轻测试允许显式降级。"""
+        if app_env == "test":
+            logger.warning(f"{label}初始化失败（测试环境降级）: {exc}")
+            return
+        raise RuntimeError(f"{label}初始化失败，拒绝启动") from exc
+
     # --- 初始化连接池 ---
     try:
-        pool = await init_pool()
+        await init_pool()
         from .core.db import _POOL_CONFIG
         logger.info(f"数据库连接池已初始化 (min={_POOL_CONFIG['min_size']}, max={_POOL_CONFIG['max_size']})")
     except Exception as e:
-        logger.warning(f"连接池初始化失败: {e}")
+        _required_startup_failure("数据库连接池", e)
 
     # --- 初始化数据库表 ---
     try:
         await init_db()
         logger.info("PostgreSQL 数据库已初始化")
     except Exception as e:
-        logger.warning(f"PostgreSQL 初始化失败（服务仍可启动，数据库功能受限）: {e}")
+        _required_startup_failure("PostgreSQL", e)
 
     # CDC 事件表与触发器由 Alembic 迁移管理（A19/A23，迁移 e5f6a7b8c9d0），
     # 启动不再执行 DDL；缺失时 init_db 已 fail loudly。
@@ -213,11 +235,19 @@ async def lifespan(app: FastAPI):
         await init_redis()
         logger.info("Redis 连接池已初始化")
     except Exception as e:
-        logger.warning(f"Redis 初始化失败: {e}")
+        _required_startup_failure("Redis 连接池", e)
 
     # 启动后台任务 + 预热
-    maintenance_task, slowq_task, cdc_task, cdc_worker = await _start_background_tasks()
+    (maintenance_task, slowq_task, deferred_task,
+     cdc_task, cdc_worker) = await _start_background_tasks()
     await _warmup_components()
+    return (maintenance_task, slowq_task, deferred_task, cdc_task, cdc_worker)
+
+
+async def lifespan(app: FastAPI):
+    # 生产环境数据库/Redis 初始化失败会直接拒绝启动。
+    (maintenance_task, slowq_task, deferred_task,
+     cdc_task, cdc_worker) = await _initialize_runtime()
 
     # 初始化 OpenTelemetry (HTTP 导出)（保护性：OTEL 不可用时跳过，main指点 #4）
     if OTEL_AVAILABLE:
@@ -245,7 +275,15 @@ async def lifespan(app: FastAPI):
 
     yield
     # --- 关闭时 ---
-    await _stop_background_tasks(maintenance_task, slowq_task, cdc_task, cdc_worker)
+    await _stop_background_tasks(
+        maintenance_task, slowq_task, deferred_task, cdc_task, cdc_worker)
+    # 排空 spawn 后台任务（审计/缓存/计费等，2026-09-14 审计 P1）：必须在
+    # Redis/PG 连接池关闭之前——这些任务的收尾写库依赖连接仍可用
+    try:
+        from .core.concurrency import drain_background_tasks
+        await drain_background_tasks(timeout=10.0)
+    except Exception as e:
+        logger.warning(f"后台任务排空失败: {e}")
     # 关闭 Redis
     try:
         from .core.redis import close_redis
@@ -287,13 +325,19 @@ async def monitor_requests(request: Request, call_next):
         try:
             from .core.error_aggregator import record_error
             await record_error(request, exc)
-        except Exception as e:
+        except Exception:
             logger.warning("异常聚合写入失败")
         raise
     finally:
         duration = time.perf_counter() - start_time
         route = request.scope.get("route")
-        endpoint = route.path if route and hasattr(route, "path") else request.url.path
+        if route is not None and hasattr(route, "path"):
+            endpoint = route.path
+        else:
+            # 2026-09-15 审查 B-03：未匹配路由的路径是客户端可任意构造的，
+            # 直接作 Prometheus label 会造成基数爆炸（未认证 DoS 面），
+            # 归一为固定值；真实路由的 label 粒度不受影响
+            endpoint = "unrouted"
         gateway_requests_total.labels(
             method=request.method,
             endpoint=endpoint,
@@ -315,6 +359,9 @@ app.add_middleware(
 # SessionMiddleware 仅用于 GitHub OAuth 的 state 存储（authlib 依赖 request.session），
 # 非认证主体（JWT 才是认证）；main指点 #16 建议移除，但移除会破坏 OAuth state 机制，故保留并注明。
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET_KEY)
+# 主站安全响应头（2026-09-19 审查 core P2-1）：本进程 StaticFiles 托管前端、
+# nginx 把 / 反代到这里，头会真的进浏览器；用主站专用策略（多放行 datav 与定位）。
+install_security_headers(app, GATEWAY_SECURITY_HEADERS)
 
 os.makedirs("uploads", exist_ok=True)
 # 安全：uploads 目录不移除通过 StaticFiles 公开挂载，文件只能通过 API 授权访问

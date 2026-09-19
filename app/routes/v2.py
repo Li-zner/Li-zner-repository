@@ -11,7 +11,6 @@ from pydantic import BaseModel
 from ..middleware.auth import get_current_user
 from ..models.schemas import ChatRequest, CreateTaskRequest
 from ..core.task_manager import get_task
-from ..core.quota import is_quota_exhausted
 from ..services.agent_tasks import (
     cancel_agent_task, create_agent_task, ensure_task_access, resume_agent_task, wait_task_result,
     task_user_perms,
@@ -64,7 +63,9 @@ async def upload_file(
     current_user: dict = Depends(get_current_user)
 ) -> UploadResponse:
     """上传文件（支持 TXT/PDF/图片/Word 等），返回文件ID与提取的文本"""
-    return await handle_upload(file, current_user["username"])
+    # 频控与每小时配额在 file_upload 服务层统一把关，路由只透传身份（审查 R3）
+    return await handle_upload(file, current_user["username"],
+                               current_user.get("role", "user"))
 
 
 @router.get("/files/{file_id}", response_model=FileInfoResponse)
@@ -139,11 +140,8 @@ async def resume_task(
     if not task:
         return JSONResponse({"error": "task not found"}, status_code=404)
     ensure_task_access(task, current_user["username"], current_user["role"])
-    # 试用额度复查（2026-09-09 审查 P1）：与 create_agent_task 对齐——服务层注释
-    # 声称"resume 也复查"，实际 _task_quota_gate 只查日配额，额度耗尽用户可借
-    # resume 无限重跑 LLM 任务绕过试用上限
-    if current_user.get("role") != "admin" and is_quota_exhausted(current_user):
-        raise HTTPException(status_code=402, detail="免费额度已用完，请绑定手机号后继续使用")
+    # 试用额度由 resume_agent_task 在创建新任务前原子预留。
     return await resume_agent_task(task_id, task, current_user["username"],
                                    task_user_perms(current_user),
-                                   role=current_user["role"])
+                                   role=current_user["role"],
+                                   quota_user=current_user)

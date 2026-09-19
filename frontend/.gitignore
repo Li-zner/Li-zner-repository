@@ -1,5 +1,6 @@
 node_modules
 dist
+dist-console
 coverage
 playwright-report
 test-results

@@ -9,14 +9,14 @@
 |------|--------------|------------|---------|
 | 可用性 | 5xx 请求占比（`gateway_requests_total`） | 错误率 < 1%（月度） | HighErrorRate |
 | 延迟 | p95 响应耗时（`gateway_request_duration_seconds`） | p95 < 5s | P95LatencyHigh |
-| 体验 | 首 token 时间（`requests.first_token_time`） | p95 < 3s | 人工观测 |
+| 体验 | 首 token 时间（`requests.first_token_time`） | p95 < 3s（目标值，未达成，实测远高于此） | 人工观测 |
 | 成本 | 每万 token 花费（`llm_tokens_total` × 10 元） | 日消耗 < 50 元（可配置） | LLMTokenSpike |
 | 缓存 | 语义缓存命中率（`semantic_cache_hits_total` / 总数） | 命中率 > 30% | CacheHitRateLow |
-| 容量 | 并发处理能力 | 4 实例 × 200 并发 = 800 并发近零错误 | 无（容量基线） |
+| 容量 | 并发处理能力 | 未做负载压测，以单实例内存上限为约束 | 无（容量基线待定） |
 
 ## 二、容量基线（2026-07 压测实测）
 
-- **并发能力**: 800 并发压测近零错误（Locust 实测）
+- **并发能力**: 未做负载压测；历史 Locust 数据不可复现，已作废
 - **单实例**: ~200 并发
 - **限流配置**: user QPS 2000 / 并发 200 / 日 50 万请求；admin 更宽
 - **连接池**: asyncpg min=20 max=50/实例；Redis 无密码内网

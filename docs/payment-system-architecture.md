@@ -802,7 +802,7 @@ INDEX idx_tx_order ON transaction_logs(order_no)
 #   4 实例 × 1200 QPS = 4800 HTTP QPS 上限
 #   → 实际瓶颈在 Python HTTP 处理层, 非 DB 层
 
-# 结论：800 并发支付请求，HTTP 层 QPS = 800
+# 示例推算：若同时有 800 个支付请求，HTTP 层 QPS = 800（未实测，仅作容量推理示例）
 # 800 < 4800 → HTTP 层通过
 # 800 < 40000 → DB 层通过
 # ✅ 可 100% 完成

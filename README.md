@@ -1,5 +1,19 @@
 # agent_gateway
 
+```mermaid
+flowchart LR
+    U[Vue3 PWA 前端] --> NG[Nginx · 4 副本负载均衡]
+    NG --> SC[三级语义缓存]
+    SC -->|命中| ANS[秒级返回]
+    SC -->|未命中| RT[两级意图路由<br/>关键词毫秒级 · LLM 兜底]
+    RT -->|简单任务| ST[单工具直连]
+    RT -->|复杂任务| RA[ReAct 循环<br/>熔断 · 降级 · 步数上限]
+    RT -->|知识问答| RG[RAG<br/>双路召回 → RRF → 本地重排<br/>法条溯源 · 拒答契约]
+    ST & RA & RG --> LLM[DeepSeek / Qwen]
+    RA & RG --> PG[(PostgreSQL<br/>pgvector · 支付 WAL)]
+    SC & RA --> RD[(Redis)]
+```
+
 个人独立开发并自运维的 Multi-Agent 网关：一套引擎承载旅游规划与民法典咨询两类问答场景，已上线公网（Vue3 PWA 前端 + FastAPI 后端），从需求、编码、部署到线上排障全程一人完成。目前处于小范围内测，真实用户量很小，仓库内出现的性能与评测数字均为自测。
 
 ## 亮点
@@ -24,5 +38,4 @@ Python · FastAPI · PostgreSQL(pgvector) · Redis · Vue3 · TypeScript · Vite
 
 ## 演示
 
-- 公网：https://the-world-agent.cloud
-- 百度网盘：https://pan.baidu.com/s/1ProMzaj1ANz_NdQloEKGTw?pwd=sj4b
+- 在线演示：https://the-world-agent.cloud

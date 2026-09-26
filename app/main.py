@@ -1,5 +1,6 @@
 import os
 import asyncio
+import sys
 import time
 
 from fastapi import FastAPI, Request
@@ -14,11 +15,14 @@ from .core.otel import OTEL_AVAILABLE
 
 from .core.logging import setup_logging
 from .core.config import (
-    SESSION_SECRET_KEY, ADMIN_PHONE, ADMIN_USERNAME, ADMIN_PASSWORD,
+    SESSION_SECRET_KEY, SESSION_COOKIE_SECURE, ADMIN_PHONE, ADMIN_USERNAME, ADMIN_PASSWORD,
     CORS_ORIGINS,
 )
 from .core.db import init_pool, close_pool, get_pool
-from .core.metrics import gateway_requests_total, gateway_request_duration_seconds
+from .core.metrics import (
+    gateway_requests_total, gateway_request_duration_seconds,
+    background_loop_stopped_total,
+)
 from .core.security_headers import install_security_headers, GATEWAY_SECURITY_HEADERS
 from .core.password import hash_password
 from .core.concurrency import spawn
@@ -78,7 +82,8 @@ async def init_db(conn=None):
         # 关键表存在性校验（迁移未执行时 fail loudly）
         # 2026-09-13 补监测三表：否则重建镜像忘跑 alembic 时服务照常启动，
         # 采集/监测循环静默 warning 空转——正是监测系统要消灭的静默失效
-        for _t in ("users", "requests", "conversation_memories", "user_profiles",
+        for _t in ("users", "requests", "conversation_memories",
+                   "conversation_profiles", "user_profiles",
                    "semantic_cache", "knowledge_chunks", "payment_orders",
                    "payment_attempts", "cdc_events",
                    "retrieval_traces", "answer_traces", "rag_verdicts",
@@ -97,22 +102,59 @@ async def init_db(conn=None):
             # 归还给 asyncpg 连接池，避免启动探活连接脱离池管理。
             await pool.release(conn)
 
+def _count_background_loop_stopped(loop: str, reason: str):
+    """CORE-2（2026-09-20 审查）：后台循环死亡/启动失败必须进指标，
+    原来只有 logger.warning——运维面板上完全不可见。打点失败不能反噬主流程。"""
+    try:
+        background_loop_stopped_total.labels(loop=loop, reason=reason).inc()
+    except Exception as e:
+        logger.debug(f"background_loop_stopped 打点失败: {e}")
+
+
+def _watch_background_loop(task, name: str):
+    """给后台循环挂退出探针：error/cancelled/正常返回三种死法都记数并告警级
+    落日志（alert.rules.yml BackgroundLoopStopped 对 increase>0 告警）。
+    done_callback 在事件循环内同步执行，禁止抛异常出去。"""
+
+    def _on_done(t):
+        try:
+            if t.cancelled():
+                reason = "cancelled"
+            else:
+                exc = t.exception()
+                reason = "error" if exc else "returned"
+                if exc:
+                    logger.error(f"后台循环 {name} 异常退出: {exc}", exc_info=exc)
+            _count_background_loop_stopped(name, reason)
+            if reason == "returned":
+                logger.error(f"后台循环 {name} 正常返回后退出（循环本该永不返回）")
+        except Exception as e:  # 探针自身故障不得影响任务
+            logger.debug(f"后台循环退出探针失败: {e}")
+
+    task.add_done_callback(_on_done)
+    return task
+
+
 async def _start_background_tasks():
     """启动后台任务：维护循环 / 慢查询观测 / CDC worker。返回任务句柄供关闭时使用"""
     maintenance_task = None
     try:
         from .core.db_maintenance import maintenance_loop
-        maintenance_task = spawn(maintenance_loop(24), name="db-maintenance")
+        maintenance_task = _watch_background_loop(
+            spawn(maintenance_loop(24), name="db-maintenance"), "db-maintenance")
         logger.info("数据库定时维护任务已启动（每24小时）")
     except Exception as e:
+        _count_background_loop_stopped("db-maintenance", "start_failed")
         logger.warning(f"维护任务启动跳过: {e}")
 
     slowq_task = None
     try:
         from .core.slow_query_watch import slow_query_watch_loop
-        slowq_task = spawn(slow_query_watch_loop(), name="slow-query-watch")
+        slowq_task = _watch_background_loop(
+            spawn(slow_query_watch_loop(), name="slow-query-watch"), "slow-query-watch")
         logger.info("慢查询观测已启动（每5分钟，pg_stat_statements）")
     except Exception as e:
+        _count_background_loop_stopped("slow-query-watch", "start_failed")
         logger.warning(f"慢查询观测启动跳过: {e}")
 
     # 待结算扣费补偿短周期循环（2026-09-10 审查 P2）：原随 24h 维护结算，
@@ -120,9 +162,11 @@ async def _start_background_tasks():
     deferred_task = None
     try:
         from .payment.deferred import settlement_loop
-        deferred_task = spawn(settlement_loop(300), name="payment-recovery")
+        deferred_task = _watch_background_loop(
+            spawn(settlement_loop(300), name="payment-recovery"), "payment-recovery")
         logger.info("待结算扣费补偿已启动（每5分钟）")
     except Exception as e:
+        _count_background_loop_stopped("payment-recovery", "start_failed")
         logger.warning(f"待结算补偿启动跳过: {e}")
 
     cdc_task = None
@@ -131,9 +175,11 @@ async def _start_background_tasks():
         if os.getenv("CDC_ENABLED", "1") == "1":
             from .cdc.worker import CdcWorker
             cdc_worker = CdcWorker()
-            cdc_task = spawn(cdc_worker.run(), name="cdc-worker")
+            cdc_task = _watch_background_loop(
+                spawn(cdc_worker.run(), name="cdc-worker"), "cdc-worker")
             logger.info("CDC worker 已启动（变更数据捕获落盘）")
     except Exception as e:
+        _count_background_loop_stopped("cdc-worker", "start_failed")
         logger.warning(f"CDC worker 启动跳过: {e}")
 
     return (maintenance_task, slowq_task, deferred_task,
@@ -201,6 +247,17 @@ async def _stop_background_tasks(maintenance_task, slowq_task, deferred_task,
 
 async def _initialize_runtime() -> tuple:
     """初始化必需依赖、后台任务与预热，返回后台任务句柄。"""
+    if any(arg == "--proxy-headers" or arg.startswith("--proxy-headers=")
+           for arg in sys.argv[1:]):
+        # RT-2（2026-09-22 审阅 P1）：本仓 IP 判据=socket 对端命中
+        # TRUSTED_PROXY_CIDRS 才采信转发头。uvicorn 的 ProxyHeadersMiddleware
+        # （--proxy-headers 开启）会在 forwarded_allow_ips 命中时改写
+        # scope["client"]，届时取到的"对端"本身就是 XFF 首跳（用户可控），
+        # 判据静默反向失效。当前 Dockerfile/compose 均未开启；若将来确需
+        # 开启，必须改判据为读原始 transport 对端，而不是绕过本断言。
+        raise RuntimeError(
+            "检测到 uvicorn --proxy-headers：与本仓 IP 可信判据冲突。"
+            "请保持启动参数不开启，或改用原始 transport 对端口径")
     app_env = os.getenv("APP_ENV", "production").lower()
 
     def _required_startup_failure(label: str, exc: Exception):
@@ -358,7 +415,11 @@ app.add_middleware(
 )
 # SessionMiddleware 仅用于 GitHub OAuth 的 state 存储（authlib 依赖 request.session），
 # 非认证主体（JWT 才是认证）；main指点 #16 建议移除，但移除会破坏 OAuth state 机制，故保留并注明。
-app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET_KEY)
+# AUTH-4（2026-09-20 审查）：state 是回调唯一 CSRF 防线，此前默认 secure=False 可明文
+# 跨链路携带——中间人取得 state 即可走通回调。https_only 默认开（SESSION_COOKIE_SECURE
+# 可作逃生口关闭，仅限非回环纯 HTTP 部署）。
+app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET_KEY,
+                   https_only=SESSION_COOKIE_SECURE, same_site="lax")
 # 主站安全响应头（2026-09-19 审查 core P2-1）：本进程 StaticFiles 托管前端、
 # nginx 把 / 反代到这里，头会真的进浏览器；用主站专用策略（多放行 datav 与定位）。
 install_security_headers(app, GATEWAY_SECURITY_HEADERS)

@@ -1,6 +1,6 @@
 """
 法律依据纠正映射表
-加载 tests/民法典补充协议.txt 中的 40 条常见法律误区，
+加载 tests/civil_supplement_cases.txt 中的 40 条常见法律误区，
 在民法典知识库检索前，先判断用户问题是否属于其他法律领域。
 """
 import csv
@@ -13,7 +13,7 @@ from ..core.logging import setup_logging
 logger = setup_logging()
 
 # 映射表路径
-_MAPPING_FILE = Path(__file__).parent.parent.parent / "tests" / "民法典补充协议.txt"
+_MAPPING_FILE = Path(__file__).parent.parent.parent / "tests" / "civil_supplement_cases.txt"
 
 # 在内存中缓存解析后的映射表
 _LAW_MAPPING_CACHE: Optional[list[dict]] = None

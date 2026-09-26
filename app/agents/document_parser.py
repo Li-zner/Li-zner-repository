@@ -8,6 +8,9 @@ import time
 import zipfile
 import asyncio
 import threading
+# 只用到 run，且按模块内别名导入：探测测试替换 dp._subprocess_run 即可，
+# 不必去 patch 全局 subprocess 模块（会影响同进程其他测试）
+from subprocess import run as _subprocess_run
 from ..core.logging import setup_logging
 
 logger = setup_logging()
@@ -41,6 +44,30 @@ def _read_member_limited(z: zipfile.ZipFile, name: str, limit: int) -> bytes | N
     return None if len(data) > limit else data
 
 
+# RAG-5（2026-09-20 审查）：AG-1 只封了 word/media 成员的真实读取，但
+# DocxDocument() 构造即整体解压 XML 部件——高压缩比/超大声明解压尺寸仍可
+# 一次性打爆 1GB 容器。解析前用 zipinfo 校验声明总尺寸与压缩比，超限拒绝。
+_DOCX_MAX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
+_DOCX_MAX_COMPRESSION_RATIO = 60  # 正常文本 docx 压缩比 <30，炸弹常见 >1000
+
+
+def _docx_zip_bomb_reason(filepath: str) -> str:
+    """命中封项返回拒绝原因（固定文案，不含路径），否则返回空串。"""
+    try:
+        with zipfile.ZipFile(filepath) as z:
+            infos = z.infolist()
+    except (zipfile.BadZipFile, OSError):
+        return "文件不是有效的 docx 容器"
+    total_uncompressed = sum(i.file_size for i in infos)
+    if total_uncompressed > _DOCX_MAX_UNCOMPRESSED_BYTES:
+        return "解压总大小超过上限"
+    total_compressed = sum(i.compress_size for i in infos)
+    if total_compressed and total_uncompressed > (
+            total_compressed * _DOCX_MAX_COMPRESSION_RATIO):
+        return "压缩比异常（疑似 zip bomb）"
+    return ""
+
+
 # ============================================================
 # 图片 OCR 引擎（RapidOCR 优先，Tesseract 降级）
 # ============================================================
@@ -63,18 +90,56 @@ if _HAS_PIL:
         logger.warning(f"RapidOCR 加载失败（将使用 Tesseract 降级）: {e}")
 
 # Tesseract（传统 OCR，作为降级）
-_HAS_TESSERACT = False
-if _HAS_PIL:
+# 探测结果的进程内缓存：None=尚未探测（2026-09-22 审阅 P2 改成惰性），
+# True/False=已探测。测试可把它置回 None 重新走探测分支。
+_HAS_TESSERACT: bool | None = None
+# 探测子进程硬超时：tesseract 二进制在但卡住（缺字体/挂在校验上）时，
+# 没有超时的探测会把调用方线程一直占住
+_TESSERACT_PROBE_TIMEOUT_S = 5.0
+
+
+def _tesseract_ready() -> bool:
+    """判据是"系统里有 tesseract 二进制"，不是"能 import pytesseract"。
+
+    云端 lite 镜像只装 curl（deploy/Dockerfile.lite:15）却照样装了 requirements.txt
+    里的 pytesseract 包，而 RapidOCR 两个镜像都没有——按 import 判定会让每张图都
+    抛 TesseractNotFoundError 再被吞成空串。
+
+    09-22 审阅 P2：探测不再走 pytesseract.get_tesseract_version()，它内部
+    起子进程但不接受 timeout 参数；这里直接跑 `tesseract --version` 并带
+    timeout，二进制挂起时最多占住 5 秒而不是永久卡死。
+    """
     try:
         import pytesseract
-        _HAS_TESSERACT = True
-    except ImportError:
-        # 可选依赖：未安装则保持 False，OCR 走 RapidOCR 或返回引擎未安装提示
-        _HAS_TESSERACT = False
+        cmd = getattr(pytesseract, "tesseract_cmd", "tesseract")
+        proc = _subprocess_run([cmd, "--version"], capture_output=True, text=True,
+                               timeout=_TESSERACT_PROBE_TIMEOUT_S)
+        if proc.returncode != 0:
+            raise RuntimeError(f"tesseract --version 退出码 {proc.returncode}")
+    except Exception as e:
+        # 可选依赖：包缺失、二进制缺失、探测超时都返回 False（OCR 走 RapidOCR
+        # 或未安装提示）——探测失败绝不能变成解析失败
+        logger.info(f"Tesseract 引擎不可用（OCR 跳过该腿）: {type(e).__name__}")
+        return False
+    return True
+
+
+def _tesseract_available() -> bool:
+    """首次使用时探测并进程内缓存（P2：探测此前发生在 import 期）。
+
+    import 期探测的代价是"每个 worker 启动都要等一次子进程"：tesseract 挂起时
+    滚动发布直接卡死在导入语句上，一个坏节点拖慢整个服务。缓存含失败结果，
+    否则每张图都要重等一次探测超时（镜像不会在运行中途装包，结果不随请求变）。
+    """
+    global _HAS_TESSERACT
+    if _HAS_TESSERACT is None:
+        _HAS_TESSERACT = _tesseract_ready() if _HAS_PIL else False
+    return _HAS_TESSERACT
+
 
 def _ocr_image(img: Image.Image, label: str = "") -> str:
     """对 PIL Image 执行 OCR，RapidOCR 优先"""
-    if not _HAS_RAPID and not _HAS_TESSERACT:
+    if not _HAS_RAPID and not _tesseract_available():
         return ""
     try:
         with _OCR_LOCK:  # RapidOCR/ONNX 不支持并发，串行化（P1 #43）
@@ -92,7 +157,9 @@ def _ocr_image(img: Image.Image, label: str = "") -> str:
                         return f"\n[图片 OCR{ ' ('+label+')' if label else '' }]: {combined}"
                 return ""
             else:
-                # Tesseract 降级
+                # Tesseract 降级（pytesseract 只在探测函数里 import 过，
+                # 这里是模块级未绑定名字，必须就地导入）
+                import pytesseract
                 if img.mode != 'L':
                     img = img.convert('L')
                 from PIL import ImageEnhance
@@ -229,11 +296,11 @@ async def parse_pdf(filepath: str) -> str:
 
 
 # ============================================================
-# 图片 OCR（pytesseract）— 独立图片文件
-# （pytesseract/PIL 已在顶部导入，_HAS_TESSERACT 可用）
+# 图片 OCR（RapidOCR 优先，Tesseract 降级）— 独立图片文件
+# Tesseract 可用性由 _tesseract_available() 首次使用时惰性探测（09-22 审阅 P2）
 async def parse_image(filepath: str) -> str:
     """对独立图片文件进行 OCR（RapidOCR 优先）"""
-    if not _HAS_RAPID and not _HAS_TESSERACT:
+    if not _HAS_RAPID and not _tesseract_available():
         return "[OCR 引擎未安装]"
     loop = asyncio.get_running_loop()
     def _ocr():
@@ -284,6 +351,11 @@ async def parse_docx(filepath: str) -> str:
     loop = asyncio.get_running_loop()
 
     def _extract_all():
+        # RAG-5：先验封 zip bomb，再交给 DocxDocument 整体解压
+        reason = _docx_zip_bomb_reason(filepath)
+        if reason:
+            logger.warning(f"Word 文件被拒（RAG-5 防护）: {reason}")
+            return f"[Word 解析失败: {reason}]"
         doc = DocxDocument(filepath)
         parts = []
 

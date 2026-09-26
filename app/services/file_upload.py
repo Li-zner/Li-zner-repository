@@ -97,7 +97,11 @@ async def _extract_upload_text(save_path: str, safe_filename: str, ext: str, loo
         result = await parse_document(save_path, safe_filename)
         if result["success"]:
             return result["text"], f"（{result['format']}，已自动提取文本）"
-        return result.get("error", "解析失败"), f"（{result['format']}，提取失败）"
+        # API-4（2026-09-20 审查）：result["error"] 原文（如 "[PDF 解析错误: ...]"，
+        # 可含内部路径）此前直接作为回答内容返回用户并进 Redis/LLM 上下文——
+        # 与 09-12 文本分支同口径：错误只进日志，用户侧固定文案。
+        logger.warning(f"上传文档解析失败: file={safe_filename}, err={result.get('error', '')}")
+        return "文档解析失败，请换用可提取文本的文件", f"（{result['format']}，提取失败）"
     # 文本类文件直接读取
     try:
         text_content = await extract_text_content_async(save_path, safe_filename)

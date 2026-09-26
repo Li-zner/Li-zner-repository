@@ -22,6 +22,7 @@ from ..core.config import (
     DEEPSEEK_MODEL, HTTP_TIMEOUT_SHORT, HTTP_TIMEOUT_MEDIUM, TOOL_TIMEOUT,
     apply_llm_request_options, llm_endpoint,
 )
+from ..core.place_extract import extract_destination
 # 必须模块级导入：safe_set 是模块级函数，曾因 SemanticCache 只在
 # handle_simple_task 内局部导入而必然 NameError（被 except 吞掉，缓存静默不写入）
 # SemanticCache 模块级可解析是历史修复契约（09-06 NameError 事故），单测钉住
@@ -59,11 +60,22 @@ INTENT_KEYWORDS: Dict[str, List[str]] = {
 # 如果匹配"推荐"涵盖四个领域，则为全推荐模式
 RECOMMEND_PATTERNS = [
     "推荐", "建议", "攻略", "安排", "规划行程", "旅游计划",
-    "有什么好玩", "帮我规划", "行程安排", "旅行攻略"
+    "有什么好玩", "帮我规划", "行程安排", "旅行攻略",
+    "重新规划", "调整行程", "修改行程", "改行程",
+    "改目的地", "改出发地", "目的地改成", "出发地改成",
 ]
 
 # 如果匹配到多个领域的关键词，超过此数量视为复杂任务
 SIMPLE_MAX_DOMAINS = 1
+
+
+def _has_travel_trip_intent(query: str) -> bool:
+    """识别“目的地 + 旅游/旅行”的规划意图，交给统一槽位澄清。"""
+    if any(marker in query for marker in ("民法典", "法律", "法条", "法规")):
+        return False
+    return bool(extract_destination(query)) and any(
+        marker in query for marker in ("旅游", "旅行", "游玩", "度假", "自由行")
+    )
 
 
 def classify_by_keywords(query: str) -> Dict:
@@ -77,7 +89,6 @@ def classify_by_keywords(query: str) -> Dict:
             if kw in query:
                 matched.add(agent)
                 break  # 一个 agent 只计一次
-
     matched_list = sorted(matched)
 
     # 检测是否为全推荐模式
@@ -87,11 +98,14 @@ def classify_by_keywords(query: str) -> Dict:
     # 法律咨询场景的"推荐"不触发旅游全推荐（P2 #20：如"推荐一本民法典书籍"）
     if has_recommend_kw and any(kw in query for kw in ("民法典", "法律", "法条", "法规")):
         has_recommend_kw = False
-    if has_recommend_kw:
+    # "渭南旅游/成都旅行"即使没有"推荐/规划"也是旅行规划意图，必须补出发地槽位。
+    has_travel_trip = _has_travel_trip_intent(query)
+    if has_recommend_kw or has_travel_trip:
         # 触发全推荐模式的条件（满足任意一条即可）：
         # 1. 匹配了至少2个领域关键词
         # 2. 包含明确的全局规划意图词（攻略/规划/安排/行程等）
         # 3. 匹配了1个领域且包含推荐/安排/规划等词
+        # 4. 已识别目的地且明确提到旅游/旅行
         comprehensive_plan = any(p in query for p in [
             "攻略", "规划", "安排", "行程", "旅游计划",
             "旅行攻略", "帮我规划", "帮我安排"
@@ -100,7 +114,7 @@ def classify_by_keywords(query: str) -> Dict:
             is_recommend = True
         elif comprehensive_plan:
             is_recommend = True
-        elif len(matched_list) >= 1 and has_recommend_kw:
+        elif has_travel_trip or (len(matched_list) >= 1 and has_recommend_kw):
             is_recommend = True
 
     # 全推荐模式下，启用所有4个旅游Agent
@@ -433,6 +447,9 @@ async def handle_simple_task(
             agent_name, user_query, username, user_perms, history,
             persona_id=persona_id,
         )
+        if agent_name == "query_weather":
+            from ..services.conversation_profiles import persist_weather_snapshot
+            await persist_weather_snapshot(mm, tool_result)
         if await is_cancelled_remote(task_id):
             return
 

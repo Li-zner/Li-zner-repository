@@ -70,6 +70,8 @@ export default {
   "recharge_amount": "选择充值金额",
   "recharge_method": "选择支付方式",
   "cancel": "取消",
+  "close": "关闭",
+  "save": "保存",
   "go_recharge": "去充值",
   "close_pay": "关闭 · 完成支付",
   "done": "完成",

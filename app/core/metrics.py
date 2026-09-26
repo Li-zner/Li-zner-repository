@@ -210,3 +210,12 @@ safety_filter_timeout_total = Counter(
     'safety_filter_timeout_total',
     'DFA safety filter scans aborted by timeout (content passed unfiltered)'
 )
+
+# CORE-2（2026-09-20 审查）：后台循环死亡此前只有 warning 日志，CDC/维护/补偿
+# 循环静默退出后只能经 lag 间接发现。每循环退出计一次，配套 alert.rules.yml
+# BackgroundLoopStopped（increase > 0 即告警）。reason ∈ {error, cancelled, returned}
+background_loop_stopped_total = Counter(
+    'background_loop_stopped_total',
+    '后台循环退出次数（按循环名与原因）',
+    ['loop', 'reason']
+)

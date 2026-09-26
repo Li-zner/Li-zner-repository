@@ -5,6 +5,8 @@ from __future__ import annotations
 from fastapi import FastAPI, Request
 from starlette.responses import Response
 
+from .config import TRUST_PROXY_HEADERS, peer_is_trusted_proxy
+
 
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
@@ -56,7 +58,14 @@ def apply_security_headers(request: Request, response: Response,
     """把安全头写入响应，HTTPS 场景额外启用 HSTS。"""
     for name, value in headers.items():
         response.headers[name] = value
-    forwarded = request.headers.get("x-forwarded-proto", "")
+    # x-forwarded-proto 是客户端可自报的头（直连网关即可，无需反代），而 HSTS 一旦
+    # 下发就是浏览器侧一年期"只用 HTTPS"硬锁：伪造一次该头能让明文站点把用户钉死
+    # 在打不开的页面上。故与 auth._client_ip 用同一判据——只有 socket 对端确实命中
+    # TRUSTED_PROXY_CIDRS（或显式开了逃生口）才采信转发头，否则只看请求 URL 的 scheme。
+    forwarded = ""
+    peer = request.client.host if request.client else ""
+    if TRUST_PROXY_HEADERS or peer_is_trusted_proxy(peer):
+        forwarded = request.headers.get("x-forwarded-proto", "")
     if request.url.scheme == "https" or forwarded.lower() == "https":
         response.headers["Strict-Transport-Security"] = (
             "max-age=31536000; includeSubDomains"

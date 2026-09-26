@@ -71,6 +71,17 @@ def _normalize_with_map(text: str) -> tuple:
     return "".join(out), origins
 
 
+# 输出侧单次扫描（find_first / check_stream / 流式守卫切点）的归一化+匹配预算。
+# 2026-09-22 审阅 P1：带截止的 _normalize_capped 此前只用在输入侧
+# contains_sensitive，输出侧两个调用点直调无截止的 _normalize_with_map——
+# 归一化是逐字符纯 Python 循环，对抗输出用零宽填充就能把事件循环冻死。
+# 预算耗尽一律 fail-closed（宁可误杀，不可冻结）。
+_SCAN_BUDGET_MS = 2000
+# 流式守卫待缓冲文本上限：正常尾巴只有"最长词-1"个字符（个位数），
+# 远超此值即为对抗性填充，继续留着只会让下一块重扫更大整段。
+_MAX_GUARD_PENDING_CHARS = 4096
+
+
 # ============================================================
 # DFA 节点
 # ============================================================
@@ -83,6 +94,11 @@ class _DFANode:
 
 class SafetyFilter:
     """DFA 敏感词过滤器（含超时机制）"""
+
+    # find_first 预算耗尽时返回的"强制命中"标记：词库侧同样过 NFKC+去 Cf/Mn
+    # 归一化（见 _build_trie），带 \\x00 前缀的串不可能与任何真实敏感词相撞，
+    # 因此 check_stream 可以按它单独分支，而不会把正常命中误判成超时。
+    FAIL_CLOSED_WORD = "\x00[budget-exhausted]"
 
     def __init__(self, extra_words: list = None):
         self._root = _DFANode()
@@ -192,7 +208,13 @@ class SafetyFilter:
         if not text:
             return False
         start = time.perf_counter()
-        norm, _ = _normalize_with_map(text)
+        # AUTH-2（2026-09-20 审查）：归一化是逐字符纯 Python 循环，此前超时预算
+        # 只在 _scan_segment 检查——超长输入在归一化阶段完全跑不掉，fail-closed
+        # 修复等于把"绕过"换成了"冻结事件循环的 DoS"。分片归一化、片间查预算
+        # （NFKC 与类别判定逐字符、上下文无关，分片拼接与整段处理等价）。
+        norm = self._normalize_capped(text, timeout_ms, start)
+        if norm is None:
+            return self._fail_closed(timeout_ms)
         offset = 0
         overlap = max(1, getattr(self, "max_word_len", 1) - 1)
         step = max(1, 5000 - overlap)
@@ -202,10 +224,40 @@ class SafetyFilter:
             offset += step
         return False
 
-    def _fail_closed(self, timeout_ms: int) -> bool:
-        """超时=按命中：对抗文本不能再靠耗尽预算换到放行。"""
+    @staticmethod
+    def _normalize_capped(text: str, timeout_ms: int, start: float):
+        """带截止时间的分片归一化；预算耗尽返回 None（调用方按命中=fail-closed 处理）"""
+        capped = SafetyFilter._normalize_capped_with_map(text, timeout_ms, start)
+        return None if capped is None else capped[0]
+
+    @staticmethod
+    def _normalize_capped_with_map(text: str, timeout_ms: int, start: float):
+        """同上，但保留 (norm, origins) 映射，供需要把命中换算回原文坐标的调用方用。
+
+        origins 需按分片起点平移：片内下标是 8192 相对值，直接拼接会让第二片之后
+        的命中坐标整体偏回文本开头（find_first 的截断点因此切错位置）。
+        """
+        if timeout_ms <= 0:
+            return _normalize_with_map(text)
+        pieces = []
+        origins = []
+        for i in range(0, len(text), 8192):
+            if (time.perf_counter() - start) * 1000 > timeout_ms:
+                return None
+            piece, mapping = _normalize_with_map(text[i:i + 8192])
+            pieces.append(piece)
+            origins.extend([o + i for o in mapping])
+        return "".join(pieces), origins
+
+    @staticmethod
+    def _note_fail_closed(timeout_ms: int) -> None:
+        """预算耗尽的唯一记账出口（指标 + 告警），输入侧与流式输出侧共用。"""
         safety_filter_timeout_total.inc()
         logger.warning(f"DFA 扫描超时({timeout_ms}ms)，fail-closed 拦截")
+
+    def _fail_closed(self, timeout_ms: int) -> bool:
+        """超时=按命中：对抗文本不能再靠耗尽预算换到放行。"""
+        self._note_fail_closed(timeout_ms)
         return True
 
     def _scan_segment(self, text: str, timeout_ms: int, start: float = 0.0) -> bool:
@@ -244,25 +296,43 @@ class SafetyFilter:
             stack.extend(node.children.values())
         return count
 
-    def find_first(self, text: str) -> tuple:
+    def find_first(self, text: str, timeout_ms: int = _SCAN_BUDGET_MS,
+                   start: float | None = None) -> tuple:
         """
         找到第一个敏感词（不含白名单同句豁免，仅供 check_stream 内部使用——
         对外检查请用 contains_sensitive / check_stream，两者才带豁免语义）
         判定在归一化文本上进行，返回的起止位置已映射回**原文**坐标：
         (敏感词, 起始位置, 结束位置) 或 None
+
+        预算耗尽返回 (FAIL_CLOSED_WORD, 0, len(text))：与 contains_sensitive
+        同一"超时=命中"语义（2026-09-22 审阅 P1）。此处此前直调无截止的
+        _normalize_with_map，而它每块都吃整段待缓冲文本——零宽填充因此能把
+        纯 Python 逐字符循环变成事件循环冻结器。
+        start 由 check_stream 传入，让一次调用内的多次续扫共享同一份预算。
         """
         if not text:
             return None
-        norm, origins = _normalize_with_map(text)
+        deadline_start = time.perf_counter() if start is None else start
+        capped = self._normalize_capped_with_map(text, timeout_ms, deadline_start)
+        if capped is None:
+            self._note_fail_closed(timeout_ms)
+            return self.FAIL_CLOSED_WORD, 0, len(text)
+        norm, origins = capped
         # 分窗扫描而非直接截断，避免超大单块从 5000 字符后绕过检查。
         window = 5000
         overlap = max(0, int(getattr(self, "max_word_len", 1)) - 1)
         step = max(1, window - overlap)
-        for start in range(0, len(norm), step):
-            found = self._find_first_in_text(norm[start:start + window])
+        for base in range(0, len(norm), step):
+            # 逐窗查预算：归一化已过，扫描同样是纯 Python，多窗长文本不能白拿
+            if base and (time.perf_counter() - deadline_start) * 1000 > timeout_ms:
+                self._note_fail_closed(timeout_ms)
+                return self.FAIL_CLOSED_WORD, 0, len(text)
+            found = self._find_first_in_text(norm[base:base + window])
             if found:
                 word, rel_start, rel_end = found
-                abs_start, abs_end = start + rel_start, start + rel_end
+                if word == self.FAIL_CLOSED_WORD:
+                    return self.FAIL_CLOSED_WORD, 0, len(text)
+                abs_start, abs_end = base + rel_start, base + rel_end
                 # 归一化可能删字/展开，end 取下一归一字符的原文下标（越界即文末）
                 end_orig = origins[abs_end] if abs_end < len(origins) else len(text)
                 return word, origins[abs_start], end_orig
@@ -288,12 +358,25 @@ class SafetyFilter:
         """
         if not chunk:
             return {"safe": True, "chunk": chunk, "triggered_word": None}
+        # 一次调用一份预算：同句豁免会多次重入 find_first，每次都重置预算等于把
+        # 预算乘以命中次数，白名单词就成了"用豁免换时间"的放大器（09-22 P1）
+        deadline_start = time.perf_counter()
         offset = 0
         while True:
-            result = self.find_first(chunk[offset:])
+            result = self.find_first(chunk[offset:], timeout_ms=_SCAN_BUDGET_MS,
+                                     start=deadline_start)
             if not result:
                 return {"safe": True, "chunk": chunk, "triggered_word": None}
             word, start, end = result
+            if word == self.FAIL_CLOSED_WORD:
+                # 必须在同句豁免之前收口：豁免分支会把 offset 置成 abs_end，
+                # 而超时命中的坐标是 (0, 0)，offset 不推进就是死循环
+                logger.warning("DFA 流式扫描预算耗尽，fail-closed 拦截")
+                return {
+                    "safe": False,
+                    "chunk": chunk[:offset],
+                    "triggered_word": word,
+                }
             abs_start, abs_end = offset + start, offset + end
             # 同句豁免：命中词所在句含白名单词 → 跳过该命中继续向后找
             if self._in_safe_context(self._sentence_at(chunk, abs_start)):
@@ -428,6 +511,14 @@ class ContentStreamGuard:
         if not chunk:
             return "", False
         text = self._pending + chunk
+        if len(text) > _MAX_GUARD_PENDING_CHARS:
+            # 09-22 审阅 P1：零宽填充把 _pending 撑大后，每一块都要把整段重新
+            # 归一化 + 重扫（纯 Python 逐字符循环）——没有上限就等于把"预算耗尽"
+            # 换成"每块都跑满预算"，照样冻结事件循环。超限直接 fail-closed。
+            logger.warning(f"流式守卫缓冲超限（{len(text)} 字符），fail-closed 拦截")
+            self._pending = ""
+            self._blocked = True
+            return self._sf.safe_message, True
         chk = self._sf.check_stream(text)
         if not chk["safe"]:
             self._pending = ""
@@ -436,6 +527,11 @@ class ContentStreamGuard:
         if self._hold <= 0:
             return text, False  # 词库为空/单字词：无缓冲需求（注意 text[:-0] 是空串切片陷阱）
         cut = self._emittable_prefix_len(text)
+        if cut < 0:
+            # 归一化预算耗尽：与 check_stream 命中同一收口，宁可截停不发
+            self._pending = ""
+            self._blocked = True
+            return self._sf.safe_message, True
         if cut <= 0:
             self._pending = text
             return "", False
@@ -449,8 +545,17 @@ class ContentStreamGuard:
         字符会把 hold 全部吃满、把可见的前一字提前发走，跨块的敏感词就漏检
         （实测 "…黑"+5×U+200B+"客…" 在该切块点不拦截）。用 origins 把 hold
         换算回原文坐标，缓冲长度随对抗性填充自动放大。
+
+        预算修复（2026-09-22 审阅 P1）：归一化改走带截止的 _normalize_capped_with_map
+        ——上面的"缓冲随填充自动放大"没有上界时，就是攻击者的放大器；
+        预算耗尽返回 -1，由 feed 按拦截收口（与 check_stream 同语义）。
         """
-        norm, origins = _normalize_with_map(text)
+        capped = SafetyFilter._normalize_capped_with_map(
+            text, _SCAN_BUDGET_MS, time.perf_counter())
+        if capped is None:
+            SafetyFilter._note_fail_closed(_SCAN_BUDGET_MS)
+            return -1
+        norm, origins = capped
         if len(norm) <= self._hold:
             return 0
         return origins[len(norm) - self._hold]

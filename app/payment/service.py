@@ -47,6 +47,10 @@ payment_recharge_total = Counter("payment_recharge_total", "充值请求数（�
 # 避免同名 Counter 重复注册（2026-09-11 审查 P1 告警接线）
 from ..core.metrics import payment_orders_total
 
+# 渠道支付超时（秒）：与 order:{order_no} 锁 TTL 30s 配套（refund 侧同名常量
+# _CHANNEL_REFUND_TIMEOUT_SECONDS 同口径）——渠道耗时 + 本地结算须落在锁有效期内
+_CHANNEL_PAY_TIMEOUT_SECONDS = 10.0
+
 
 # ============================================================
 # 充值流程
@@ -215,6 +219,13 @@ async def _invoke_channel(order: dict) -> dict:
     """调用支付渠道（事务外，P0 #33：渠道路径 I/O 不持有 DB 连接；超时保护 P1 #20）
 
     A17：admin 停用渠道后立即生效（实时查 is_active）。返回渠道结果 dict。
+
+    2026-09-22 审阅 P1 的同类漏口（与 refund._call_channel_refund 一起修）：
+    wait_for 抛的 TimeoutError 不是 ValueError，routes 的 `except ValueError` 漏接
+    → 充值接口裸 500。这里收敛为同一业务口径（400，"稍后查询订单状态"）。
+    超时只代表没等到回复、**渠道侧结果未知**：异常在 record_channel_result 之前抛出，
+    attempt 留在 processing（300s 后转 manual_review）。绝不能记 channel_failed——
+    那会让下一次重试新建 attempt 再次打渠道，真渠道下等于重复扣款。
     """
     pool = await get_pool()
     async with pool.acquire(timeout=5) as conn:
@@ -225,7 +236,14 @@ async def _invoke_channel(order: dict) -> dict:
     if _active is False:
         return {"success": False, "message": "支付渠道已停用"}
     channel = get_channel(order["payment_method"])
-    return await asyncio.wait_for(channel.pay(order), timeout=10.0)
+    try:
+        return await asyncio.wait_for(
+            channel.pay(order), timeout=_CHANNEL_PAY_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError as exc:
+        logger.error(
+            f"渠道支付超时（结果未知，attempt 留在 processing 待恢复/人工）: "
+            f"order={order.get('order_no')}, amount={order.get('amount')}")
+        raise ValueError("支付渠道响应超时，结果未知，请稍后查询订单状态") from exc
 
 
 def _recharge_response(channel_result: dict, order_no: str, now, after_balance) -> dict:
@@ -292,17 +310,22 @@ async def _settle_recharge(
             raise ValueError(f"订单状态不允许支付: {locked['status']}")
         if (not channel_succeeded and locked["expire_at"]
                 and locked["expire_at"] < _utcnow()):
+            # 纵深防御（2026-09-22 审阅 P2）：状态迁移必须自带前置条件。
+            # 现在靠同一事务的 FOR UPDATE + 上面的 allowed 判定保证安全，但一旦有人
+            # 去掉行锁或新增调用方，`WHERE order_no = $1` 会把已 success 的订单改写成
+            # expired（等于抹掉一笔已入账的充值）。前置集合与 allowed 完全一致。
             await conn.execute(
                 "UPDATE payment_orders SET status = 'expired', updated_at = CURRENT_TIMESTAMP "
-                "WHERE order_no = $1", order_no,
+                "WHERE order_no = $1 AND status IN ('pending', 'failed')", order_no,
             )
             raise ValueError("订单已过期")
 
         if not channel_succeeded:
             # 渠道失败：标记 failed（无 paid_at / 无余额变动），返回 None 占位
+            # 同上：带状态前置，绝不允许把 success/partial_refunded 改写成 failed
             await conn.execute(
                 "UPDATE payment_orders SET status = 'failed', updated_at = CURRENT_TIMESTAMP "
-                "WHERE order_no = $1", order_no,
+                "WHERE order_no = $1 AND status IN ('pending', 'failed')", order_no,
             )
             payment_orders_total.labels(
                 order_type='recharge', status='failed',
@@ -327,15 +350,21 @@ async def _apply_recharge_success(
     now = _utcnow()
     amount = locked["amount"]
     payment_method = locked["payment_method"]
-    await conn.execute(
+    # 纵深防御（2026-09-22 审阅 P2）：状态前置与 _settle_recharge 的 allowed 集合一致
+    # （success 已在前面提前返回，partial_refunded/refunded 一律不许被充值改写）。
+    # 影响行数必须为 1：本语句之后就是钱包入账，更新不到行说明订单状态已被并发变更，
+    # 抛错让整笔事务回滚，杜绝"钱进了钱包、订单却没转 success"的账实不符。
+    result = await conn.execute(
         """UPDATE payment_orders SET
            status = 'success', paid_at = $1,
            channel_order_no = $2,
            callback_status = 'not_needed',
            updated_at = CURRENT_TIMESTAMP
-           WHERE order_no = $3""",
+           WHERE order_no = $3 AND status IN ('pending', 'failed', 'expired')""",
         now, channel_result.get("channel_order_no", ""), order_no,
     )
+    if "UPDATE 1" not in result:
+        raise ValueError("订单状态已被并发变更，充值结算回滚")
     payment_orders_total.labels(
         order_type='recharge', status='success',
         payment_method=payment_method).inc()
@@ -411,7 +440,13 @@ async def process_recharge(order_no: str, user_id: str) -> dict:
         # 7. 返回结果（A20 埋点）
         return _recharge_response(channel_result, order_no, now, after_balance)
     finally:
-        await _release_lock(lock_key, lock_token)
+        # 2026-09-22 审阅 P2（与扣费/退款路径同一失效模式）：钱已在事务里入账后，
+        # finally 里裸调 Redis 释放锁一旦抖动就会把成功充值谎报成 500。
+        # 锁有 TTL 30s 会自动过期，泄漏只延后同单重试，故只记日志不再上抛。
+        try:
+            await _release_lock(lock_key, lock_token)
+        except Exception as release_err:
+            logger.exception(f"充值锁释放失败（锁将随 TTL 过期，充值结果不受影响）: {release_err}")
 
 
 # ============================================================

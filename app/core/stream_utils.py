@@ -78,8 +78,10 @@ async def stream_llm(api_key: str, model: str, messages: list, *,
     base_url, api_key = llm_endpoint(model, api_key)
 
     breaker = get_breaker(f"llm-stream:{model}", call_timeout=DEEPSEEK_API_TIMEOUT + 5)
-    async with breaker.guard():
-        async with llm_semaphore:
+    # INFRA-2（09-20 审查）：排队的人不该占熔断位——先 semaphore 再 guard，
+    # 否则 HALF_OPEN 探针排队期间全量请求被 CircuitOpenError 秒拒。
+    async with llm_semaphore:
+        async with breaker.guard():
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(DEEPSEEK_API_TIMEOUT, connect=LLM_CONNECT_TIMEOUT)
             ) as client:

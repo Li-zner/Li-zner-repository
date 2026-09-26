@@ -38,8 +38,11 @@ from .rag_request_trace import finish_request, record_span, set_request_identity
 
 logger = setup_logging()
 
-# 历史压缩时保留的最近消息条数（与 SUMMARY_THRESHOLD 的 token 阈值构成双保险，P2 #23）
-_HISTORY_COMPACT_MSGS = 6
+# 兜底截断阈值（2026-09-25 修登记 bug）：原先 30 与 get_context 读取上限
+# SUMMARY_THRESHOLD=30 相等，compress_message_history 恒 no-op，滚动摘要失败时
+# 旧轮无任何兜底。改 20 对齐 runner.py 任务链路 09-22 拍板：留 10 条压缩余量，
+# 让第 11 轮起的旧轮真正折叠进【历史摘要】，与 LLM 滚动摘要层互为兜底。
+_HISTORY_COMPACT_MSGS = 20
 
 
 @dataclass
@@ -80,6 +83,10 @@ class ChatStreamCtx:
     finished: bool = False
     has_history: bool = False
     concurrent_lease: str = ""
+    # 旅行槽位填充：pending 保存待补信息，clear 标记本轮消费后收尾清除。
+    travel_pending: Dict = field(default_factory=dict)
+    travel_waiting_slot: bool = False
+    travel_pending_clear: bool = False
 
 
 async def ensure_chat_allowed(current_user: dict) -> str:
@@ -263,6 +270,8 @@ async def finalize_answer(ctx: ChatStreamCtx, answer: str, write_cache: bool = T
             {"role": "user", "content": ctx.req.query},
             {"role": "assistant", "content": answer},
         )
+        if ctx.travel_pending_clear and hasattr(ctx.mm, "clear_pending_travel"):
+            await ctx.mm.clear_pending_travel()
         if write_cache and not ctx.has_history:
             # safe_set 兜底：后台任务异常不能无人认领（与 runner/router 同一封装）
             spawn(safe_set(ctx.req.query, answer, cache_ctx=ctx.cache_ctx), name="semantic-cache-set")

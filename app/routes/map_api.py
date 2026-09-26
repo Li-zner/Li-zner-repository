@@ -11,6 +11,14 @@ from ..core.logging import setup_logging
 from .auth import _client_ip
 from .map_utils import is_reserved_ip, weather_candidates
 from .map_amap import plan_amap_route
+# 共享池的并入/抽样在 services（09-22 审查 P2：合并要收进单条 Lua 脚本，
+# 本文件已贴 600 行门禁）；键前缀与池参数一并从那里导入，避免两处定义漂移
+from ..services.map_recommend_pool import (
+    CITY_CACHE_PREFIX, RECOMMEND_PICK, RECOMMEND_POOL_MAX,
+    RECOMMEND_TTL_SECONDS,
+    recommend_pick_from_pool as _recommend_pick_from_pool,
+    recommend_pool_put as _recommend_pool_put,
+)
 
 logger = setup_logging()
 
@@ -40,12 +48,9 @@ async def _require_map_qps(current_user: dict) -> None:
 #   只有刷新按钮（force=1）才重新生成并并入池、续期 15 天。
 # Top-N 环境变量 CITY_CACHE_TOP_N 现仅约束天气。
 CITY_HIT_ZSET = "map:city_hits:{date}"
-CITY_CACHE_PREFIX = "map:city_cache:"
 CITY_TOP_N = int(os.getenv("CITY_CACHE_TOP_N", "200"))
 WEATHER_TTL_SECONDS = 86400         # 天气：每天刷新一次
-RECOMMEND_TTL_SECONDS = 15 * 86400  # 美食景点共享池：每次刷新生成续期 15 天
-RECOMMEND_PICK = 3                  # 普通点击每类随机抽取条数
-RECOMMEND_POOL_MAX = 30             # 共享池每类封顶条数（防无界增长）
+# 共享池键前缀与 RECOMMEND_* 口径见 services/map_recommend_pool.py（同一处定义）
 # recommend 失败兜底数据（模块级单例：handler 用同一性判断"是兜底就不写缓存"）
 _DEFAULT_REC = {"foods": ["当地特色小吃", "地道家常菜", "招牌美食"],
                 "spots": ["城市地标", "历史文化街区", "自然公园"]}
@@ -89,52 +94,8 @@ async def _city_cache_put(city: str, kind: str, payload, force: bool = False) ->
                 json.dumps(payload, ensure_ascii=False), ex=WEATHER_TTL_SECONDS)
 
 
-# ---------- 美食/景点共享池（2026-09-20 口径：键不带日期，全员可读） ----------
-
-async def _recommend_pick_from_pool(city: str):
-    """从城市共享池随机抽 3+3；无池/数据损坏/条数不足返回 None（触发生成）。"""
-    import random
-    from ..core.redis import get_redis
-    r = await get_redis()
-    raw = await r.get(f"{CITY_CACHE_PREFIX}recommend:{city}")
-    if raw is None:
-        return None
-    try:
-        pool = json.loads(raw)
-    except ValueError:
-        return None
-    if not isinstance(pool, dict):
-        return None
-    picked = {}
-    for kind in ("foods", "spots"):
-        items = pool.get(kind)
-        if not (isinstance(items, list) and len(items) >= RECOMMEND_PICK):
-            return None
-        picked[kind] = random.sample(items, RECOMMEND_PICK)
-    return picked
-
-
-async def _recommend_pool_put(city: str, result: dict) -> None:
-    """把本轮生成结果并入共享池：新条目在前、去重、封顶 30 条/类，每次写入续期 15 天。"""
-    from ..core.redis import get_redis
-    r = await get_redis()
-    key = f"{CITY_CACHE_PREFIX}recommend:{city}"
-    try:
-        pool = json.loads(await r.get(key) or "{}")
-    except ValueError:
-        pool = {}
-    if not isinstance(pool, dict):
-        pool = {}
-    merged = {}
-    for kind in ("foods", "spots"):
-        old = pool.get(kind) if isinstance(pool.get(kind), list) else []
-        dedup = []
-        for item in [*(result.get(kind) or []), *old]:
-            s = str(item).strip()
-            if s and s not in dedup:
-                dedup.append(s)
-        merged[kind] = dedup[:RECOMMEND_POOL_MAX]
-    await r.set(key, json.dumps(merged, ensure_ascii=False), ex=RECOMMEND_TTL_SECONDS)
+# ---------- 美食/景点共享池：见 services/map_recommend_pool.py ----------
+# 读池与并入池都必须在 Redis 侧单脚本内原子完成，故不在路由层实现。
 
 
 @router.get("/regeo")
@@ -560,6 +521,11 @@ async def _plan_amap_route(req: RouteRequest) -> dict:
         )
     except ValueError as exc:
         raise HTTPException(502, str(exc)) from exc
+    except httpx.HTTPError as exc:
+        # API-3（2026-09-20 审查）：raise_for_status/超时抛 HTTPError 原先不接 → 裸 500；
+        # 且其 str 含完整请求 URL（key 在查询串里），日志只记类型名，对外固定文案。
+        logger.warning(f"高德路线上游请求失败: err_type={type(exc).__name__}")
+        raise HTTPException(502, "路线规划服务暂不可用，请稍后再试") from exc
 
 
 @router.get("/geojson")

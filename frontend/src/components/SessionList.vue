@@ -4,6 +4,8 @@ import { ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useChatStore } from '../stores/chat'
 import { downloadSession } from '../utils/sessions'
+import { userPreview } from '../utils/conversationProfile'
+import type { ChatSession } from '../utils/sessions'
 
 const { t, locale } = useI18n()
 const chat = useChatStore()
@@ -50,6 +52,12 @@ function exportSession(id: string) {
   const s = chat.sessions.find((x) => x.id === id)
   if (s) downloadSession(s, locale.value)
 }
+
+function lastUserPreview(session: ChatSession): string {
+  const message = [...session.messages].reverse().find((item) => item.role === 'user')
+  return message ? userPreview(message.content) : ''
+}
+
 </script>
 
 <template>
@@ -74,7 +82,10 @@ function exportSession(id: string) {
         >
       </template>
       <template v-else>
-        <span class="item-name" :title="s.title">{{ s.title }}</span>
+        <div class="item-copy">
+          <span class="item-name" :title="s.title">{{ s.title }}</span>
+          <span v-if="lastUserPreview(s)" class="item-preview">{{ lastUserPreview(s) }}</span>
+        </div>
         <button
           class="pin-btn"
           :class="{ 'is-pinned': s.pinned }"
@@ -115,6 +126,20 @@ function exportSession(id: string) {
   border-radius: 4px;
   font-size: 12px;
   line-height: 1;
+}
+.item-copy {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+.item-preview {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 /* 置顶会话使用浅主色底强调 */
 .history-item.pinned {

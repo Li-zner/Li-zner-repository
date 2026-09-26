@@ -18,6 +18,8 @@ ACT_PAYMENT = "payment"
 ACT_ADMIN = "admin_op"
 ACT_PHONE_BIND = "phone_bind"
 ACT_RAG_ASK = "rag_ask"
+ACT_RAG_DATA_ASK = "rag_data_ask"
+ACT_RAG_ACTION_PROPOSE = "rag_action_propose"
 ACT_RAG_CONTENT_VIEW = "rag_content_view"
 
 

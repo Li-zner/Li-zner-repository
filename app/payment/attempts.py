@@ -6,12 +6,13 @@
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
+
+import asyncpg
 
 from ..core.db import get_pool
 from ..core.logging import setup_logging
@@ -48,45 +49,71 @@ async def begin_channel_attempt(
     """返回可恢复的渠道 attempt；已有成功 attempt 时直接复用。"""
     pool = await get_pool()
     async with pool.acquire(timeout=5) as conn:
-        async with conn.transaction():
-            existing = await conn.fetchrow(
-                """
-                SELECT * FROM payment_attempts
-                WHERE order_no = $1 AND operation = $2
-                  AND status = ANY($3::text[])
-                ORDER BY created_at DESC
-                LIMIT 1
-                FOR UPDATE
-                """,
-                order_no, operation, list(_ACTIVE_STATUSES),
-            )
-            if existing:
-                result = dict(existing)
-                result["channel_result"] = _decode_json(result.get("channel_result"))
-                result["is_new"] = False
-                return result
-            attempt_id = f"att_{uuid.uuid4().hex[:24]}"
-            if operation == "refund":
-                # F4（2026-09-20 拍板）：渠道实退金额在预留时刻钳制到剩余可退额度。
-                # 本事务对原单 FOR UPDATE，且同一原单同时只允许一条活跃退款 attempt
-                # （上面的 existing 分支挡住并发新建），"渠道调用与本地结算之间
-                # 并发退款已提交"因此不可能发生——超退缺口从源头消灭，而非事后对账。
-                amount = await _clamp_refund_quota(conn, order_no, amount)
-            row = await conn.fetchrow(
-                """
-                INSERT INTO payment_attempts
-                (attempt_id, order_no, user_id, operation, status, amount,
-                 channel_code, idempotency_key, allow_consumption_refund)
-                VALUES ($1, $2, $3, $4, 'processing', $5, $6, $7, $8)
-                RETURNING *
-                """,
-                attempt_id, order_no, user_id, operation, amount,
-                channel_code, idempotency_key, allow_consumption_refund,
-            )
-            result = dict(row)
-            result["channel_result"] = {}
-            result["is_new"] = True
+        try:
+            return await _begin_attempt_locked(conn, order_no, user_id, operation,
+                                               amount, channel_code,
+                                               idempotency_key, allow_consumption_refund)
+        except asyncpg.exceptions.UniqueViolationError as exc:
+            # PAY-3（2026-09-20 审查）：上面 existing 查询与 INSERT 之间，并发请求可
+            # 抢插同一 (order_no, operation) 的活跃 attempt，撞 uq_payment_attempts_active
+            # 唯一索引。UniqueViolationError（IntegrityConstraintViolationError 子类）
+            # 不是 ValueError，routes 层 except 漏接
+            # 变裸 500——转成与"退款尝试仍在处理中"同一业务口径（400 可安全重试）。
+            # 2026-09-22 审阅 P2：**只捕 UniqueViolationError，不捕父类**。
+            # 撞 NOT NULL / CHECK / FK 都是代码写错（字段漏传、状态值拼错），不是并发
+            # 竞争；捕成父类会给用户回"正在处理中，请稍后重试"——一个永远重试不成功的
+            # 假象，还会把真实缺陷从错误日志里抹掉。收窄后编码错误原样上抛为 500。
+            logger.warning(
+                f"attempt 活跃唯一索引竞态: order={order_no}, op={operation}, "
+                f"err_type={type(exc).__name__}")
+            raise ValueError("支付尝试正在处理中，请稍后查询订单状态") from exc
+
+
+async def _begin_attempt_locked(
+    conn, order_no: str, user_id: str, operation: str,
+    amount: Decimal, channel_code: str, idempotency_key: str,
+    allow_consumption_refund: bool,
+) -> dict:
+    """活跃检查 + 预留插入，必须在同一事务内（调用方已持 conn）。"""
+    async with conn.transaction():
+        existing = await conn.fetchrow(
+            """
+            SELECT * FROM payment_attempts
+            WHERE order_no = $1 AND operation = $2
+              AND status = ANY($3::text[])
+            ORDER BY created_at DESC
+            LIMIT 1
+            FOR UPDATE
+            """,
+            order_no, operation, list(_ACTIVE_STATUSES),
+        )
+        if existing:
+            result = dict(existing)
+            result["channel_result"] = _decode_json(result.get("channel_result"))
+            result["is_new"] = False
             return result
+        attempt_id = f"att_{uuid.uuid4().hex[:24]}"
+        if operation == "refund":
+            # F4（2026-09-20 拍板）：渠道实退金额在预留时刻钳制到剩余可退额度。
+            # 本事务对原单 FOR UPDATE，且同一原单同时只允许一条活跃退款 attempt
+            # （上面的 existing 分支挡住并发新建），"渠道调用与本地结算之间
+            # 并发退款已提交"因此不可能发生——超退缺口从源头消灭，而非事后对账。
+            amount = await _clamp_refund_quota(conn, order_no, amount)
+        row = await conn.fetchrow(
+            """
+            INSERT INTO payment_attempts
+            (attempt_id, order_no, user_id, operation, status, amount,
+             channel_code, idempotency_key, allow_consumption_refund)
+            VALUES ($1, $2, $3, $4, 'processing', $5, $6, $7, $8)
+            RETURNING *
+            """,
+            attempt_id, order_no, user_id, operation, amount,
+            channel_code, idempotency_key, allow_consumption_refund,
+        )
+        result = dict(row)
+        result["channel_result"] = {}
+        result["is_new"] = True
+        return result
 
 
 async def _clamp_refund_quota(conn, order_no: str, requested: Decimal) -> Decimal:
@@ -94,6 +121,8 @@ async def _clamp_refund_quota(conn, order_no: str, requested: Decimal) -> Decima
 
     可退基数口径与 refund._decide_refund 对称：abs(原单金额) - 已退累计。
     剩余额度不足请求量时按剩余钳制（宁可少退给渠道，绝不超退）；退尽则拒绝。
+    下面这条 SUM 在持原单 FOR UPDATE 的事务里执行，扫描时间直接就是行锁持有时间，
+    故 metadata->>'original_order_no' 由迁移 z6b7c8d9e0f1 建部分表达式索引覆盖。
     """
     order = await conn.fetchrow(
         "SELECT status, amount FROM payment_orders WHERE order_no = $1 FOR UPDATE",
@@ -244,18 +273,8 @@ async def _settle_attempt(row: dict) -> bool:
     return False
 
 
-async def payment_attempt_recovery_loop(interval_seconds: int = 300) -> None:
-    """周期恢复渠道成功后中断的本地结算。"""
-    while True:
-        await sleep_seconds(interval_seconds)
-        try:
-            settled = await settle_recoverable_attempts()
-            if settled:
-                logger.info(f"支付尝试恢复结算 {settled} 条")
-        except Exception as exc:
-            logger.warning(f"支付尝试恢复循环异常（下轮重试）: {exc}")
-
-
-async def sleep_seconds(seconds: int) -> None:
-    """抽出 sleep，便于测试恢复循环时不真实等待。"""
-    await asyncio.sleep(seconds)
+# 2026-09-22 审阅 P2：此处原有 `payment_attempt_recovery_loop` + 专用 `sleep_seconds`
+# 已删除——全仓（app/ scripts/ tests/ .github 工作流）零调用方。恢复由
+# `deferred.settlement_loop` 每轮内联调用 `settle_recoverable_attempts` 驱动
+# （main.py 只启动 settlement_loop）。留第二条循环入口会误导排障：改 interval 不生效、
+# 或以为有两个循环在跑从而重复扫描。

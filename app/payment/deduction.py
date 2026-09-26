@@ -125,6 +125,22 @@ async def _apply_token_deduction(
     return tx_before, actual_deduct, new_balance
 
 
+async def _acquire_wallet_lock(user_id: str) -> tuple:
+    """抢 wallet:{user_id} 分布式锁（同用户钱包变更串行化，防并发扣费版本冲突）。
+
+    竞争时指数退避重试 3 次；仍失败返回 (lock_key, None)，调用方转「待结算占位单」
+    由维护任务补偿结算——原实现直接跳过 = 高并发下漏计费且无痕
+    （2026-09-05 修复，占位见 deferred.py）。
+    """
+    lock_key = f"wallet:{user_id}"
+    for attempt in range(3):
+        lock_token = await _acquire_lock(lock_key)
+        if lock_token:
+            return lock_key, lock_token
+        await asyncio.sleep(0.05 * (2 ** attempt))
+    return lock_key, None
+
+
 async def deduct_token_cost(
     user_id: str,
     token_count: int,
@@ -144,16 +160,8 @@ async def deduct_token_cost(
     # 生成扣费订单号
     order_no = await _generate_order_no()
 
-    # 分布式锁：同一用户钱包的并发变更串行化（防止并发扣费版本冲突）。
-    # 竞争时退避重试 3 次；仍失败转「待结算占位单」由维护任务补偿结算——
-    # 原实现直接跳过 = 高并发下漏计费且无痕（2026-09-05 修复，占位见 deferred.py）。
-    lock_key = f"wallet:{user_id}"
-    lock_token = None
-    for attempt in range(3):
-        lock_token = await _acquire_lock(lock_key)
-        if lock_token:
-            break
-        await asyncio.sleep(0.05 * (2 ** attempt))
+    # 钱包锁策略与"抢不到就转占位单"的理由见 _acquire_wallet_lock
+    lock_key, lock_token = await _acquire_wallet_lock(user_id)
     if not lock_token:
         await defer_deduction(order_no, user_id, cost_amount, token_count, session_id, remark)
         payment_deduct_total.labels(status="deferred").inc()  # 2026-09-10 审查 P2：延后可观测
@@ -177,7 +185,12 @@ async def deduct_token_cost(
         payment_deduct_total.labels(status="failed").inc()
         return {"deducted": False, "amount": 0, "reason": "system error"}
     finally:
-        await _release_lock(lock_key, lock_token)
+        # 2026-09-22 审阅 P2：扣费已在事务里提交，裸调 Redis 释放锁一旦抖动就会把成功
+        # 谎报成失败（上层按未扣费处理会二次扣费）。锁随 TTL(10s) 自动过期，只记日志。
+        try:
+            await _release_lock(lock_key, lock_token)
+        except Exception as release_err:
+            logger.exception(f"扣费锁释放失败（锁将随 TTL 过期，扣费结果不受影响）: {release_err}")
 
     logger.info(f"Token扣费: user={user_id}, tokens={token_count}, "
                 f"amount={actual_deduct}, balance_before={before_balance}, balance_after={new_balance}")

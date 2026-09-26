@@ -20,7 +20,8 @@ from ..core.config import (
     DEEPSEEK_FLASH_MODEL, HTTP_TIMEOUT_LONG,
 )
 from ..core.safety_filter import (
-    ContentStreamGuard, sanitize_untrusted_text, serialize_untrusted_value,
+    ContentStreamGuard, sanitize_error_text, sanitize_untrusted_text,
+    serialize_untrusted_value,
 )
 from ..core.stream_utils import dispatch_tool, stream_llm
 from ..core.task_manager import (
@@ -28,6 +29,7 @@ from ..core.task_manager import (
     is_cancelled_remote, cancel_task_if_active, clear_cancel_marker,
     reset_accumulated_result,
 )
+from ..services.conversation_profiles import persist_weather_snapshot
 
 logger = setup_logging()
 
@@ -154,7 +156,8 @@ async def _run_discussion(user_query: str,
 
 async def _handle_tool_step(task_id: str, username: str, user_query: str,
                             assistant_content: str, messages: list, tool_calls_list: list,
-                            intent, user_perms, persona_id: str = "") -> str:
+                            intent, user_perms, persona_id: str = "",
+                            mm=None) -> str:
     """执行本轮工具调用并按结果续写对话（工具消息 + 多 Agent 讨论）。
 
     返回 "ok"（继续下一轮）/ "cancelled"（降级中任务已取消）/ "timeout"（工具超时已降级，
@@ -195,8 +198,13 @@ async def _handle_tool_step(task_id: str, username: str, user_query: str,
     # 工具结果喂回模型：错误工具换成友好兜底文案，不把原始报错透给用户
     tool_msgs = []
     for idx, result in enumerate(tool_results):
+        func_name = tool_calls_list[idx]["function"]["name"]
         if isinstance(result, Exception):
-            result = {"error": str(result)}
+            # CHAT-4（2026-09-20 审查）：异常 str 可含带 key 的完整 URL，剥指纹后
+            # 再进 LLM 上下文（与 chat_react 同口径；"未找到/超时"关键字不受影响）
+            result = {"error": sanitize_error_text(str(result))}
+        if func_name == "query_weather":
+            await persist_weather_snapshot(mm, result)
         if isinstance(result, dict) and "error" in result:
             err = result["error"]
             fb = "获取数据失败了，可能服务暂时不可用。"
@@ -275,57 +283,62 @@ async def _fallback_flash(user_query: str, username: str):
     _usage = None  # include_usage 尾块用量（2026-09-09 计费收口）
     _full = ""     # 断连估算用已产出累积（2026-09-09 P1）
     _blocked = False
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_LONG) as client:
-        async with client.stream(
-            "POST", f"{DEEPSEEK_API_BASE}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": DEEPSEEK_FLASH_MODEL, "messages": [{"role": "user", "content": user_query}],
-                  "stream_options": {"include_usage": True}, "max_tokens": 1024},
-        ) as resp:
-            resp.raise_for_status()
-            try:
-                async for line in resp.aiter_lines():
-                    if line.startswith("data:"):
-                        data_str = line[5:].strip()
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            data = json.loads(data_str)
-                            # include_usage 尾块 choices 为空，取值须容忍（同 chat_fallback 修复）
-                            if data.get("usage"):
-                                _usage = data["usage"]
-                            choices = data.get("choices") or [{}]
-                            chunk = choices[0].get("delta", {}).get("content", "")
-                            if chunk:
-                                if _blocked:
-                                    continue
-                                _full += chunk
-                                piece, is_blocked = guard.feed(chunk)
-                                if is_blocked:
-                                    _blocked = True
-                                    yield sf.safe_message
-                                    continue
-                                if piece:
-                                    yield piece
-                        except json.JSONDecodeError:
-                            continue  # 非数据行/残包：跳过继续读流（P2 修复：不再裸 pass）
-            except (GeneratorExit, asyncio.CancelledError):
-                # 断连/取消估算计费（2026-09-09 审查 P1）：直连 httpx 无法安全排空，
-                # 退化按已产出文本估算（正常完成路径已在下方按真实 usage 计费）
-                if username and _full:
+    # CHAT-5（2026-09-20 审查）：任务侧降级此前不持 llm_semaphore（SSE 侧
+    # chat_fallback._flash_sse 持），故障风暴时任务路径绕过全局 LLM 并发闸；
+    # 与 chat_fallback 同法——整段流式消费持锁
+    from ..core.concurrency import llm_semaphore
+    async with llm_semaphore:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_LONG) as client:
+            async with client.stream(
+                "POST", f"{DEEPSEEK_API_BASE}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": DEEPSEEK_FLASH_MODEL, "messages": [{"role": "user", "content": user_query}],
+                      "stream_options": {"include_usage": True}, "max_tokens": 1024},
+            ) as resp:
+                resp.raise_for_status()
+                try:
+                    async for line in resp.aiter_lines():
+                        if line.startswith("data:"):
+                            data_str = line[5:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                data = json.loads(data_str)
+                                # include_usage 尾块 choices 为空，取值须容忍（同 chat_fallback 修复）
+                                if data.get("usage"):
+                                    _usage = data["usage"]
+                                choices = data.get("choices") or [{}]
+                                chunk = choices[0].get("delta", {}).get("content", "")
+                                if chunk:
+                                    if _blocked:
+                                        continue
+                                    _full += chunk
+                                    piece, is_blocked = guard.feed(chunk)
+                                    if is_blocked:
+                                        _blocked = True
+                                        yield sf.safe_message
+                                        continue
+                                    if piece:
+                                        yield piece
+                            except json.JSONDecodeError:
+                                continue  # 非数据行/残包：跳过继续读流（P2 修复：不再裸 pass）
+                except (GeneratorExit, asyncio.CancelledError):
+                    # 断连/取消估算计费（2026-09-09 审查 P1）：直连 httpx 无法安全排空，
+                    # 退化按已产出文本估算（正常完成路径已在下方按真实 usage 计费）
+                    if username and _full:
+                        record_token_usage(
+                            {"prompt_tokens": 0, "completion_tokens": _estimate_tokens(_full)},
+                            username, "",
+                            remark=f"断连估算补计费（任务降级 {_estimate_tokens(_full)} tokens）")
+                    raise
+                if not _blocked:
+                    tail, tail_blocked = guard.flush()
+                    if tail_blocked:
+                        yield sf.safe_message
+                    elif tail:
+                        yield tail
+                # 计入计费（2026-09-09 主人拍板）：任务降级路径原先零计量
+                if _usage:
                     record_token_usage(
-                        {"prompt_tokens": 0, "completion_tokens": _estimate_tokens(_full)},
-                        username, "",
-                        remark=f"断连估算补计费（任务降级 {_estimate_tokens(_full)} tokens）")
-                raise
-            if not _blocked:
-                tail, tail_blocked = guard.flush()
-                if tail_blocked:
-                    yield sf.safe_message
-                elif tail:
-                    yield tail
-            # 计入计费（2026-09-09 主人拍板）：任务降级路径原先零计量
-            if _usage:
-                record_token_usage(
-                    _usage, username, "", model=DEEPSEEK_FLASH_MODEL,
-                )
+                        _usage, username, "", model=DEEPSEEK_FLASH_MODEL,
+                    )

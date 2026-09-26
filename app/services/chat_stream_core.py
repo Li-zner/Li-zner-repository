@@ -23,11 +23,14 @@ from .chat_support import get_deepseek_key
 from .chat_fallback import fallback_chain
 from .chat_fast_paths import simple_fast_path, recommend_fast_path
 from .chat_react import react_loop
+from .chat_travel_flow import (
+    apply_travel_memory, build_travel_query, build_travel_state,
+    next_missing_travel_slot, travel_clarification_gate,
+)
 from .rag_request_trace import (begin_request, finish_request, mark_first_token,
                                 mark_route, record_span)
 
 logger = setup_logging()
-
 
 async def _tracked_stage(stage: str,
                          source: AsyncIterator[str]) -> AsyncIterator[str]:
@@ -55,6 +58,20 @@ def _busy_message(ctx: ChatStreamCtx) -> str:
     return "服务暂时繁忙，请稍后重试。"
 
 
+async def _refund_trial_if_unproduced(username: str) -> None:
+    """SSE 侧试用额度归还（2026-09-20 审查 CHAT-1）。
+
+    任务路径 09-14 决策 #4A 已对"未产生模型调用/输出"退还（runner.py
+    _refund_quota_if_unproduced），SSE 侧此前只扣不退——繁忙/无 Key/降级
+    空流三类终态用户没拿到真实回答也白扣一次额度，同一决策只落了一半。
+    rollback 自带 quota_limited 条件，非受限用户是 no-op。"""
+    from ..core.quota import rollback_used_questions
+    try:
+        await rollback_used_questions(username)
+    except Exception as rb_err:
+        logger.warning(f"试用额度归还失败（依赖故障面，用户可重试）: {rb_err}")
+
+
 async def _finish_busy(ctx: ChatStreamCtx) -> AsyncIterator[str]:
     """防击穿锁不可用时收口，禁止在无锁状态下继续调用模型。"""
     message = _busy_message(ctx)
@@ -62,6 +79,7 @@ async def _finish_busy(ctx: ChatStreamCtx) -> AsyncIterator[str]:
     yield sse("answer_complete", message) + "data: [DONE]\n\n"
     ctx.saved_normally = True
     ctx.finished = True
+    await _refund_trial_if_unproduced(ctx.username)
     await finalize_answer(ctx, message, write_cache=False)
 
 
@@ -70,6 +88,8 @@ async def route_intent(ctx: ChatStreamCtx) -> None:
     from ..agents.router import classify_intent, get_tools_for_intent
     try:
         intent_result = await classify_intent(ctx.user_query, use_llm=False, username=ctx.username)
+        if not is_civil_persona(ctx.persona_id):
+            intent_result = await apply_travel_memory(ctx, intent_result)
         matched_agents = intent_result.get("agents", [])
         is_simple = intent_result.get("is_simple", True)
         is_recommend = intent_result.get("is_recommend", False)
@@ -79,19 +99,33 @@ async def route_intent(ctx: ChatStreamCtx) -> None:
             is_simple = True
             is_recommend = False
             logger.info("民法典人格，强制意图=search_knowledge")
+        elif is_recommend:
+            # 旅行规划是槽位填充：缺目的地/出发地时先澄清，禁止先烧四工具。
+            state = await build_travel_state(ctx)
+            missing_slot = next_missing_travel_slot(state)
+            if missing_slot:
+                state["missing_slot"] = missing_slot
+                ctx.travel_pending = state
+                ctx.travel_waiting_slot = True
+                ctx.travel_pending_clear = False
+            else:
+                ctx.user_query = build_travel_query(state)
         if matched_agents:
             tools = get_tools_for_intent(matched_agents)
         else:
             tools = []
     except Exception as route_err:
-        logger.warning(f"意图路由异常（降级为全部工具）: {route_err}")
+        logger.warning(f"意图路由异常（降级）: {route_err}")
         if is_civil_persona(ctx.persona_id):
+            # civil 人格任何路径都不得降级为无工具通用回答：异常仍锁知识库检索
             from ..agents.tool_definitions import CIVIL_CODE_TOOLS
             matched_agents = ["search_knowledge"]
             is_simple, is_recommend, tools = True, False, CIVIL_CODE_TOOLS
         else:
-            from ..agents.tool_definitions import ALL_TOOLS
-            matched_agents, is_simple, is_recommend, tools = [], True, False, ALL_TOOLS
+            # 2026-09-25 修两链不对称：与任务链 _maybe_simple_task 异常口径统一为
+            # "无工具纯 LLM"。原先赋 ALL_TOOLS 是死赋值（matched_agents=[] 走纯聊
+            # 快速通道，不读 ctx.tools），一旦流形变化进 ReAct 就变成暗放全工具。
+            matched_agents, is_simple, is_recommend, tools = [], True, False, []
     ctx.matched_agents = matched_agents
     ctx.is_simple = is_simple
     ctx.is_recommend = is_recommend
@@ -138,6 +172,7 @@ async def serve_from_cache(ctx: ChatStreamCtx) -> AsyncIterator[str]:
             # 历史、日请求计数与 answer trace 缺失，与缓存命中分支（下述）
             # 同一口径。繁忙提示不入缓存（write_cache=False）。
             ctx.saved_normally = True
+            await _refund_trial_if_unproduced(ctx.username)
             await finalize_answer(ctx, _busy_msg, write_cache=False)
             ctx.finished = True
             return
@@ -318,6 +353,8 @@ async def _run_chat_pipeline(ctx: ChatStreamCtx) -> AsyncIterator[str]:
         yield sse("answer_complete", _config_error) + "data: [DONE]\n\n"
         ctx.saved_normally = True
         ctx.finished = True
+        # CHAT-1：无 Key 属"未产生模型调用"，与任务路径 runner.py:369 同口径退还
+        await _refund_trial_if_unproduced(ctx.username)
         await finalize_answer(ctx, _config_error, write_cache=False)
         return
     _route_started = time.perf_counter()
@@ -328,6 +365,13 @@ async def _run_chat_pipeline(ctx: ChatStreamCtx) -> AsyncIterator[str]:
         attributes={"agents": ctx.matched_agents, "is_simple": ctx.is_simple,
                     "is_recommend": ctx.is_recommend},
     )
+    async for ev in _tracked_stage("travel_clarification",
+                                   travel_clarification_gate(ctx)):
+        yield ev
+        if ctx.finished:
+            return
+    if ctx.finished:
+        return
     async for ev in _tracked_stage("law_mapping", law_mapping_gate(ctx)):
         yield ev
         if ctx.finished:
@@ -359,6 +403,8 @@ async def _fallback_events(ctx: ChatStreamCtx | None,
         yield sse("answer_complete", _civil_error) + "data: [DONE]\n\n"
         ctx.saved_normally = True
         ctx.finished = True
+        # CHAT-1：service_error 为固定文案未打模型，退还预留额度
+        await _refund_trial_if_unproduced(ctx.username)
         await finalize_answer(ctx, _civil_error, write_cache=False)
         return
     logger.error(f"V2 未知异常，降级备胎: {error}", exc_info=True)
@@ -385,6 +431,10 @@ async def _fallback_events(ctx: ChatStreamCtx | None,
     # finalize 结果只影响台账不影响用户
     if ctx is not None:
         ctx.saved_normally = True
+        # CHAT-1：降级链零产出（_fb_text 为空=Flash 未吐出任何内容）时退还；
+        # 有部分产出则按 #4A 口径"部分产出不退"
+        if not _fb_text:
+            await _refund_trial_if_unproduced(ctx.username)
         try:
             await finalize_answer(
                 ctx, _fb_text or '服务暂时不可用，请稍后再试。', write_cache=False)
@@ -398,6 +448,8 @@ async def _cleanup_generation(ctx: ChatStreamCtx | None,
     if ctx is not None:
         await cleanup_stream(ctx)
     else:
+        # CHAT-1：ctx 构建失败（Redis/PG 抖动）时额度已在准入处预留、必然零产出，退还
+        await _refund_trial_if_unproduced(current_user["username"])
         await release_concurrent(
             current_user["username"], current_user.get("_concurrent_lease", "")
         )

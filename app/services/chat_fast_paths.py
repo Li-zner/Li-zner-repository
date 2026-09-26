@@ -24,6 +24,7 @@ from .chat_stream_ctx import ChatStreamCtx, finalize_answer
 from .chat_support import (
     display_safe_tool_result, hide_reasoning, lang_instruction, safe_format_prompt,
 )
+from .conversation_profiles import persist_weather_snapshot
 from .civil_grounding import (
     civil_tool_result,
     find_ungrounded_citations as _find_ungrounded_citations,
@@ -291,12 +292,14 @@ async def simple_fast_path(ctx: ChatStreamCtx) -> AsyncIterator[str]:
                 agent_name, args, ctx.user_query, ctx.user_perms,
                 getattr(ctx, "username", ""), persona_id=ctx.persona_id,
             )
+            if agent_name == "query_weather":
+                await persist_weather_snapshot(getattr(ctx, "mm", None), tool_result)
             if agent_name == "search_knowledge":
                 from ..core.audit import audit
                 await audit(ctx.username, "kb_search", {"query": ctx.user_query[:200]})
             yield f"data: {json.dumps({'type': 'reasoning_done'})}\n\n"
             yield f"data: {json.dumps({'type': 'tool_call', 'name': agent_name, 'args': args})}\n\n"
-            yield f"data: {json.dumps({'type': 'tool_result', 'index': 0, 'result': display_safe_tool_result(tool_result)})}\n\n"
+            yield f"data: {json.dumps({'type': 'tool_result', 'name': agent_name, 'index': 0, 'result': display_safe_tool_result(tool_result)})}\n\n"
 
         civil_buffer = is_civil_persona(ctx.persona_id) and agent_name == "search_knowledge"
         stop_message = _civil_stop_message(ctx, agent_name, tool_result)
@@ -367,8 +370,10 @@ async def _run_recommend_tools(ctx: ChatStreamCtx, tool_results: List[Tuple[str,
         for done in asyncio.as_completed(tasks, timeout=TOOL_TIMEOUT):
             name, res = await done
             tool_results.append((name, res))
+            if name == "query_weather":
+                await persist_weather_snapshot(getattr(ctx, "mm", None), res)
             yield f"data: {json.dumps({'type': 'tool_call', 'name': name, 'args': {}})}\n\n"
-            yield f"data: {json.dumps({'type': 'tool_result', 'index': 0, 'result': display_safe_tool_result(res)})}\n\n"
+            yield f"data: {json.dumps({'type': 'tool_result', 'name': name, 'index': 0, 'result': display_safe_tool_result(res)})}\n\n"
     except TimeoutError:
         for t in tasks:
             if not t.done():
@@ -377,7 +382,7 @@ async def _run_recommend_tools(ctx: ChatStreamCtx, tool_results: List[Tuple[str,
             if name not in {n for n, _ in tool_results}:
                 tool_results.append((name, {"error": "tool timeout"}))
                 yield f"data: {json.dumps({'type': 'tool_call', 'name': name, 'args': {}})}\n\n"
-                yield f"data: {json.dumps({'type': 'tool_result', 'index': 0, 'result': {'error': 'tool timeout'}})}\n\n"
+                yield f"data: {json.dumps({'type': 'tool_result', 'name': name, 'index': 0, 'result': {'error': 'tool timeout'}})}\n\n"
 
 
 async def recommend_fast_path(ctx: ChatStreamCtx) -> AsyncIterator[str]:

@@ -80,36 +80,86 @@ async def get_task(task_id: str) -> Optional[dict]:
     # 惰性超时：pending/generating 超时 → CAS 写回真实终态 timeout 并设取消
     # 标记（生成实例下一检查点退出）。2026-09-12 修复（外部复核 P1）：原实现只在
     # 返回对象上标记不回写——后台任务继续运行并可能晚到写 completed。
+    # CORE-1（2026-09-20 审查）：本惰性检查只覆盖"有人在轮询"的路径，
+    # 无人轮询时由生成侧 timeout_deadline 独立到点终结（同一 mark_task_timeout）。
     if result.get("status") in ("pending", "generating"):
-        try:
-            _dt = datetime.fromisoformat(result.get("created_at") or "")
-            if _dt.tzinfo is None:
-                _dt = _dt.replace(tzinfo=timezone.utc)
-            if (datetime.now(timezone.utc) - _dt).total_seconds() > TASK_TIMEOUT:
-                ok = await r.eval(
-                    _TIMEOUT_TASK_LUA, 1, f"task:{task_id}",
-                    "timeout", result.get("result") or "",
-                    datetime.now(timezone.utc).isoformat(),
-                    str(TASK_TTL),
-                )
-                if ok == 1:
-                    # 设跨实例取消标记：生成实例在下一检查点（usage/边界）退出
-                    await r.set(_cancel_key(task_id), "timeout", ex=TASK_TTL)
-                    logger.warning(f"任务超时已终结: task_id={task_id}")
+        age = _task_age_seconds(result)
+        if age is not None and age > TASK_TIMEOUT:
+            # 终结动作本身会再走两次 Redis（hgetall + eval）。2026-09-22 审阅 P2：
+            # 这块从 try 里移出来之后，抖动一次就让轮询接口 500——前端看到的不是
+            # "还没好"而是报错。超时终结失败按"不终结"处理：返回已读到的旧快照，
+            # 状态未知不等于状态错误，下一轮轮询与生成侧闹钟都会再试一次。
+            try:
+                if await mark_task_timeout(task_id):
                     result["status"] = "timeout"
-                else:
-                    # CAS 失败说明其他实例已写终态；必须重读真实状态，
-                    # 不能把返回对象强行标成 timeout 欺骗调用方。
-                    fresh = await r.hgetall(f"task:{task_id}")
-                    if fresh:
-                        result = {
-                            k.decode() if isinstance(k, bytes) else k:
-                            v.decode() if isinstance(v, bytes) else v
-                            for k, v in fresh.items()
-                        }
-        except Exception as e:
-            logger.debug(f"任务超时检查时间解析失败: {e}")
+                    return result
+                # CAS 失败说明其他实例已写终态；必须重读真实状态，
+                # 不能把返回对象强行标成 timeout 欺骗调用方。
+                fresh = await r.hgetall(f"task:{task_id}")
+            except Exception as e:
+                logger.warning(f"任务超时终结失败（按未终结返回旧快照）: {e}")
+                return result
+            if fresh:
+                result = {
+                    k.decode() if isinstance(k, bytes) else k:
+                    v.decode() if isinstance(v, bytes) else v
+                    for k, v in fresh.items()
+                }
     return result
+
+
+def _task_age_seconds(result: dict) -> Optional[float]:
+    """任务创建至今秒数；created_at 缺失/不可解析返回 None（按不超时处理）。"""
+    try:
+        _dt = datetime.fromisoformat(result.get("created_at") or "")
+    except (TypeError, ValueError) as e:
+        logger.debug(f"任务超时检查时间解析失败: {e}")
+        return None
+    if _dt.tzinfo is None:
+        _dt = _dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - _dt).total_seconds()
+
+
+async def mark_task_timeout(task_id: str) -> bool:
+    """仍活跃的任务 CAS 终结为 timeout 并设跨实例取消标记。
+
+    get_task 惰性检查与 CORE-1 生成侧定时截止共用此入口；
+    已终态/不存在/CAS 输都返回 False（无副作用，可安全重复调用）。
+    """
+    r = await _redis()
+    data = await r.hgetall(f"task:{task_id}")
+    if not data:
+        return False
+    result = {k.decode() if isinstance(k, bytes) else k:
+              v.decode() if isinstance(v, bytes) else v
+              for k, v in data.items()}
+    if result.get("status") not in ("pending", "generating"):
+        return False
+    ok = await r.eval(
+        _TIMEOUT_TASK_LUA, 1, f"task:{task_id}",
+        "timeout", result.get("result") or "",
+        datetime.now(timezone.utc).isoformat(), str(TASK_TTL),
+    )
+    if ok != 1:
+        return False
+    # 设跨实例取消标记：生成实例在下一检查点（usage/边界）退出
+    await r.set(_cancel_key(task_id), "timeout", ex=TASK_TTL)
+    logger.warning(f"任务超时已终结: task_id={task_id}")
+    return True
+
+
+async def timeout_deadline(task_id: str, delay_s: float) -> None:
+    """CORE-1（2026-09-20 审查）：客户端断轮询后生成协程不再有截止点，
+    僵尸生成继续吃 token 到自然结束。生成侧进 generating 后挂本协程：
+    到点无条件走 mark_task_timeout（早已完成则 CAS no-op）。"""
+    try:
+        await asyncio.sleep(delay_s)
+    except asyncio.CancelledError:  # noqa: silent-except — 任务正常收尾即取消本闹钟
+        return
+    try:
+        await mark_task_timeout(task_id)
+    except Exception as e:
+        logger.warning(f"任务超时闹钟执行失败（轮询路径兜底）: {e}")
 
 
 _TIMEOUT_TASK_LUA = """

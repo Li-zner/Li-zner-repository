@@ -1,7 +1,10 @@
 /** 聊天态（Pinia）：多会话(localStorage 按人格隔离) + 可取消流式收发 + 评分/删除/重生成 */
 import { defineStore } from 'pinia'
 import { streamChat, type ChatStreamHandler } from '../api/chat'
-import { deleteConversation } from '../api/conversation'
+import {
+  deleteConversation,
+  getConversationProfile, patchConversationProfile,
+} from '../api/conversation'
 import { ApiError } from '../api/http'
 import { fetchPersonas, type Persona } from '../api/personas'
 import i18n, { currentLocale } from '../locales'
@@ -9,6 +12,11 @@ import { cleanReasoning, toolDisplayName } from '../utils/reasoning'
 import { SseEventType } from '../enums'
 import { newConversationId, newMessageId, newSessionId, loadSessions, saveSessions } from '../utils/sessions'
 import type { ChatSession } from '../utils/sessions'
+import {
+  conversationTitle, emptyConversationProfile, extractProfileUpdates,
+  mergeConversationProfile, needsContextCompression, normalizeConversationProfile,
+  weatherSnapshotFromTool,
+} from '../utils/conversationProfile'
 import { useAuthStore } from './auth'
 
 let streamCompletion: Promise<void> = Promise.resolve()
@@ -27,16 +35,26 @@ function refreshQuotaBadge(): void {
   if (auth.user?.quota_limited) void auth.loadProfile().catch(() => {})
 }
 
+/** 最近一条用户原话；用于画像加载后重算自动标题。 */
+function latestUserContent(session: ChatSession): string {
+  const message = [...session.messages].reverse().find((item) => item.role === 'user')
+  return message?.content ?? ''
+}
+
+/** 自动标题随画像刷新；手动重命名后不再覆盖。 */
+function refreshAutoTitle(session: ChatSession, query = ''): void {
+  if (session.titleMode === 'manual') return
+  const source = query.trim() || latestUserContent(session)
+  if (!source) return
+  session.title = conversationTitle(source, session.profile)
+}
+
 /** 组装本轮用户与助手消息，返回服务端查询和响应式助手引用。 */
 function appendOutgoingTurn(
   session: ChatSession,
   query: string,
   fileIds: string[],
 ): { sendQuery: string; assistantView: ChatMessage } {
-  if (!session.messages.length) {
-    const titleSource = query || translate('send_file_query')
-    session.title = titleSource.slice(0, 30) + (titleSource.length > 30 ? '…' : '')
-  }
   const sendQuery = query || translate('send_file_query')
   const displayText = query || translate('send_file_display')
   const userMsg: ChatMessage = {
@@ -113,6 +131,12 @@ function handleStreamEvent(
     appendToolCall(last, event)
   } else if (event.type === SseEventType.ToolResult) {
     appendToolResult(last, event)
+    const name = String((event as { name?: string }).name ?? '')
+    if (name === 'query_weather') {
+      const weather = weatherSnapshotFromTool((event as { result?: unknown }).result)
+      session.profile = mergeConversationProfile(session.profile, weather)
+      session.updatedAt = Date.now()
+    }
   }
 }
 
@@ -183,6 +207,7 @@ export const useChatStore = defineStore('chat', {
         this.sessions = loadSessions(this.currentPersonaId, owner)
         if (!this.sessions.length) this.createSession()
         this.currentSessionId = this.sessions[0].id
+        void this.loadProfileForSession(this.currentSessionId)
       } catch (e) {
         console.error('[chat.initSessions] FAILED:', e)  // 会话加载失败需可见
       }
@@ -193,9 +218,11 @@ export const useChatStore = defineStore('chat', {
         id: newSessionId(),
         personaId: this.currentPersonaId,
         title: '新对话',
+        titleMode: 'auto',
         conversationId: newConversationId(),
         messages: [],
         updatedAt: Date.now(),
+        profile: emptyConversationProfile(),
       }
       this.sessions.unshift(s)
       this.currentSessionId = s.id
@@ -206,6 +233,7 @@ export const useChatStore = defineStore('chat', {
       if (this.streaming) return
       this.currentSessionId = id
       this.persist()
+      void this.loadProfileForSession(id)
     },
 
     async deleteSession(id: string): Promise<boolean> {
@@ -230,7 +258,45 @@ export const useChatStore = defineStore('chat', {
       const s = this.sessions.find((x) => x.id === id)
       if (s && title.trim()) {
         s.title = title.trim()
+        s.titleMode = 'manual'
         this.persist()
+      }
+    },
+
+    async loadProfileForSession(id: string): Promise<void> {
+      const session = this.sessions.find((item) => item.id === id)
+      if (!session) return
+      try {
+        const resp = await getConversationProfile(session.conversationId)
+        session.profile = normalizeConversationProfile(resp.profile)
+        refreshAutoTitle(session)
+        session.contextCompressed = needsContextCompression(
+          session.messages.filter((msg) => msg.role === 'user').length,
+        )
+        this.persist()
+      } catch {
+        // 离线时保留本地画像，联网后再同步。
+      }
+    },
+
+    applyProfileFromQuery(session: ChatSession, query: string, pendingSlot?: 'origin' | 'destination') {
+      const updates = extractProfileUpdates(query, session.profile, pendingSlot)
+      session.profile = mergeConversationProfile(session.profile, updates)
+      refreshAutoTitle(session, query)
+      session.contextCompressed = needsContextCompression(
+        session.messages.filter((msg) => msg.role === 'user').length + 1,
+      )
+      this.persist()
+    },
+
+    async syncProfile(session: ChatSession): Promise<void> {
+      const profile = normalizeConversationProfile(session.profile)
+      try {
+        const resp = await patchConversationProfile(session.conversationId, profile)
+        session.profile = normalizeConversationProfile(resp.profile)
+        this.persist()
+      } catch {
+        // 画像同步失败不阻塞聊天主流程，本地仍保留可编辑副本。
       }
     },
 
@@ -317,6 +383,7 @@ export const useChatStore = defineStore('chat', {
       }
       const session = this.currentSession
       if (!session || (!query.trim() && !fileIds.length)) return
+      this.applyProfileFromQuery(session, query)
 
       const { sendQuery, assistantView } = appendOutgoingTurn(session, query, fileIds)
       this.streaming = true
@@ -370,6 +437,7 @@ export const useChatStore = defineStore('chat', {
         session.updatedAt = Date.now()
         try {
           this.persist(ownerAtSend)
+          void this.syncProfile(session)
         } finally {
           // 无论 localStorage 是否异常，都必须唤醒等待登出收尾的调用方。
           resolveStreamCompletion?.()

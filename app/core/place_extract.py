@@ -23,6 +23,8 @@ CITY_ALIASES = {
     "蓉城": "成都", "山城": "重庆", "春城": "昆明", "冰城": "哈尔滨",
     "泉城": "济南", "榕城": "福州", "星城": "长沙", "江城": "武汉",
 }
+# 别名归一后的城市集合：_plausible_name 的"命中城市表"判据把别名一并算进来
+_ALIASED_CITIES = frozenset(CITY_ALIASES.values())
 
 # 目的地标志词。不含"在"——"我在广州"是位置陈述而非目的地意图
 _DEST_MARKERS = ("去", "到", "前往", "飞")
@@ -35,11 +37,47 @@ _FROM_TO_RE = re.compile(r"从(.{2,12}?)到(.{2,12}?)(?:[，。,.\s]|怎么|的|
 # 高德 geocode 必然查不到）。捕获含疑问/指代字的不算地名（"去哪里玩""去哪都行"）；
 # 高德对真实不存在的名字自行返回"未找到"，误提取代价可控
 _NONLIST_DEP_RE = re.compile(r"从([\u4e00-\u9fa5]{2,6}?)(?:市)?出发")
+_EXPLICIT_DEP_RE = re.compile(
+    r"(?:出发地|出发城市|起点)\s*"
+    r"(?:改成|改为|调整为|变成|换成|设为|是|为|到)?\s*"
+    r"([\u4e00-\u9fa5]{2,8}?)(?=出发|旅游|旅行|游玩|玩|[,，。；;\s]|$)"
+)
 _NONLIST_DEST_RE = re.compile(
     r"(?:想去|想玩|前往|去|到|飞)([\u4e00-\u9fa5]{2,6}?)(?:市)?"
     r"(?=旅游|旅行|游玩|玩一玩|玩|[,，。.！！？?\s]|$)"
 )
+_EXPLICIT_DEST_RE = re.compile(
+    r"(?:目的地|目标城市|终点)\s*"
+    r"(?:改成|改为|调整为|变成|换成|设为|是|为|到)?\s*"
+    r"([\u4e00-\u9fa5]{2,8}?)(?=旅游|旅行|游玩|玩|[,，。；;\s]|$)"
+)
+# "出发地改成日照"是明确赋值，"出发地不知道"是拒答——前者必须放行表外城市，
+# 后者交给 _plausible_name 的拒答词表拦（2026-09-22 审阅 P1）。只取无歧义的
+# 改值动词，"是/为/到"太常用在疑问与铺陈里，不算赋值凭据。
+_ASSERT_CHANGE_RE = re.compile(r"(?:改成|改为|调整为|变成|换成|设为)")
+# "渭南旅游/梧州旅行"没有"去/到"标志词，但仍是明确的旅游目的地。
+_BARE_TOUR_DEST_RE = re.compile(
+    r"([\u4e00-\u9fa5]{2,6}?)(?:市)?(?:旅游|旅行|游玩)"
+)
+# 旅游词前的活动/范围词不是地名，避免"国内旅游/亲子旅游"被当城市。
+_NON_PLACE_TRAVEL_WORDS = {
+    "国内", "周边", "亲子", "情侣", "自由", "自由行", "当地", "境外",
+    "出国", "自驾", "毕业", "周末", "寒假", "暑假",
+}
 _FUNC_CHAR_RE = re.compile(r"[哪这怎几吗呢啥]")
+
+# 待补槽场景下，用户常用"从梧州出发/广州吧"回复；这里只归一化地点本体。
+_PLACE_REPLY_PREFIX_RE = re.compile(
+    r"^(?:从|我在|出发地(?:是|为)?[:：]?|就|选|我选|当然是|是)\s*"
+)
+_PLACE_REPLY_SUFFIX_RE = re.compile(
+    r"\s*(?:出发|吧|呀|啊|哦|了|的|就行|可以|都可以)\s*$"
+)
+_PLACE_REPLY_REJECT = {
+    "算了", "不用", "取消", "不知道", "不晓得", "随便", "都行", "你好",
+    "您好", "什么", "哪里", "哪儿", "为啥", "为什么", "没有", "不去",
+    "先不", "晚点", "再说",
+}
 
 # 旅游缓存约束指纹的归一化词表。这里只保留会改变答案的维度，
 # 不把“攻略/推荐”等通用词纳入，避免无意义地碎片化缓存。
@@ -198,9 +236,48 @@ def extract_weather_city(user_query: str, history: list | None = None) -> str:
     return extract_context_city(history)
 
 
-def _plausible_name(name: str) -> bool:
-    """地名候选可信度：非空、不含疑问/指代字"""
-    return bool(name) and not _FUNC_CHAR_RE.search(name)
+def _plausible_name(name: str, require_listed: bool = False,
+                    asserted: bool = False) -> bool:
+    """地名候选可信度：非空、不含疑问/指代字、且不是"不知道/随便"这类拒绝语。
+
+    2026-09-22 审阅 P1：显式出发地正则把拒绝语当成了城市——"出发地不知道"提取出
+    origin="不知道"，再经 extract_profile_updates→_update_profile_async 写进
+    **全局画像**，此后每一轮都带着这个假出发地。拒绝语集与短回复补槽共用同一份
+    （_PLACE_REPLY_REJECT），避免两处各自漂移。
+
+    require_listed=True 时还要求命中城市表/别名（或自带行政后缀）：只用于
+    "出发地X/目的地X"这类显式句式——它的值直接进画像并作为 route 的 departure
+    传高德，漏了有"当前位置"兜底。
+    asserted=True（句中有"改成/换成"这类改值动词）时放弃这一层：用户是在明确
+    赋值，而城市表只有 68 城，日照/梧州都不在表内（2026-09-10 线上实测），
+    一刀切会把真地名一起砍掉、并让画像继续留着旧出发地。
+    ponytail: 改值动词后的表外候选仍可能吃掉"出发地改成没想好"这类短语，
+    彻底收口要在写入侧过一次 geocode 校验（属 tools/conversation_profiles 范围）。
+    """
+    if not name or _FUNC_CHAR_RE.search(name) or name in _PLACE_REPLY_REJECT:
+        return False
+    if not require_listed or asserted:
+        return True
+    bare = strip_shi(name)
+    return bare in CITIES or bare in _ALIASED_CITIES or name.endswith(("市", "县"))
+
+
+_TOUR_LEAD_MARKER_RE = re.compile(r"^[想去到飞往在从来]")
+
+
+def _plausible_tour_dest(candidate: str) -> bool:
+    """旅游目的地候选的共用守卫（2026-09-22 审阅 P1）：非拒绝语、非活动/范围词。
+
+    此前黑名单 _NON_PLACE_TRAVEL_WORDS 只挂 _BARE_TOUR_DEST_RE 那一轮，
+    上一行的 _NONLIST_DEST_RE 没过守卫——"去周边玩""想到国内旅游"带标志词，
+    正好被它抓成目的地；两个循环共用后同类问题只剩这一处判据。
+    判据本身按子串而非等值：裸旅游正则会把标志词一起吞进候选
+    （"想到国内旅游" → "想到国内"），等值比较对这种整段无能为力。
+    """
+    name = strip_shi(candidate)
+    if not _plausible_name(name) or _TOUR_LEAD_MARKER_RE.match(name):
+        return False
+    return not any(word in name for word in _NON_PLACE_TRAVEL_WORDS)
 
 
 def strip_shi(name: str) -> str:
@@ -223,8 +300,15 @@ def query_cities(user_query: str) -> list:
 def extract_departure(user_query: str) -> str:
     """出发地：仅认问题中显式"从X"（无定位输入，不再兜底）
 
-    城市表未收录的地名走"从X市出发"正则兜底。
+    城市表未收录的地名走"从X市出发"正则兜底。显式"出发地X"分支额外过
+    _plausible_name：本函数的返回值会进全局画像，拒答语一旦被认成城市，
+    此后每一轮都带着它（2026-09-22 审阅 P1）。
     """
+    m = _EXPLICIT_DEP_RE.search(user_query)
+    if m and _plausible_name(
+            m.group(1), require_listed=True,
+            asserted=bool(_ASSERT_CHANGE_RE.search(user_query))):
+        return strip_shi(m.group(1))
     for c in query_cities(user_query):
         if f"从{c}" in user_query:
             return c
@@ -240,6 +324,11 @@ def extract_destination(user_query: str) -> str:
 
     最后一级回退到唯一候选，覆盖"先查广州天气"这类唯一城市恰为出发地的问法。
     """
+    m = _EXPLICIT_DEST_RE.search(user_query)
+    if m and _plausible_name(
+            m.group(1), require_listed=True,
+            asserted=bool(_ASSERT_CHANGE_RE.search(user_query))):
+        return strip_shi(m.group(1))
     cands = query_cities(user_query)
     dep = extract_departure(user_query)
     for c in cands:
@@ -252,11 +341,34 @@ def extract_destination(user_query: str) -> str:
             return c
     if cands:
         return cands[0]
-    # 城市表长尾："想去日照旅游"这类表外地名，按"想去X旅游"等边界提取
+    # 城市表长尾："想去日照旅游"这类表外地名，按"想去X旅游"等边界提取。
+    # 两轮共用 _plausible_tour_dest：黑名单此前只护后一轮，带标志词的前一轮
+    # 一句"去周边玩"就把范围词当成了城市（2026-09-22 审阅 P1）。
     for m in _NONLIST_DEST_RE.finditer(user_query):
-        if _plausible_name(m.group(1)):
+        if _plausible_tour_dest(m.group(1)):
+            return strip_shi(m.group(1))
+    for m in _BARE_TOUR_DEST_RE.finditer(user_query):
+        if _plausible_tour_dest(m.group(1)):
             return strip_shi(m.group(1))
     return ""
+
+
+def extract_place_reply(query: str) -> str:
+    """从待补槽短回复中提取地点，不接受取消/寒暄/未知等非地点答复。
+
+    ponytail: 这是覆盖常见城市短答的启发式；复杂指代/长句升级到 LLM 槽位抽取。
+    """
+    text = (query or "").strip().strip("。！？!?，,、 ")
+    if not text or len(text) > 20:
+        return ""
+    text = _PLACE_REPLY_PREFIX_RE.sub("", text)
+    text = _PLACE_REPLY_SUFFIX_RE.sub("", text).strip()
+    candidate = strip_shi(text)
+    if candidate in _PLACE_REPLY_REJECT:
+        return ""
+    if not (2 <= len(candidate) <= 6 and _plausible_name(candidate)):
+        return ""
+    return candidate
 
 
 def _extract_travel_days(query: str) -> list:

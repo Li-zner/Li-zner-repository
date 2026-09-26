@@ -22,9 +22,17 @@ logger = setup_logging()
 
 
 class ChannelUpdateRequest(BaseModel):
+    """渠道运营参数更新：只有费率与额度上下限。
+
+    `is_active` 已从此处摘掉（2026-09-24 关闭风险 1）：渠道启停属于治理动作，
+    必须走中控台 `set_channel_active`（人工审批 + 前后快照 + 可回滚）。字段保留为
+    只读探测位是为了让老调用方**报错而不是被静默丢弃**——若直接删字段，带
+    is_active 的请求会被 pydantic 忽略并返回 200，调用方误以为开关改成了。
+    """
+
     channel_code: str
     fee_rate: float = 0.0
-    is_active: bool = True
+    is_active: bool | None = None
     min_amount: float = 0.01
     max_amount: float = 999999.00
 
@@ -74,16 +82,22 @@ async def api_admin_update_channel(
     req: ChannelUpdateRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """更新支付渠道配置（仅管理员）"""
+    """更新支付渠道运营参数（仅管理员）；渠道启停不走这里"""
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可访问")
+    if req.is_active is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="渠道启停请走中控台动作 set_channel_active（需审批、可回滚）；"
+                   "本端点只改费率与额度上下限",
+        )
     pool = await get_pool()
     async with pool.acquire(timeout=5) as conn:
         result = await conn.execute(
-            "UPDATE payment_channels SET fee_rate = $1, is_active = $2, "
-            "min_amount = $3, max_amount = $4, updated_at = CURRENT_TIMESTAMP "
-            "WHERE channel_code = $5",
-            req.fee_rate, req.is_active, req.min_amount, req.max_amount,
+            "UPDATE payment_channels SET fee_rate = $1, "
+            "min_amount = $2, max_amount = $3, updated_at = CURRENT_TIMESTAMP "
+            "WHERE channel_code = $4",
+            req.fee_rate, req.min_amount, req.max_amount,
             req.channel_code,
         )
     # P2 修复：渠道不存在时 UPDATE 零行，如实报 404 而非误报"已更新"

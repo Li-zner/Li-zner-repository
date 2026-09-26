@@ -11,7 +11,7 @@ from ..core.config import (
 logger = setup_logging()
 
 
-def compress_message_history(messages: list, max_messages: int = 6) -> list:
+def compress_message_history(messages: list, max_messages: int = 30) -> list:
     """把较早的对话历史压成一条简短摘要，保留最近几轮上下文。"""
     if not messages:
         return messages
@@ -45,7 +45,11 @@ def compress_message_history(messages: list, max_messages: int = 6) -> list:
         content = (msg.get("content") or "").strip()
         if not content:
             continue
-        prior_text_parts.append(content[:120])
+        # 用户原问题在压缩摘要中保留前100字，助手长文只留前200字控制上下文。
+        if msg.get("role") == "user":
+            prior_text_parts.append(f"用户: {content[:100]}")
+        else:
+            prior_text_parts.append(f"助手: {content[:200]}")
 
     summary_text = " ".join(prior_text_parts[-4:]) if prior_text_parts else "历史上下文较多"
     compacted = lead_system + summaries + [{

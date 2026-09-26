@@ -14,7 +14,8 @@ from ..core.persona_manager import is_civil_persona
 from ..core.config import SUMMARY_THRESHOLD, DEEPSEEK_MODEL
 from ..core.memory_manager import MemoryManager
 from ..core.task_manager import (
-    update_status, append_result, read_accumulated_result,
+    update_status,  # noqa: F401 — 本模块命名空间绑定，task_stages 经 getattr 晚绑定回读
+    append_result, read_accumulated_result,
     is_cancelled_remote, finish_task, fail_task,
     cleanup_event, clear_cancel_marker, get_task,
 )
@@ -26,6 +27,7 @@ from .react_steps import (
 )
 from .memory import compress_message_history
 from .orchestrator import build_shared_context
+from . import task_stages
 
 logger = setup_logging()
 
@@ -115,7 +117,8 @@ async def _maybe_simple_task(task_id: str, username: str, conversation_id: str,
     """意图路由（步骤 1.5）：简单任务直接执行单个 Agent 并终结任务。
 
     返回 (handled, intent)：handled=True 调用方直接返回；复杂任务/纯 LLM 返回
-    (False, intent) 继续主流程；路由异常降级为复杂任务不中断（intent=None）。
+    (False, intent) 继续主流程；路由异常不中断——非 civil 降为无工具纯 LLM
+    （intent=None），civil 人格返回强制 search_knowledge 意图（与 SSE 链同口径）。
     """
     try:
         if is_civil_persona(persona_id):
@@ -146,7 +149,13 @@ async def _maybe_simple_task(task_id: str, username: str, conversation_id: str,
         else:
             logger.info(f"路由为复杂任务: agents={intent['agents']}, task_id={task_id}")
     except Exception as route_err:
-        logger.warning(f"意图路由异常（降级为复杂任务）: {route_err}")
+        if is_civil_persona(persona_id):
+            # 2026-09-25 修两链不对称：civil 人格异常（如 handle_simple_task 抛错）
+            # 不得掉进无工具纯 LLM——与 SSE 链 route_intent 异常分支同口径锁知识库
+            logger.warning(f"意图路由异常（civil 人格降级为强制 search_knowledge）: {route_err}")
+            return False, {"agents": ["search_knowledge"], "is_simple": True,
+                           "is_recommend": False, "method": "route_error_fallback"}
+        logger.warning(f"意图路由异常（降级为无工具纯 LLM，继续主流程）: {route_err}")
         return False, None
     return False, intent
 
@@ -298,17 +307,18 @@ async def _run_react_loop(task_id: str, username: str, user_query: str,
             branch = await _handle_tool_step(
                 task_id, username, user_query, state["content"],
                 messages, tool_calls_list, intent, user_perms,
-                persona_id=persona_id,
+                persona_id=persona_id, mm=mm,
             )
             if branch == "cancelled":
                 return
             if branch == "timeout":
                 break
         else:
-            # 纯文本回答，完成
+            # 纯文本回答完成。CHAT-2（09-20 审查）：DFA 拦截产物不得写缓存——
+            # "安全前缀+安全文案"会绕过终检 == safe_message 精确比对
             await _finish_text_answer(
                 task_id, user_query, mm, state["content"], cache_ctx, sf,
-                persona_id=persona_id,
+                persona_id=persona_id, write_cache=not state["blocked"],
             )
             return
 
@@ -389,68 +399,46 @@ async def run_agent_task(
     user_perms: list | tuple | None = (),
 ):
     """后台运行 Agent，逐步写入 Redis；前端轮询 /v2/chat/tasks/{task_id}/result 获取进度。
-    编排：语义缓存/重建锁 → 意图路由 → 构建消息 → ReAct 主循环；步骤原语见 react_steps.py。"""
+    编排：语义缓存/重建锁 → 意图路由 → 构建消息 → ReAct 主循环；步骤原语见 react_steps.py。
+    生成主体拆至 _task_prepare_generation/_task_gate_and_route（≤80 行门禁），
+    本函数只管 trace 生命周期与终态收口。"""
     # uuid 后缀（与 chat_stream_ctx 同一修复）：秒级时间戳同秒并发任务共用会话
     conv_id = conversation_id or f"conv_{username}_{uuid.uuid4().hex[:12]}"
     mm = MemoryManager(username, conv_id)
-    _cache_ctx, cacheable = "", False
-    rebuild_lock_token, renew_task = None, None
+    params = {"persona_id": persona_id, "file_ids": file_ids,
+              "lang": lang, "user_perms": user_perms}
     # 后台任务自行建立请求级 trace，finally 统一收尾。
     from ..services.rag_request_trace import begin_request, finish_request, mark_route
     begin_request(conversation_id=conv_id, username=username)
     mark_route("task")
     _outcome = "failed"
+    # (cache_ctx, cacheable, rebuild_lock_token, renew_task) 的可变列表：
+    # 必须是列表且由本函数创建后传下去——task_stages.gate_and_route 持锁成功后
+    # 原位登记，异常路径没有任何返回值，本 finally 只有靠同一只容器才拿得到
+    # token（元组/内建列表只能靠返回赋值，抛异常即丢失，09-22 P1）。
+    cache_state = ["", False, None, None]
+    deadline_task = None
     try:
-        # 缓存上下文构建也必须处于 try 内：否则异常会绕过 fail_task/finally，
-        # 任务永久停在 pending，取消标记和重建锁也无法清理。
-        _cache_ctx, cacheable = await _build_cache_ctx(mm, username, persona_id,
-                                                        user_query, lang)
-        if not await update_status(task_id, "generating"):
-            _outcome = await _resolve_handled_outcome(task_id, username)
+        # 编排主体必须在 try 内（含缓存上下文构建）：否则异常绕过 fail_task/
+        # finally，任务永久停在 pending，取消标记和重建锁也无法清理。
+        # 阶段函数定义见 task_stages.py（≤80/≤600 行门禁拆段，行为等价）。
+        _outcome_v, deadline_task = await task_stages.prepare_generation(
+            task_id, username, user_query, mm, conversation_id, params,
+            mark_route, cache_state)
+        if _outcome_v is not None:
+            _outcome = _outcome_v
             return
-
-        # ===== 1. 语义缓存拦截 + 防击穿重建锁 =====
-        if cacheable:
-            rebuild_lock_token, renew_task, served = await _enter_cache_gate(
-                task_id, username, user_query, mm, _cache_ctx)
-            if served:
-                _outcome = "success"
-                return
-
-        # ===== 1.5 意图路由：简单任务直接执行后返回 =====
-        handled, intent = await _maybe_simple_task(
-            task_id, username, conversation_id, user_query,
-            persona_id, file_ids, _cache_ctx if cacheable else None, lang, user_perms)
-        if handled:
-            mark_route("task_simple")
-            _outcome = await _resolve_handled_outcome(task_id, username)
-            return
-
-        # ===== 2. 取密钥 / 构建消息 / 落用户消息 =====
-        prepared = await _prepare_task_run(
-            task_id, username, mm, user_query, persona_id, file_ids, intent, lang)
-        if prepared is None:
-            return
-        deepseek_api_key, messages, tools = prepared
-
-        # ===== 3. ReAct 主循环 =====
-        mark_route("task_react")
-        await _run_react_loop(
-            task_id, username, user_query, mm, messages, tools, intent,
-            _cache_ctx if cacheable else None, user_perms, deepseek_api_key,
-            persona_id=persona_id,
-        )
-        # ReAct 内部可能因取消提前 return；不能无条件记成功，必须按 Redis
-        # 真实终态回传 outcome，再决定是否退还未产出额度。
-        _outcome = await _resolve_handled_outcome(task_id, username)
-
     except asyncio.CancelledError:
         _outcome = "cancelled"
         await _finish_cancelled(task_id, await read_accumulated_result(task_id))
     except Exception as e:
         await _fail_task_sanitized(task_id, username, e)
     finally:
-        await _release_task_resources(task_id, renew_task, rebuild_lock_token, user_query, _cache_ctx)
+        # CORE-1：撤超时闹钟；CAS 保证即使闹钟先触发也不会写坏终态。
+        if deadline_task:
+            deadline_task.cancel()
+        await _release_task_resources(task_id, cache_state[3], cache_state[2],
+                                      user_query, cache_state[0])
         try:
             finish_request(status=_outcome)
         except Exception as _fin_err:  # 监测收尾不影响任务主流程
@@ -537,7 +525,10 @@ async def _build_task_messages(mm, username: str, user_query: str,
     history_dicts = await mm.get_context(limit=SUMMARY_THRESHOLD)
     user_profile = await mm.get_profile()
     system_content += f"\n{build_shared_context(user_profile or '')}"
-    history_dicts = compress_message_history(history_dicts, max_messages=6)
+    # 2026-09-22 审阅 P2-1（主人拍板"阈值改 20 生效"）：原先 max_messages 与
+    # SUMMARY_THRESHOLD 同为 30，而 get_context 已限 30 条，压缩恒 no-op，
+    # 30 条全文无界进 prompt；留 10 条压缩余量让旧轮真正折叠。
+    history_dicts = compress_message_history(history_dicts, max_messages=20)
 
     messages = [{"role": "system", "content": system_content}]
 

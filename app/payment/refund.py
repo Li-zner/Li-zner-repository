@@ -23,6 +23,9 @@ logger = setup_logging()
 # 仅允许代码内显式开启的人工补偿。普通用户接口默认不允许消费者自助退款，
 # 避免已交付的模型服务被退款后形成免费 token 漏洞。
 _REFUNDABLE_ORDER_TYPES = frozenset({"payment"})
+# 渠道退款超时（秒）：与 refund:{order_no} 锁 TTL 30s 配套——渠道耗时 + 本地结算
+# 必须落在锁有效期内，否则锁过期后并发第二笔退款会绕过串行保护。
+_CHANNEL_REFUND_TIMEOUT_SECONDS = 10.0
 
 
 def _decide_refund(
@@ -42,7 +45,9 @@ def _decide_refund(
     if order_type not in _REFUNDABLE_ORDER_TYPES:
         raise ValueError("该订单类型不支持自助退款，如有问题请联系管理员")
     if order_type == "payment" and not allow_consumption_refund:
-        raise ValueError("已交付的消费订单不支持自助退款，请提交人工审核")
+        # P1-12（2026-09-22 拍板）：拒绝的同时给出路——消费单只能由
+        # POST /api/payment/admin/refund（require_admin + 强制幂等键）代客发起
+        raise ValueError("已交付的消费订单不支持自助退款，请提交人工审核（管理员补偿通道）")
     if order["status"] not in ("success", "partial_refunded"):
         raise ValueError("仅已成功的订单可退款")
     # 2026-09-12 修复（外部复核 P0）：消费订单 amount 为负数（扣费为负记录），
@@ -64,10 +69,25 @@ async def _call_channel_refund(order: dict, amount: Decimal) -> dict:
     """调用渠道退款并原样返回结果（保留失败详情供 attempt 落库）。
 
     P2 修复：原先从不调用渠道退款。渠道已成功但本侧账务事务失败的缺口由对账兜底（模拟模式）。
+
+    2026-09-22 审阅 P1 修复：wait_for 抛的 TimeoutError 不是 ValueError，routes 的
+    `except ValueError` 漏接 → 退款接口裸 500。这里收敛为与"渠道异常"同一业务口径（400），
+    原单保持 success/partial_refunded 不动，用户可稍后重试。
+    关键边界（**为什么不能记 channel_failed**）：超时只代表"没等到回复"，渠道侧结果未知，
+    真渠道可能已经退款成功。调用 record_channel_result 置 channel_failed 会让下一次重试
+    新建 attempt 再次打渠道 = 重复退款；置本地 success 更是无据入账。因此异常在落库前抛出，
+    attempt 留在 processing，300s 后由 settle_recoverable_attempts 转 manual_review 兜底。
     """
     from .channels import get_channel
     channel = get_channel(order["payment_method"])
-    return await asyncio.wait_for(channel.refund(order, amount), timeout=10.0)
+    try:
+        return await asyncio.wait_for(
+            channel.refund(order, amount), timeout=_CHANNEL_REFUND_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError as exc:
+        logger.error(
+            f"渠道退款超时（结果未知，attempt 留在 processing 待恢复/人工）: "
+            f"order={order.get('order_no')}, amount={amount}")
+        raise ValueError("渠道退款响应超时，结果未知，请稍后查询订单状态") from exc
 
 
 async def _invoke_channel_refund(order: dict, amount: Decimal) -> dict:
@@ -253,24 +273,33 @@ def _follow_attempt_amount(attempt: dict, snapshot_amount: Decimal, order_no: st
     return attempt_amount
 
 
+def _refund_idem_key(user_id: str, idempotency_key: str) -> str:
+    """PAY-2（09-20 审查）：仅显式 Idempotency-Key 建键；原派生键会吞掉
+    同单同额的合法二次部分退款（Stripe 语义无键不去重）。
+
+    2026-09-22 审阅 P1-13 之后：HTTP 侧（自助 /refund 与管理员 /admin/refund）已在
+    路由层强制要求 X-Idempotent-Key，缺键根本走不到这里。空串分支保留为纵深防御，
+    服务对象是资金层内部/恢复/脚本调用方（显式传空表示"我知道我在做什么"），
+    不得被理解成"资金出口允许不去重"。
+    """
+    if not idempotency_key:  # 路由层已强制，此处仅兜底（见上方 P1-13 说明）
+        return ""
+    digest = hashlib.sha256(idempotency_key.encode()).hexdigest()[:32]
+    return f"payment:idem:refund:{user_id}:{digest}"
+
+
 async def process_refund(
-    order_no: str,
-    user_id: str,
-    amount: Optional[Decimal] = None,
-    reason: str = "用户申请退款",
-    idempotency_key: str = "",
+    order_no: str, user_id: str, amount: Optional[Decimal] = None,
+    reason: str = "用户申请退款", idempotency_key: str = "",
     allow_consumption_refund: bool = False,
 ) -> dict:
     """处理退款（支持部分退款：多次退款累计防超额，退满后原单标 refunded）"""
-    raw_key = idempotency_key or f"{order_no}:{amount}:{reason}"
-    idem_key = (
-        f"payment:idem:refund:{user_id}:"
-        f"{hashlib.sha256(raw_key.encode()).hexdigest()[:32]}"
-    )
     redis = await get_redis()
-    replayed = await _claim_refund_idempotency(redis, idem_key)
-    if replayed is not None:
-        return replayed
+    idem_key = _refund_idem_key(user_id, idempotency_key)
+    if idem_key:
+        replayed = await _claim_refund_idempotency(redis, idem_key)
+        if replayed is not None:
+            return replayed
 
     channel_done = False  # 渠道已成功后本地异常不得删幂等键（2026-09-12 修复）
     # TTL 30s 对齐充值路径：渠道退款超时 10s + 结算耗时，10s 默认值会在渠道变慢时过期，
@@ -278,7 +307,8 @@ async def process_refund(
     lock_key = f"refund:{order_no}"
     lock_token = await _acquire_lock(lock_key, ttl=30)
     if not lock_token:
-        await redis.delete(idem_key)
+        if idem_key:
+            await redis.delete(idem_key)
         raise ValueError("退款正在处理中")
 
     try:
@@ -310,12 +340,13 @@ async def process_refund(
             )
 
         result = _refund_result(order_no, refund_order_no, refund_amount, now)
-        try:
-            await redis.set(idem_key, json.dumps(result), ex=86400)
-        except Exception as idem_err:
-            # 2026-09-12 清欠 P1（09-11 审查 B-F11）：退款已入账，幂等键必须
-            # 保留（24h TTL 兜底不可依赖时人工处理），删除会让重试再次退钱
-            logger.error(f"退款结果写幂等键失败（键保留防重放）: {idem_err}")
+        if idem_key:
+            try:
+                await redis.set(idem_key, json.dumps(result), ex=86400)
+            except Exception as idem_err:
+                # 2026-09-12 清欠 P1（09-11 审查 B-F11）：退款已入账，幂等键必须
+                # 保留（24h TTL 兜底不可依赖时人工处理），删除会让重试再次退钱
+                logger.error(f"退款结果写幂等键失败（键保留防重放）: {idem_err}")
         return result
     except Exception as exc:
         # 2026-09-12 修复（外部复核 P2→实际资金语义）：渠道已成功而本地结算异常时，
@@ -325,8 +356,13 @@ async def process_refund(
         if channel_done:
             logger.error(
                 f"渠道退款已成功但本地结算异常，幂等键保留防重放: order={order_no}")
-        else:
+        elif idem_key:
             await redis.delete(idem_key)
         raise
     finally:
-        await _release_lock(lock_key, lock_token)
+        # 2026-09-22 审阅 P2（与 deduction 同一失效模式）：退款已在事务里提交，裸调 Redis
+        # 释放锁一旦抖动就会把"已退成功"变成 500。锁有 TTL 30s 自愈，故只记日志不上抛。
+        try:
+            await _release_lock(lock_key, lock_token)
+        except Exception as release_err:
+            logger.exception(f"退款锁释放失败（锁将随 TTL 过期，退款结果不受影响）: {release_err}")

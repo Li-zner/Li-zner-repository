@@ -70,6 +70,8 @@ export default {
   "recharge_amount": "Select amount",
   "recharge_method": "Select payment method",
   "cancel": "Cancel",
+  "close": "Close",
+  "save": "Save",
   "go_recharge": "Recharge",
   "close_pay": "Close · Complete Payment",
   "done": "Done",

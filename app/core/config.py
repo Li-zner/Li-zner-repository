@@ -5,6 +5,7 @@
 - 安全凭据缺失 fail loudly（SESSION_SECRET_KEY / JWT_SECRET / ADMIN_PASSWORD）。
 - CORS 通配符与 allow_credentials=True 冲突时拒绝启动。
 """
+import ipaddress
 import os
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -47,9 +48,18 @@ class _Settings(BaseSettings):
     # Cloudflare Tunnel / nginx 反代时才置 1，_client_ip 才读转发头；
     # 默认 0 = 只信 socket 对端地址（防伪造头绕登录锁/短信限额/oauth 限频）
     trust_proxy_headers: bool = False
+    # 可信反代网段（2026-09-22 审查 P1）：只有 socket 对端精确命中这里的 CIDR，
+    # _client_ip 才采信 CF-Connecting-IP / X-Forwarded-For。
+    # 默认只给回环：原实现把整个 RFC1918 写死成可信，而 docker 网桥上的直连源
+    # 本身就是 172.18.0.x——任何能直连网关端口的容器都能自报客户端 IP，把自己的
+    # 登录失败锁/短信日限额/oauth 限频甩给无辜 IP。生产按实际反代网段精确配置。
+    trusted_proxy_cidrs: str = "127.0.0.1/32"
 
     # ---------- 数据库 ----------
     database_url: str = ""
+    # 中控台「问数」只读观测专用 DSN（账号见 scripts/rag_readonly_role.sql）。
+    # 不回退 database_url：只读观测一旦被赋予主账号，SQL 守卫就是纸糊的。
+    rag_readonly_dsn: str = ""
     timeout_seconds: float = 30.0
 
     # ---------- GitHub OAuth ----------
@@ -79,8 +89,9 @@ class _Settings(BaseSettings):
     llm_temperature: float = 0.3
 
     # ---------- 对话管理 ----------
-    summary_threshold: int = 20
-    history_limit: int = 20
+    # 保留15轮原始消息，第16次用户提问后再滚动摘要压缩。
+    summary_threshold: int = 30
+    history_limit: int = 30
     history_ttl: int = 86400
     history_summary_ttl: int = 604800
     rag_answer_top_k: int = 10
@@ -143,6 +154,11 @@ class _Settings(BaseSettings):
     cors_origins: str = "http://localhost:10088,http://localhost:10086,http://localhost:10189,http://localhost:10190,http://localhost:10090"
     github_redirect_uri: str = "http://localhost:10088/auth/github/callback"
     gateway_public_url: str = "http://localhost:10088"
+    # AUTH-4（2026-09-20 审查）：OAuth state 会话 cookie 的 Secure 标记。
+    # 默认开（生产 HTTPS/Tunnel 链路）；仅当整套部署确认走非回环 HTTP 时才设
+    # SESSION_COOKIE_SECURE=0——浏览器对 127.0.0.1 有 secure-context 豁免，
+    # 本地回环验收不受影响。
+    session_cookie_secure: bool = True
 
     # ---------- 密码 ----------
     bcrypt_max_bytes: int = 72
@@ -178,11 +194,13 @@ if "*" in CORS_ORIGINS:
 # ===== 模块级导出（保持所有 import 名兼容）=====
 POSTGRES_DSN = _settings.database_url
 DATABASE_URL = POSTGRES_DSN  # MemoryManager 使用的别名
+RAG_READONLY_DSN = _settings.rag_readonly_dsn
 TIMEOUT_SECONDS = _settings.timeout_seconds
 
 GITHUB_CLIENT_ID = _settings.github_client_id
 GITHUB_CLIENT_SECRET = _settings.github_client_secret
 SESSION_SECRET_KEY = _settings.session_secret_key
+SESSION_COOKIE_SECURE = _settings.session_cookie_secure
 
 SECRET_KEY = _settings.jwt_secret
 SECRET_KEY_OLD = _settings.jwt_secret_old or None
@@ -244,6 +262,48 @@ SAFETY_FILTER_WORDS_FILE = _settings.safe_filter_words_file
 DEFAULT_CITY = _settings.default_city
 APP_ENV = (_settings.app_env or "").lower()
 TRUST_PROXY_HEADERS = _settings.trust_proxy_headers
+
+
+def _parse_trusted_proxy_cidrs(raw: str) -> tuple:
+    """解析 TRUSTED_PROXY_CIDRS：逗号分隔，允许 host/bits 写法（strict=False）。
+
+    非法网段直接启动失败而不是静默跳过：信任面配错若退化成"谁都不信"，登录锁、
+    短信日限额、oauth 限频会塌成全站共用一个 IP 桶——正是本键要修的那个故障。
+    """
+    nets = []
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(item, strict=False))
+        except ValueError as e:
+            raise RuntimeError(
+                f"TRUSTED_PROXY_CIDRS 含非法网段 {item!r}：{e}") from e
+    return tuple(nets)
+
+
+TRUSTED_PROXY_CIDRS: tuple = _parse_trusted_proxy_cidrs(
+    _settings.trusted_proxy_cidrs)
+
+
+def peer_is_trusted_proxy(host: str) -> bool:
+    """socket 对端是否命中配置的精确反代网段（IP 桶与 HSTS 共用的唯一判据）。
+
+    地址解析不了（Unix socket、空值）按不可信处理。双栈监听时 nginx 常以
+    ::ffff:127.0.0.1 呈现，先还原 IPv4-mapped 再比对，否则本机回环反代会被
+    误判成不可信、全站又退回一个桶（这个判据失效是静默的，必须堵住）。
+    """
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return any(ip in net for net in TRUSTED_PROXY_CIDRS)
+
+
 METRICS_TOKEN_CFG = _settings.metrics_token
 DB_ACQUIRE_TIMEOUT = _settings.db_acquire_timeout
 DB_COMMAND_TIMEOUT = _settings.db_command_timeout

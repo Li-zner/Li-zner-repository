@@ -1,8 +1,9 @@
 """CDC 变更日志落盘：JSONL 追加写 + 按日/按大小滚动 + 断点续传 checkpoint
 
 落盘目录默认 cdc_journal/（docker-compose 挂载到宿主机 SSD），
-写入使用 asyncio.to_thread 避免阻塞事件循环；每条 flush，
-每 100 条 fsync 一次保证持久化（兼顾吞吐与耐用性）。
+写入使用 asyncio.to_thread 避免阻塞事件循环；每个 append_batch 批次
+flush + fsync 一次，作为 checkpoint/cleanup 的持久化栅栏（INFRA-5 修注释漂移：
+原先"每 100 条 fsync"描述的是已删除的 _write_line 死路径）。
 """
 import asyncio
 import json
@@ -15,7 +16,6 @@ from ..core.logging import setup_logging
 
 logger = setup_logging()
 
-_FSYNC_EVERY = 100  # 每 N 条 fsync 一次
 _JOURNAL_NAME_RE = re.compile(r"^(\d{8})\.jsonl(?:\.\d+)?$")
 
 
@@ -58,7 +58,6 @@ class CdcJournal:
         self._fh = None
         self._current_basename = None
         self._max_size = 50 * 1024 * 1024  # 单文件 50MB 后滚动
-        self._since_fsync = 0
         self._write_lock = threading.Lock()  # P1 #7：防 to_thread 并发写交错
         self.last_id, self.last_txid = self.load_checkpoint_pair()  # 启动时恢复断点
 
@@ -112,10 +111,16 @@ class CdcJournal:
                 self._fh.write(line)
             self._fh.flush()
             os.fsync(self._fh.fileno())
-            self._since_fsync = 0
 
     def _rotate_if_needed(self, basename: str):
-        """单文件超限时切到下一个滚动文件。"""
+        """单文件超限时切到下一个滚动文件。
+
+        此处刻意不更新 _current_basename（仍为"当日文件名"）——它只用于
+        "跨天/首开"判断；若改成 f"{basename}.{seq}"，下一笔校验
+        self._current_basename != basename 恒真，会反复重开超限的当日文件，
+        导致每条写入都新建一个滚动文件（文件无限增殖，P2 #14 回归过）。
+        保留当日名，写入自然落到滚动序号文件；序号上限 1000 防无限增长。
+        """
         if self._fh.tell() <= self._max_size:
             return
         seq = 1
@@ -128,43 +133,6 @@ class CdcJournal:
         old_fh = self._fh
         self._fh = new_fh
         old_fh.close()
-
-    def _write_line(self, line: str):
-        with self._write_lock:  # P1 #7：防 to_thread 并发写交错
-            self._ensure_dir()
-            basename = self._day_basename()
-            path = os.path.join(self.journal_dir, basename)
-            # 跨天/首次：先开新文件再关旧（P0 #19 原子切换，失败时旧句柄仍有效）
-            if self._fh is None or self._current_basename != basename:
-                new_fh = self._open_append(path)
-                old_fh = self._fh
-                self._fh = new_fh
-                if old_fh:
-                    old_fh.close()
-                self._current_basename = basename
-            # 单文件超限 -> 滚动（原子：先开新再关旧）
-            if self._fh.tell() > self._max_size:
-                seq = 1
-                while seq < 1000:  # P2 #14：限制最大滚动序号，防无限增长
-                    alt = os.path.join(self.journal_dir, f"{basename}.{seq}")
-                    if not os.path.exists(alt):
-                        break
-                    seq += 1
-                new_fh = self._open_append(alt)
-                old_fh = self._fh
-                self._fh = new_fh
-                old_fh.close()
-                # 注意：此处不更新 _current_basename（仍为“当日文件名”）。
-                # _current_basename 只用于“跨天/首开”判断；若改成 f"{basename}.{seq}"，
-                # 下一笔校验 self._current_basename != basename 恒真，会反复重开超限的当日文件，
-                # 导致每条写入都新建一个滚动文件（文件无限增殖）。保留当日名，写入自然落到滚动序号文件。
-            self._fh.write(line)
-            # P1 #8：移除每条 flush，fsync 前统一 flush（fsync 每 100 条一次）
-            self._since_fsync += 1
-            if self._since_fsync >= _FSYNC_EVERY:
-                self._fh.flush()
-                os.fsync(self._fh.fileno())
-                self._since_fsync = 0
 
     async def save_checkpoint(self, last_id: int, last_txid: int = 0):
         """原子写 checkpoint（临时文件 + os.replace；记录当前 journal 文件名，P2 #18）

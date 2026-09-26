@@ -167,12 +167,12 @@ async def _flash_sse(req: ChatRequest, username: str, deepseek_api_key: str) -> 
                 # 拦截路径已由 _bill_intercepted 提前完成，避免 usage 双计。
                 if _usage:
                     record_token_usage(_usage, username, "", model=DEEPSEEK_FLASH_MODEL)
-                # answer_complete 承载终检后的完整内容；空全文不发成功事件，
-                # 由 fallback_chain 据 yielded 判断是否补兜底文案。
+                # answer_complete 承载终检后的完整内容；空全文什么都不发——
+                # 原先在此补裸 [DONE] 会让上层 _yielded 置真、fallback_chain 的
+                # 空流兜底分支（answer_complete+[DONE]）永不触发，整条流反而
+                # 缺成功事件（2026-09-20 审查 CHAT-3，与 :170 原注释承诺相反）
                 if _safe_text:
                     yield sse("answer_complete", _safe_text) + "data: [DONE]\n\n"
-                    return
-                yield "data: [DONE]\n\n"
 
 
 def accumulate_sse_text(acc: str, raw_event: str) -> str:

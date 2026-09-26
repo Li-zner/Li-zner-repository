@@ -3,7 +3,8 @@
 背景：deduct_token_cost 原实现拿不到钱包锁就直接跳过扣费——高并发下漏计费且无痕。
 方案：拿锁退避重试仍失败 → 落一张 pending 扣费单（占位，不动余额，"存一个空值"）→
 维护循环（db_maintenance.maintenance_loop）周期调用 settle_pending_deductions 补偿结算：
-锁钱包 → 按占位单记录的 token_count 重算费用 → 扣款 + 订单转 success + 记流水，同一事务原子完成。
+锁钱包 → **按占位单已入库的 amount 结算**（不再按当前费率重算，见 _settle_one 注释）→
+扣款 + 订单转 success + 记流水，同一事务原子完成。
 幂等：结算 UPDATE 带 status='pending' 前置条件，多实例并发结算只有一个生效（其余整体回滚）。
 """
 import asyncio
@@ -70,19 +71,13 @@ async def defer_deduction(order_no: str, user_id: str, cost_amount: Decimal,
     logger.warning(f"扣费转待结算占位: user={user_id}, order={order_no}, 应扣={cost_amount}")
 
 
-def _compute_cost(token_count: int):
-    """与 service._compute_token_cost 同一公式；函数内延迟导入避免模块循环依赖"""
-    from .service import _compute_token_cost  # noqa: PLC0415
-    return _compute_token_cost(token_count)
-
-
 async def settle_pending_deductions(min_age_seconds: int = PENDING_MIN_AGE_SECONDS,
                                     limit: int = SETTLE_BATCH_LIMIT) -> int:
     """补偿结算待结算扣费单；返回本轮成功结算张数。由维护循环周期调用。"""
     pool = await get_pool()
     async with pool.acquire(timeout=5) as conn:
         rows = await conn.fetch(
-            """SELECT order_no, user_id, metadata FROM payment_orders
+            """SELECT order_no, user_id, amount, metadata FROM payment_orders
                WHERE order_type = 'payment' AND status = 'pending'
                  AND payment_method = 'balance'
                  AND updated_at < CURRENT_TIMESTAMP - ($1 * INTERVAL '1 second')
@@ -93,7 +88,8 @@ async def settle_pending_deductions(min_age_seconds: int = PENDING_MIN_AGE_SECON
     settled = 0
     for row in rows:
         try:
-            if await _settle_one(row["order_no"], row["user_id"], row["metadata"]):
+            if await _settle_one(
+                    row["order_no"], row["user_id"], row["amount"], row["metadata"]):
                 settled += 1
         except Exception as e:
             logger.error(f"待结算扣费单处理失败: order={row['order_no']}, err={e}", exc_info=True)
@@ -102,15 +98,20 @@ async def settle_pending_deductions(min_age_seconds: int = PENDING_MIN_AGE_SECON
     return settled
 
 
-async def _settle_one(order_no: str, user_id: str, metadata) -> bool:
-    """结算单张待结算扣费单（钱包锁 + 事务原子）；钱包仍忙返回 False 留待下轮"""
+async def _settle_one(order_no: str, user_id: str, stored_amount, metadata) -> bool:
+    """结算单张待结算扣费单（钱包锁 + 事务原子）；钱包仍忙返回 False 留待下轮
+
+    2026-09-22 审阅 P2：结算基数取**占位单已入库的 amount**，不再拿 token_count 按当前
+    TOKEN_COST_RATE 重算——占位单落库那一刻价格即已定，重算等于把费率调整**追溯**应用到
+    历史欠费，且同一张单在费率前后会结算出两个金额（口径漂移 + 破坏补偿结算的幂等）。
+    """
     meta = {}
     if metadata:
         meta = json.loads(metadata) if isinstance(metadata, str) else dict(metadata)
-    token_count = int(meta.get("token_count") or 0)
-    cost_amount = _compute_cost(token_count)
-    if cost_amount is None or cost_amount <= 0:
-        # 无法计价的异常占位单：作废（failed 为既有合法状态值），防止永久滞留
+    token_count = int(meta.get("token_count") or 0)  # 仅供流水摘要文案，不参与计价
+    cost_amount = Decimal(str(stored_amount if stored_amount is not None else 0))
+    if cost_amount <= 0:
+        # 金额缺失/非正的异常占位单：作废（failed 为既有合法状态值），防止永久滞留
         await _void_order(order_no)
         return False
 
@@ -146,6 +147,7 @@ async def _settle_one(order_no: str, user_id: str, metadata) -> bool:
                     actual_deduct = Decimal("0")
                 elif before_balance < cost_amount:
                     actual_deduct = before_balance
+                # SET amount 写回的是"实扣额"（余额不足时被上面钳低），不是重算的价格
                 # 订单转 success 带 pending 前置：多实例并发结算只有一个生效，其余整体回滚
                 result = await conn.execute(
                     """UPDATE payment_orders SET amount = $1, status = 'success',

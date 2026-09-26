@@ -3,15 +3,15 @@
 从 app/main.py 纯移动而来（2026-08-31 模块化，行为等价，零逻辑改动）。
 支持手机号作为账号登录（账号即手机号）；JWT 认证主体在 middleware/auth。
 """
-import ipaddress
-
 from pydantic import BaseModel, Field
 from fastapi import APIRouter, Request, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
 from ..core.logging import setup_logging
 from ..core.db import get_pool
-from ..core.config import PASSWORD_MAX_BYTES, TRUST_PROXY_HEADERS
+from ..core.config import (
+    PASSWORD_MAX_BYTES, TRUST_PROXY_HEADERS, peer_is_trusted_proxy,
+)
 from ..core.auth_cookies import (
     ACCESS_COOKIE,
     REFRESH_COOKIE,
@@ -47,31 +47,6 @@ return c
 """
 
 
-# 可信反代来源网段：回环 + RFC1918 + IPv6 回环/ULA/链路本地。
-# 不用 ipaddress.is_private——它还把 192.0.2.0/24、198.51.100.0/24、
-# 203.0.113.0/24 等文档段算作私有，等于把伪造头的信任面扩大到公网。
-_TRUSTED_PROXY_NETS: tuple = tuple(
-    ipaddress.ip_network(c) for c in (
-        "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-        "::1/128", "fd00::/8", "fe80::/10",
-    )
-)
-
-
-def _peer_is_trusted_proxy(host: str) -> bool:
-    """socket 对端是否本机可信反代：只有落在上面的网段才算。
-
-    生产链路（Cloudflare Tunnel -> nginx -> uvicorn）里 nginx 与网关同网络，
-    对端必然是私网地址；公网对端只可能是直连，其转发头一律不采信。
-    地址解析不了（Unix socket、空值）按不可信处理。
-    """
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return any(ip in net for net in _TRUSTED_PROXY_NETS)
-
-
 def _client_ip(request: Request) -> str:
     """取可信客户端 IP。Cloudflare Tunnel 链路以 CF-Connecting-IP 为准。
 
@@ -83,14 +58,14 @@ def _client_ip(request: Request) -> str:
     只有部署链路确为可信反代（TRUST_PROXY_HEADERS=1，与 observability 威胁
     模型口径一致）时才读头。本函数为 phone/map/oauth 共用，修这一处全覆盖。
 
-    重扫修复（2026-09-19）：全局开关在实际部署里从未置位（容器 printenv 为
-    空、uvicorn 未带 --proxy-headers），于是所有请求都退化成 nginx 的地址——
-    登录锁、短信日限、oauth 限频、地图配额变成全站共享一个桶（任一人可锁
-    任意账号）。改为按**本次请求的对端**判定：对端是回环/私网即视为经过本机
-    反代、可信其头；公网对端仍只信 socket。开关保留为强制放行的逃生口。
+    2026-09-22 审查 P1：上一轮"对端是回环/私网就算可信反代"太宽——网关跑在
+    docker 里，直连源的地址本身就是 172.18.0.x，整个 RFC1918 当信任面等于没
+    门禁：任意同网段容器自报 CF-Connecting-IP 就能把爆破锁/日限额甩给别人的
+    IP 桶。现在对端必须精确命中 TRUSTED_PROXY_CIDRS（默认仅 127.0.0.1/32，
+    生产按反代实际网段配置），判据与 HSTS 共用 core.config 同一处。
     """
     peer = request.client.host if request.client else ""
-    if not (TRUST_PROXY_HEADERS or _peer_is_trusted_proxy(peer)):
+    if not (TRUST_PROXY_HEADERS or peer_is_trusted_proxy(peer)):
         return peer or "unknown"
     cf_ip = request.headers.get("cf-connecting-ip", "").strip()
     if cf_ip:

@@ -2,10 +2,10 @@
 《民法典专属路由裁决表》
 ========================
 合并自：
-  - tests/关键词白名单.txt     → whitelist（民法典关键词）
-  - tests/互斥.txt             → blacklist（非民法典法域）
-  - tests/民法典补充协议.txt    → blacklist（常见误归案例）
-  - tests/民法典映射表.txt      → colloquial_map（口语→术语）
+  - tests/civil_keyword_whitelist.txt  → whitelist（民法典关键词）
+  - tests/civil_domain_mutex.txt       → blacklist（非民法典法域）
+  - tests/civil_supplement_cases.txt   → blacklist（常见误归案例）
+  - tests/civil_colloquial_map.txt     → colloquial_map（口语→术语）
 
 架构：
   用户输入 → 前置路由裁决表（硬规则引擎）

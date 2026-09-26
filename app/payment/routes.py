@@ -8,8 +8,9 @@ from decimal import Decimal
 import time
 from typing import Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from pydantic import Field
 
-from ..middleware.auth import get_current_user
+from ..middleware.auth import get_current_user, require_admin
 from ..core.logging import setup_logging
 from . import router
 from .models import RechargeRequest, RefundRequest
@@ -49,6 +50,46 @@ async def _refund_rate_limit(user_id: str) -> None:
         raise
     except Exception as e:
         logger.warning(f"退款限频检查失败（放行）: {type(e).__name__}")
+
+
+# 幂等键长度上限：键本身只进 sha256 摘要（refund._refund_idem_key），限长是为了
+# 不让异常串进 Redis 键、日志与 OpenAPI 示例里放大；正常客户端用的是 UUID（36 字符）
+_IDEM_KEY_MAX_LEN = 128
+_IDEM_KEY_MISSING_DETAIL = "资金操作必须携带幂等键（请求头 X-Idempotent-Key）"
+
+
+def _require_idem_key(raw: Optional[str]) -> str:
+    """P1-13（2026-09-22 拍板）：资金出口不再接受空幂等键。
+
+    **为什么必须在路由层拦**：原先签名写 `Header("")`，把"没带 header"和"带了空串"
+    合成同一个值，而 refund._refund_idem_key 对空串直接返回空键 → process_refund
+    完全跳过 `_claim_refund_idempotency`，同一笔退款重复点击/网关重试就是二次出款，
+    且资金链路上没有任何"这次是哪一笔"的可追溯标识。放在资金层里兜底也能修，但
+    报错会变成 500 口径；路由层拦下来的结果是明确的 400 + 中文原因。
+    """
+    key = (raw or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail=_IDEM_KEY_MISSING_DETAIL)
+    if len(key) > _IDEM_KEY_MAX_LEN:
+        raise HTTPException(
+            status_code=400, detail=f"幂等键过长（最多 {_IDEM_KEY_MAX_LEN} 字符）")
+    return key
+
+
+class AdminRefundRequest(RefundRequest):
+    """管理员补偿退款入参（P1-12 拍板新增）。
+
+    继承自助侧的 order_no/amount 约束（含 max_length 与金额上下限），只做两处收紧：
+    归属人必须显式传（退款单要落在原单归属的钱包上），reason 不给默认值——
+    补偿通道是真金白银出口，"谁为什么退" 是事后追责的唯一线索，留空等于自毁审计。
+    """
+    user_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="原订单归属用户（与登录侧 username 限长对称）",
+    )
+    reason: str = Field(
+        ..., min_length=2, max_length=200, description="退款原因（审计必填）",
+    )
 
 
 @router.get("/wallet")
@@ -131,10 +172,16 @@ async def api_get_order_detail(
 async def api_process_refund(
     req: RefundRequest,
     current_user: dict = Depends(get_current_user),
-    idempotency_key: str = Header("", alias="X-Idempotent-Key"),
+    idempotency_key: Optional[str] = Header(default=None, alias="X-Idempotent-Key"),
 ):
-    """申请退款（按用户限频 5 次/小时，2026-09-07 审查 P0 配套）"""
+    """申请退款（按用户限频 5 次/小时，2026-09-07 审查 P0 配套）
+
+    2026-09-22 审阅 P1-13：缺 X-Idempotent-Key 直接 400，空串不再允许进资金流程。
+    本入口**不**放开消费单（allow_consumption_refund 默认 False）：已交付的模型服务
+    自助退款会形成免费 token 漏洞，消费单争议一律走 /admin/refund 补偿通道。
+    """
     user_id = current_user["username"]
+    key = _require_idem_key(idempotency_key)
     await _refund_rate_limit(user_id)
     try:
         result = await process_refund(
@@ -143,9 +190,53 @@ async def api_process_refund(
             # 注意 is not None 判断：Decimal("0") 为 falsy，truthiness 会把 0 元退款误变全额退款
             amount=Decimal(str(req.amount)) if req.amount is not None else None,
             reason=req.reason,
-            idempotency_key=idempotency_key,
+            idempotency_key=key,
         )
         return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# 与既有 router 同前缀（/api/payment），实际路径 POST /api/payment/admin/refund。
+# 鉴权用 dependencies=[Depends(require_admin)]：FastAPI 会把 router/路由级依赖
+# insert 到 dependant.dependencies 首位，先于函数签名里的 get_current_user 与函数体，
+# 所以"非管理员"在任何资金动作之前就被拒（照抄 routes/rag_admin 的门禁写法）。
+@router.post("/admin/refund", dependencies=[Depends(require_admin)])
+async def api_admin_refund(
+    req: AdminRefundRequest,
+    current_user: dict = Depends(get_current_user),
+    idempotency_key: Optional[str] = Header(default=None, alias="X-Idempotent-Key"),
+):
+    """管理员补偿退款（2026-09-22 审阅 P1-12 拍板）：消费单唯一的可退入口。
+
+    背景：`_decide_refund` 的类型白名单只有 'payment'，而 'payment' 又被
+    allow_consumption_refund 拦住，自助入口从来不会传这个 flag → 消费单在 HTTP 上
+    恒拒（P1-12）。拍板是"入口不能死，但也不能对消费者开"：新增本通道，由管理员
+    带 reason 代客发起。
+
+    只放开消费单，**不放开充值单**：allow_consumption_refund=True 命中的是第二道
+    状态门，refund._REFUNDABLE_ORDER_TYPES 白名单里没有 'recharge'，第一道类型门
+    照旧拒（09-07 双倍入账 P0 口径不变，本通道也绕不过去）。
+
+    与自助侧的差异只有两点：归属人由 req.user_id 显式指定（管理员代客），以及
+    不吃按用户的 5 次/小时限频——那个阈值防的是消费者刷退款，补偿通道的节流由
+    管理员鉴权 + 强制幂等键承担。
+    """
+    key = _require_idem_key(idempotency_key)
+    # 审计落点：DB 侧退款单记的是原单归属 user_id，"哪个管理员发起的"只在这里留痕
+    # （_settle_refund 的流水 operator 固定写 system，改它等于动资金层签名）
+    logger.info(
+        f"管理员补偿退款受理: admin={current_user.get('username')}, "
+        f"target_user={req.user_id}, order={req.order_no}, reason={req.reason}")
+    try:
+        return await process_refund(
+            order_no=req.order_no,
+            user_id=req.user_id,
+            amount=req.amount,
+            reason=req.reason,
+            idempotency_key=key,
+            allow_consumption_refund=True,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

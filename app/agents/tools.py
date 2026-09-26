@@ -37,7 +37,7 @@ _COLLOQUIAL_MAP_PATH = None
 _LOAD_LOCK = threading.Lock()
 
 def _load_colloquial_map() -> dict:
-    """加载口语化表述映射表（tests/民法典映射表.txt）
+    """加载口语化表述映射表（tests/civil_colloquial_map.txt）
 
     2026-09-12 深检 P2：首调并发竞态修复——构建在局部 dict 完成后一次性发布。
     原写法锁内置空 dict 后在锁外填充：并发快路径会把空/部分 dict 当作已加载
@@ -51,11 +51,11 @@ def _load_colloquial_map() -> dict:
             return _COLLOQUIAL_MAP
         mapping = {}
         path = _COLLOQUIAL_MAP_PATH or os.path.join(
-            os.path.dirname(__file__), "..", "..", "tests", "民法典映射表.txt"
+            os.path.dirname(__file__), "..", "..", "tests", "civil_colloquial_map.txt"
         )
         if not os.path.exists(path):
             # 回退到容器内路径
-            path = "/app/tests/民法典映射表.txt"
+            path = "/app/tests/civil_colloquial_map.txt"
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -394,13 +394,19 @@ async def _recall_and_fuse(conn, query: str, search_query: str, recall_limit: in
         logger.info(f"检索低置信（trgm={max_trgm:.2f}, vec={max_vec:.2f}），触发改写重试: "
                     f"{search_query[:40]}... → {rewritten[:40]}...")
         retry_started = time.perf_counter()
-        trgm2, vec2, _, _ = await _recall_two_ways(
+        trgm2, vec2, max_trgm2, max_vec2 = await _recall_two_ways(
             conn, rewritten, recall_limit, permissions)
+        # RAG-3（2026-09-20 审查）：重试轮会覆盖 _LAST_EMBEDDING，而 _LAST_LEGS
+        # 此前只留在第一轮——第二轮 embedding 故障全静默，retrieval_trace 把
+        # 残缺召回当客观事实喂 RC-1b/1c。重试后以最终一轮口径统一回填。
+        _vec_failed2 = _LAST_EMBEDDING.get() is None
+        _LAST_LEGS.set((len(trgm2), len(vec2), max_trgm2, max_vec2, _vec_failed2))
         record_span(
             "recall_retry",
             latency_ms=round((time.perf_counter() - retry_started) * 1000),
             result_count=len(trgm2) + len(vec2),
-            attributes={"trgm_hits": len(trgm2), "vec_hits": len(vec2)},
+            attributes={"trgm_hits": len(trgm2), "vec_hits": len(vec2),
+                        "vec_failed": _vec_failed2},
         )
         recall_lists.extend([trgm2, vec2])
         if diagnostics is not None:

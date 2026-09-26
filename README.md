@@ -27,6 +27,7 @@ flowchart LR
 ## 目录导览
 
 - [showcase/](showcase/README.md) —— 项目展示（给 HR / 招聘方看的完整细则）
+- [agent_docs/](agent_docs/修复日志.md) —— **修复台账总入口**（Bug日志 + 全项目总修复日志；各子目录另有同格式 修复日志.md，与代码同址存放）
 - [app/](app/) —— 后端核心代码（FastAPI 分层：routes / services / agents / payment / core）
 - [frontend/](frontend/) —— 前端 v2 源码（Vue3 + TypeScript + Vite）
 - [可复用资产/](可复用资产/) —— 跨项目可复用资产（AI 应用资产 / 前端资产 / harness 模板 / MCP / skill）
@@ -39,3 +40,5 @@ Python · FastAPI · PostgreSQL(pgvector) · Redis · Vue3 · TypeScript · Vite
 ## 演示
 
 - 在线演示：https://the-world-agent.cloud
+
+> ℹ️ **同步口径**：本仓为脱敏展示快照（`app/` 等代码同步自私有主仓，2026-09-26 快照）；**修复台账随本仓公开**（[agent_docs/Bug日志.md](agent_docs/Bug日志.md)、[agent_docs/修复日志.md](agent_docs/修复日志.md) 及各目录 修复日志.md，敏感字面量已脱敏）；评测数据与会话历史仍在私有主仓，不随本仓公开。文中引用的 `tests/`、`scripts/`、`deploy/` 等私有工程路径在本仓不存在的，以台账文字为准。

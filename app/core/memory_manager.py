@@ -1,6 +1,7 @@
 import json
 import os
 import asyncio
+import time
 import uuid
 from typing import List, Dict
 from ..core.redis import get_redis
@@ -9,6 +10,10 @@ from ..core.logging import setup_logging
 from ..core.config import HISTORY_LIMIT, HISTORY_TTL, HISTORY_SUMMARY_TTL
 from ..core.concurrency import spawn
 from ..agents.memory import generate_summary
+from ..services.conversation_profiles import (
+    extract_profile_updates, get_conversation_profile as load_conversation_profile,
+    normalize_conversation_profile,
+)
 
 logger = setup_logging()
 
@@ -56,6 +61,17 @@ _PG_WRITE_SEMAPHORE = asyncio.Semaphore(
 )
 
 
+# 旅行待补槽状态的生命周期（2026-09-22 审阅 P2）：此前跟历史一样吃
+# HISTORY_TTL=24h，而读取侧只判"键是否存在"——昨天没答完的"从哪里出发"，今天
+# 随手回个两字词就被填进昨天那个槽。补槽是"追问—回答"的相邻对（adjacency pair），
+# 一次规划会话内分钟级闭合；用户十分钟不答即视为放弃这轮规划，重开一次澄清的
+# 代价远小于拿昨天的槽位答今天的问题。
+PENDING_TRAVEL_TTL_SECONDS = 10 * 60
+# 槽值内的写入时间戳：Redis TTL 只在"键没被别的路径复用"时才可信（回填、
+# 测试桩、跨版本旧键都不保证过期），读取方按同一常量再判一次新鲜度。
+PENDING_TRAVEL_TS_KEY = "saved_at"
+
+
 class MemoryManager:
     """冷热分层记忆管理器（连接池版）"""
 
@@ -67,6 +83,56 @@ class MemoryManager:
         # PG 回源本就按 user_id 过滤，热缓存同口径对齐（旧键随 TTL 自然过期）
         self._history_key = f"conv:{self.user_id}:{self.conv_id}"
         self._summary_key = f"conv_summary:{self.user_id}:{self.conv_id}"
+        self._pending_travel_key = f"conv_pending_travel:{self.user_id}:{self.conv_id}"
+
+    # ---------- 待补槽状态：旅行澄清轮的短时会话记忆 ----------
+    async def get_pending_travel(self) -> Dict:
+        """读取旅行待补槽状态；损坏或依赖故障按无状态处理，不阻断聊天。"""
+        try:
+            redis = await get_redis()
+            raw = await redis.get(self._pending_travel_key)
+            if not raw:
+                return {}
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+            state = json.loads(raw)
+            return state if isinstance(state, dict) else {}
+        except Exception as e:
+            logger.warning(
+                f"读取旅行待补槽状态失败（按无状态处理）: {type(e).__name__}"
+            )
+            return {}
+
+    async def set_pending_travel(self, state: Dict) -> None:
+        """写入旅行待补槽状态；短回复下一轮据此恢复上轮推荐意图。
+
+        带时间戳 + 分钟级 TTL（2026-09-22 审阅 P2）：TTL 负责淘汰，saved_at 负责
+        新鲜度判定（见 chat_travel_flow._pending_is_fresh），两者缺一都会让隔日的
+        短回复填进昨天那个"从哪里出发"。
+        """
+        try:
+            redis = await get_redis()
+            payload = dict(state)
+            payload[PENDING_TRAVEL_TS_KEY] = time.time()
+            await redis.set(
+                self._pending_travel_key,
+                json.dumps(payload, ensure_ascii=False),
+                ex=PENDING_TRAVEL_TTL_SECONDS,
+            )
+        except Exception as e:
+            logger.warning(
+                f"写入旅行待补槽状态失败（本轮仍可正常澄清）: {type(e).__name__}"
+            )
+
+    async def clear_pending_travel(self) -> None:
+        """清除已消费/已取消的旅行待补槽状态。"""
+        try:
+            redis = await get_redis()
+            await redis.delete(self._pending_travel_key)
+        except Exception as e:
+            logger.warning(
+                f"清除旅行待补槽状态失败（TTL 自愈）: {type(e).__name__}"
+            )
 
     # ---------- 读路径：L1(Redis) -> L2(PG) 回填 ----------
     async def get_context(self, limit: int = HISTORY_LIMIT, offset: int = 0) -> List[Dict]:
@@ -292,40 +358,53 @@ return 1
                         conn, user_msg["content"], assistant_msg["content"]
                     )
                 except Exception as e:
-                    logger.warning(f"用户画像更新失败（对话记忆已保存）: {e}")
+                    logger.warning(
+                        f"用户画像更新失败（对话记忆已保存）: {type(e).__name__}"
+                    )
 
     # ---------- L3：用户画像更新 ----------
     # （save_user_location 已随"出发地"手动输入功能一并移除；画像城市仍由
     # _update_profile_async 从对话文本自然提取）
 
+    async def _upsert_conversation_profile(
+        self, conn, updates: dict, increment_message_count: bool = False,
+    ) -> None:
+        """写入本会话画像；只在保存整轮消息时递增消息计数。"""
+        if not updates and not increment_message_count:
+            return
+        delta = 1 if increment_message_count else 0
+        await conn.execute(
+            "INSERT INTO conversation_profiles "
+            "(user_id, conversation_id, profile, message_count) "
+            "VALUES ($1, $2, $3::jsonb, $4) "
+            "ON CONFLICT (user_id, conversation_id) DO UPDATE "
+            "SET profile = conversation_profiles.profile || EXCLUDED.profile, "
+            "message_count = conversation_profiles.message_count + $4, "
+            "updated_at = NOW()",
+            self.user_id, self.conv_id,
+            json.dumps(updates, ensure_ascii=False), delta,
+        )
+
+    async def update_profile_fields(self, updates: dict) -> None:
+        """供旅行槽位流程写明确的出发地/目的地，不依赖文本猜测。"""
+        if not updates:
+            return
+        pool = await get_pool()
+        async with pool.acquire(timeout=5) as conn:
+            await self._upsert_conversation_profile(conn, updates)
+
+    async def get_conversation_profile(self) -> dict:
+        """读取结构化会话画像，供路由恢复目的地、出发地和其他槽位。"""
+        pool = await get_pool()
+        async with pool.acquire(timeout=5) as conn:
+            return await load_conversation_profile(conn, self.user_id, self.conv_id)
+
     async def _update_profile_async(self, conn, user_content: str, assistant_content: str):
-        import re
-        new_profile = {}
-        # 只匹配以 市/州/省/区 结尾的地名（至少2字），避免把"今天""你好"等词误认为城市
-        cities = re.findall(r'([\u4e00-\u9fa5]{2,4}(?:市|州|省|区|自治区))', user_content)
-        # 过滤带动词前缀的误匹配（"我从广州"被"州"后缀误抓——广州/苏州/杭州本身含州）
-        cities = [c for c in cities if not re.match(r'^(我从|我在|我想|我们|想去|去了|回到|飞到|来到)', c)]
-        if cities:
-            new_profile["recent_cities"] = cities
-        budget_match = re.search(r'(\d+)[-~](\d+)?元', user_content)
-        if budget_match:
-            new_profile["budget"] = budget_match.group(0)
-        # 出行人数（"我们4个人/一家3口/2大1小"）
-        people_match = re.search(r'(\d+)\s*个?人|一家\s*(\d+)\s*口|(\d+)大\s*(\d+)小', user_content)
-        if people_match:
-            new_profile["travelers"] = next(g for g in people_match.groups() if g)
-        # 规划天数（"玩3天/5天行程"）
-        days_match = re.search(r'(\d+)\s*天', user_content)
-        if days_match:
-            new_profile["days"] = days_match.group(0)
-        # 目的地（"去X旅游/去X玩"——地图「去这里」prompt 场景）
-        dest_match = re.search(r'去([一-龥]{2,8}?)(?:旅游|玩|旅行)', user_content)
-        if dest_match:
-            new_profile["destination"] = dest_match.group(1)
-        # 出发地（"我从X出发/我从X到"——地图 prompt 场景；"我"字排除误匹配）
-        origin_match = re.search(r'我(?:们)?从([一-龥]{2,8}?)(?:出发|到|去)', user_content)
-        if origin_match:
-            new_profile["origin"] = origin_match.group(1)
+        """从用户问题提取会话画像，并保留全局画像作为跨会话偏好。"""
+        new_profile = extract_profile_updates(user_content)
+        await self._upsert_conversation_profile(
+            conn, new_profile, increment_message_count=True,
+        )
         if new_profile:
             await conn.execute(
                 "INSERT INTO user_profiles (user_id, profile) VALUES ($1, $2) "
@@ -347,50 +426,65 @@ return 1
             return parsed if isinstance(parsed, dict) else {}
         return {}
 
+    @staticmethod
+    def _format_profile(profile_data: dict) -> str:
+        """把画像压成 LLM 易读短句，天气只在有真实快照时注入。"""
+        if not profile_data:
+            return ""
+        data = normalize_conversation_profile(profile_data)
+        parts = []
+        labels = {
+            "name": "姓名", "travelers": "人数", "origin": "出发地",
+            "destination": "目的地", "budget": "预算", "days": "行程",
+        }
+        for field, label in labels.items():
+            if data.get(field):
+                parts.append(f"{label}: {data[field]}")
+        forecast = data.get("weather_forecast") or []
+        if forecast:
+            city = data.get("weather_city") or data.get("destination") or ""
+            first = forecast[0]
+            weather_text = (
+                f"{city} {first.get('date', '')} "
+                f"{first.get('day_weather', '')} "
+                f"{first.get('day_temp', '')}/{first.get('night_temp', '')}℃"
+            ).strip()
+            parts.append(f"天气: {weather_text}")
+        return f"【用户画像】{' | '.join(parts)}" if parts else ""
+
     # ---------- 获取画像（按需读取）----------
     async def get_profile(self) -> str:
+        """优先读取本会话画像，再回退跨会话全局画像。"""
         pool = await get_pool()
         async with pool.acquire(timeout=5) as conn:
+            row = await conn.fetchrow(
+                "SELECT profile FROM conversation_profiles "
+                "WHERE user_id = $1 AND conversation_id = $2",
+                self.user_id, self.conv_id,
+            )
+            if row and row["profile"]:
+                formatted = self._format_profile(
+                    self._profile_to_dict(row["profile"])
+                )
+                if formatted:
+                    return formatted
+
             row = await conn.fetchrow(
                 "SELECT profile, updated_at FROM user_profiles WHERE user_id = $1",
                 self.user_id
             )
             if row and row["profile"]:
-                # 跳过过期画像（90天未更新；DB 列为无时区 TIMESTAMP/UTC，本地 now() 会随时区漂移）
+                # 全局画像只做跨会话兜底；会话画像不参与 90 天过期。
                 from datetime import datetime, timedelta, timezone
                 updated = row["updated_at"]
                 if updated and updated.tzinfo is None:
-                    # 兼容尚未应用 timestamptz 迁移的旧库；旧值语义本就是 UTC。
                     updated = updated.replace(tzinfo=timezone.utc)
                 if updated and (datetime.now(timezone.utc) - updated) > timedelta(days=90):
-                    # 原子条件删除（P1 #44）：带过期条件，避免"读-删"两步竞态与重复清理
                     await conn.execute(
                         "DELETE FROM user_profiles WHERE user_id = $1 "
                         "AND updated_at < NOW() - INTERVAL '90 days'",
                         self.user_id
                     )
                     return ""
-                profile_data = self._profile_to_dict(row["profile"])
-                # 精简画像：只保留最近的3个城市
-                if profile_data:
-                    if "recent_cities" in profile_data:
-                        profile_data["recent_cities"] = profile_data["recent_cities"][-3:]
-                    # 友好格式化
-                    parts = []
-                    if profile_data.get("recent_cities"):
-                        parts.append(f"最近城市: {', '.join(profile_data['recent_cities'])}")
-                    if profile_data.get("budget"):
-                        parts.append(f"预算: {profile_data['budget']}")
-                    if profile_data.get("origin"):
-                        parts.append(f"出发地: {profile_data['origin']}")
-                    if profile_data.get("destination"):
-                        parts.append(f"目的地: {profile_data['destination']}")
-                    if profile_data.get("travelers"):
-                        parts.append(f"人数: {profile_data['travelers']}人")
-                    if profile_data.get("days"):
-                        parts.append(f"行程: {profile_data['days']}")
-                    if parts:
-                        return f"【用户画像】{' | '.join(parts)}"
-                    return f"【用户画像】{json.dumps(profile_data, ensure_ascii=False)}"
-                return ""
+                return self._format_profile(self._profile_to_dict(row["profile"]))
             return ""

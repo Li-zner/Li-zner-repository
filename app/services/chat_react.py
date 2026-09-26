@@ -11,10 +11,12 @@ from ..core.logging import setup_logging
 from ..core.persona_manager import is_civil_persona
 from ..core.stream_utils import dispatch_tool, sse
 from ..core.safety_filter import (
-    get_filter, sanitize_untrusted_text, serialize_untrusted_value,
+    get_filter, sanitize_error_text, sanitize_untrusted_text,
+    serialize_untrusted_value,
 )
 from .chat_stream_ctx import ChatStreamCtx, finalize_answer
 from .chat_support import display_safe_tool_result, hide_reasoning, mark_key_result
+from .conversation_profiles import persist_weather_snapshot
 from .llm_streaming import _spawn_drain_bill, record_token_usage, stream_llm_throttled
 from .chat_fallback import fallback_chain
 from .rag_request_trace import mark_route
@@ -250,10 +252,18 @@ async def _execute_react_tools(ctx: ChatStreamCtx, tool_calls: List[dict], frame
 
     for idx, result in enumerate(tool_results):
         if isinstance(result, Exception):
-            result = {"error": str(result)}
+            # CHAT-4（2026-09-20 审查）：异常 str 可含带 key 的完整 URL；对外事件
+            # 早已过消毒，进 LLM 上下文的这份拷贝此前是裸的（两份口径不一致）
+            result = {"error": sanitize_error_text(str(result))}
+        func_name = (
+            tool_calls[idx]["function"]["name"]
+            if idx < len(tool_calls) else ""
+        )
+        if func_name == "query_weather":
+            await persist_weather_snapshot(getattr(ctx, "mm", None), result)
         # 对外事件消毒（2026-09-10 审查 P2）：第三方内容/错误串不直发前端；
         # frame["tool_results"] 仍持原对象供 LLM 上下文与圆桌使用
-        yield f"data: {json.dumps({'type': 'tool_result', 'index': idx, 'result': display_safe_tool_result(result)})}\n\n"
+        yield f"data: {json.dumps({'type': 'tool_result', 'name': func_name, 'index': idx, 'result': display_safe_tool_result(result)})}\n\n"
     law_mapping_hit = None
     for _res in tool_results:
         if isinstance(_res, dict) and _res.get("mapping_hit"):
@@ -273,7 +283,8 @@ def _build_tool_messages(tool_calls: List[dict], tool_results: List[dict]) -> Li
     tool_messages = []
     for idx, result in enumerate(tool_results):
         if isinstance(result, Exception):
-            result = {"error": str(result)}
+            # CHAT-4：同上方 tool_result 事件口径，异常 str 剥 URL/Key 后再进上下文
+            result = {"error": sanitize_error_text(str(result))}
         if isinstance(result, dict) and "error" in result:
             error_msg = result["error"]
             fallback_text = "获取数据失败了，可能服务暂时不可用。"

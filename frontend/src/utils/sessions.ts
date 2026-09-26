@@ -1,13 +1,20 @@
 /** 本地会话持久化（localStorage，按人格隔离——对齐旧版 travel/me 双存储惯例） */
 import type { ChatMessage } from '../stores/chat'
+import type { ConversationProfile } from './conversationProfile'
 
 export interface ChatSession {
   id: string
   personaId: string
   title: string
+  /** auto=随画像刷新摘要标题；manual=用户手动重命名后保持。 */
+  titleMode?: 'auto' | 'manual'
   conversationId: string
   messages: ChatMessage[]
   updatedAt: number
+  /** 每个历史会话独立画像；服务端同步，离线时保留本地副本。 */
+  profile?: ConversationProfile
+  /** 超过15轮后标记为已压缩上下文；完整消息仍保留用于回看。 */
+  contextCompressed?: boolean
   /** 置顶会话排在最前（旧数据无此字段视为未置顶） */
   pinned?: boolean
 }
@@ -24,7 +31,12 @@ export function loadSessions(personaId: string, owner = ''): ChatSession[] {
     if (!raw) return []
     const parsed: unknown = JSON.parse(raw)
     // 形状防御：损坏数据（对象/数字等）兜底为空，避免后续 unshift/find 抛异常
-    return Array.isArray(parsed) ? (parsed as ChatSession[]) : []
+    return Array.isArray(parsed)
+      ? (parsed as ChatSession[]).map((session) => ({
+        ...session,
+        titleMode: session.titleMode === 'manual' ? 'manual' : 'auto',
+      }))
+      : []
   } catch {
     return []
   }

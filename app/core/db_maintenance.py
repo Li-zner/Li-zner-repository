@@ -158,6 +158,18 @@ async def clean_expired_profiles():
         """, cutoff)
         deleted = result.split()[-1] if result else "0"
         logger.info(f"清理过期用户画像: {deleted} 条")
+        # 2026-09-22 审阅 P2：会话画像按 updated_at 直删，判据与 user_profiles 一致。
+        # 原先这里挂的是 `NOT EXISTS(conversation_memories)` 的"孤儿"条件，而
+        # compress_old_conversations 压缩时恰恰保留了 role='system' 的摘要行
+        # （见同文件压缩分支的 DELETE 口径）——被压缩过的会话永远"还有记忆行"，
+        # NOT EXISTS 恒不成立，conversation_profiles 只增不减；不传 conversation_id
+        # 的每次请求还会新建一行（memory_manager._upsert_conversation_profile），
+        # 于是无界增长。画像本身可由下一轮对话重新提取，不是不可再生数据，
+        # 超期即删与用户画像同留期（PROFILE_EXPIRE_DAYS）。
+        expired_conv = await conn.execute(
+            "DELETE FROM conversation_profiles WHERE updated_at < $1", cutoff)
+        conv_count = expired_conv.split()[-1] if expired_conv else "0"
+        logger.info(f"清理过期会话画像: {conv_count} 条")
 
 
 async def clean_stale_cache():

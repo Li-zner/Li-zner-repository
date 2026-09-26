@@ -7,7 +7,7 @@ import json
 import secrets
 
 import asyncpg
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..core.logging import setup_logging
@@ -26,37 +26,9 @@ logger = setup_logging()
 
 router = APIRouter()
 
-# 单 IP 日发送上限（2026-09-09 审查 P1）：per-phone 限流可被换号绕过——
-# 1000 个号 = 5000 条/小时计费短信 + 短信轰炸；本键兜底单 IP 日总量
-SMS_IP_DAY_LIMIT = 20
-
-# 验证码校验 Lua：锁检查、错误计数和成功消费必须在同一脚本内完成，
-# 防止并发请求同时越过错误次数限制或重放同一验证码。
-_VERIFY_CODE_LUA = """
-local function secure_equal(left, right)
-    if string.len(left) ~= string.len(right) then return false end
-    local diff = 0
-    for i = 1, string.len(left) do
-        diff = bit.bor(diff, bit.bxor(string.byte(left, i), string.byte(right, i)))
-    end
-    return diff == 0
-end
-if redis.call('GET', KEYS[1]) then return 'locked' end
-local stored = redis.call('GET', KEYS[2])
-if not stored then return 'expired' end
-if not secure_equal(stored, ARGV[1]) then
-    local count = redis.call('INCR', KEYS[3])
-    if count == 1 then redis.call('EXPIRE', KEYS[3], tonumber(ARGV[3])) end
-    if count >= tonumber(ARGV[2]) then
-        redis.call('SET', KEYS[1], '1', 'EX', tonumber(ARGV[3]))
-        redis.call('DEL', KEYS[3])
-    end
-    return 'invalid'
-end
-redis.call('DEL', KEYS[3])
-redis.call('DEL', KEYS[2])
-return 'ok'
-"""
+# 验证码校验原子脚本在 routes/sms_lua.py（逐字未改），单 IP 日额度上限与其
+# 发送前预检在 services/sms_ip_quota.py：2026-09-22 外移，本文件贴 600 行门禁，
+# 口径同 AUTH-1。
 
 # 改名迁移 Lua：日额度键、文件归属反向索引和文件元数据在单个脚本内完成迁移。
 # 旧键暂时保留，直到数据库事务确认成功后再清理，便于提交失败时可靠回滚。
@@ -115,20 +87,38 @@ return 1
 _USER_RENAME_INTENT_TTL_SECONDS = 24 * 3600
 
 
+from .sms_lua import (  # AUTH-1（09-20）：脚本外移，phone.py 曾破 600 行门禁
+    SMS_IP_DAY_LUA, SMS_SEND_LUA, VERIFY_CODE_LUA,
+)
+from ..services.sms_ip_quota import (  # 09-22 审查 P2：IP 日额度预检与上限同处
+    SMS_IP_DAY_LIMIT, assert_ip_day_headroom, ip_day_key,
+)
+
+
 class PhoneSendCodeRequest(BaseModel):
     """发送验证码请求"""
     phone: str = Field(..., pattern=r'^1\d{10}$')
 
 
 class PhoneRegisterRequest(BaseModel):
-    """手机号注册请求"""
+    """手机号注册请求
+
+    AUTH-5（09-20 审查）：三字段入库列无界且 profile 原样回吐，补齐与
+    users.py 同口径上限；extra 按序列化后长度限。"""
     phone: str = Field(..., pattern=r'^1\d{10}$')
     code: str = Field(..., min_length=1, max_length=12)
     password: str = Field(default="", max_length=256)
     agree: bool = False
-    display_name: str = ""
-    email: str = ""
+    display_name: str = Field(default="", max_length=128)
+    email: str = Field(default="", max_length=254)
     extra: dict = {}
+
+    @field_validator("extra")
+    @classmethod
+    def _cap_extra(cls, v: dict) -> dict:
+        if len(json.dumps(v, ensure_ascii=False)) > 4096:
+            raise ValueError("extra 过长")
+        return v
 
 
 class PhoneLoginRequest(BaseModel):
@@ -143,35 +133,39 @@ class BindPhoneRequest(BaseModel):
     code: str = Field(..., min_length=1, max_length=12)
 
 
-# ---------- 验证码防爆破（P0 #6：防短信轰炸 / 暴力枚举）----------
 async def _check_sms_rate(phone: str):
-    """发送频率限制：同一手机号 1 分钟 1 次、1 小时 5 次（原子，防并发绕过）"""
+    """发送频率限制：同一手机号 1 分钟 1 次、1 小时 5 次（单脚本原子，AUTH-1 收口）"""
     r = await get_redis()
-    min_key = f"phone_sms_min:{phone}"
-    hour_key = f"phone_sms_hour:{phone}"
-    # 小时计数：原子 INCR（并发各取唯一值），首次置 TTL；超阈值回滚并拒绝
-    hour = await r.incr(hour_key)
-    if hour == 1:
-        await r.expire(hour_key, 3600)
-    if hour > SMS_SEND_HOUR_LIMIT:
-        await r.decr(hour_key)
+    verdict = await r.eval(
+        SMS_SEND_LUA, 2,
+        f"phone_sms_min:{phone}",
+        f"phone_sms_hour:{phone}",
+        str(SMS_SEND_MIN_INTERVAL), str(SMS_SEND_HOUR_LIMIT), "3600",
+    )
+    if verdict == 0:
         raise HTTPException(429, "短信发送次数已达上限，请稍后再试")
-    # 分钟冷却：SETNX 原子占位（原 GET→SETNX 两步并发可双双放行 → 短信轰炸，P1 修复）
-    ok_min = await r.set(min_key, "1", nx=True, ex=SMS_SEND_MIN_INTERVAL)
-    if not ok_min:
-        await r.decr(hour_key)   # 回滚小时计数，避免无效占位累计
+    if verdict == -1:
         raise HTTPException(429, "发送太频繁，请 1 分钟后再试")
 
 
 async def _check_sms_rate_ip(ip: str):
-    """IP 维度日上限（2026-09-09 审查 P1）：换号绕过 per-phone 限流时的计费兜底"""
+    """IP 维度日上限**落账**（2026-09-09 审查 P1）：换号绕过 per-phone 限流时的
+    计费兜底；单脚本原子化同 AUTH-1。
+
+    2026-09-22 审查 P2：调用点从"发送前"移到"短信确实发出去之后"——原来
+    per-phone 分钟冷却抛 429、上游故障抛 503 时 IP 额度已经白扣，用户一条短信
+    没收到却耗尽当日额度。防轰炸语义没丢：发送前先走 services.assert_ip_day_headroom
+    只读预检（超额直接拒，不触发下发），落账仍是脚本内 INCR→超限 DECR 回滚，
+    等价"先查后增"却把并发窗口收进脚本——预检与落账之间最多溢出"同时在飞"
+    的条数，且溢出部分被回滚、不会累积。
+    """
     r = await get_redis()
-    day_key = f"phone_sms_ip_day:{ip}"
-    count = await r.incr(day_key)
-    if count == 1:
-        await r.expire(day_key, 86400)
-    if count > SMS_IP_DAY_LIMIT:
-        await r.decr(day_key)
+    verdict = await r.eval(
+        SMS_IP_DAY_LUA, 1,
+        ip_day_key(ip),
+        str(SMS_IP_DAY_LIMIT), "86400",
+    )
+    if verdict == 0:
         raise HTTPException(429, "今日发送次数已达上限，请明日再试")
 
 
@@ -179,7 +173,7 @@ async def _verify_phone_code(phone: str, code: str):
     """原子校验验证码（含错误次数防爆破）；成功时消费验证码与错误计数"""
     r = await get_redis()
     status = await r.eval(
-        _VERIFY_CODE_LUA,
+        VERIFY_CODE_LUA,
         3,
         f"phone_code_lock:{phone}",
         f"phone_code:{phone}",
@@ -202,8 +196,10 @@ async def _verify_phone_code(phone: str, code: str):
 async def send_phone_code(payload: PhoneSendCodeRequest, request: Request):
     """发送手机验证码（阿里云短信；Pydantic 校验，A24）"""
     phone = payload.phone
-    # IP 维度兜底限流（2026-09-09 审查 P1：换号绕过 per-phone 限流的场景）
-    await _check_sms_rate_ip(_client_ip(request))
+    ip = _client_ip(request)
+    # IP 维度兜底限流（2026-09-09 审查 P1：换号绕过 per-phone 限流的场景）。
+    # 09-22 审查 P2：这里只做只读预检，额度实扣见下面发送成功分支
+    await assert_ip_day_headroom(ip)
     # 发送频率限制（P0 #6 防短信轰炸：1 分钟 1 次 / 1 小时 5 次）
     await _check_sms_rate(phone)
     # 生成随机6位验证码（2026-09-12 清欠 P2：改 CSPRNG，与全文件 secrets 用法一致）
@@ -215,6 +211,8 @@ async def send_phone_code(payload: PhoneSendCodeRequest, request: Request):
     from ..core.sms import send_sms
     sent = await send_sms(phone, code)
     if sent:
+        # 短信确实出去了才扣 IP 日额度（2026-09-22 审查 P2，详见 _check_sms_rate_ip）
+        await _check_sms_rate_ip(ip)
         # 日志脱敏（kefa 红线：日志禁明文手机号，2026-09-07 审查 P1）
         logger.info(f"验证码已发送: phone={_mask_phone(phone)}")
         return {"message": "验证码已发送", "phone": phone}
@@ -349,7 +347,8 @@ async def _cascade_rename_user(conn, old_username: str, new_username: str):
 
     user_usage 以 username 为键（09-09 补：漏了它则改名后当日用量归零重计）。
     """
-    for table in ("conversation_memories", "invoices", "payment_orders",
+    for table in ("conversation_memories", "conversation_profiles",
+                  "invoices", "payment_orders",
                   "transaction_logs", "user_profiles", "user_wallets",
                   "message_ratings", "audit_logs", "payment_attempts"):
         await conn.execute(
